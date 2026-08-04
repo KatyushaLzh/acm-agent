@@ -44,6 +44,9 @@ STATIC_MEDIA_TYPES = {
     ".js": "text/javascript",
     ".json": "application/json",
     ".svg": "image/svg+xml",
+    ".ttf": "font/ttf",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
 }
 
 
@@ -141,12 +144,31 @@ class JobManager:
 def _problem_from_exception(exc: Exception) -> ApiProblem:
     if isinstance(exc, ApiProblem):
         return exc
+    if exc.__class__.__name__ == "AIConversationConflict":
+        return ApiProblem(
+            HTTPStatus.CONFLICT,
+            str(getattr(exc, "code", "conversation_conflict")),
+            str(exc),
+        )
     if exc.__class__.__name__ in {
         "RevisionConflict",
         "PlanRevisionConflict",
         "TagOverrideRevisionConflict",
+        "ProblemContextConflict",
+        "PatchConflictError",
     }:
         return ApiProblem(HTTPStatus.CONFLICT, "revision_conflict", str(exc))
+    if exc.__class__.__name__.startswith("DeepSeek"):
+        code = str(getattr(exc, "code", "deepseek_error"))
+        if code in {"missing_api_key", "invalid_model", "invalid_messages", "invalid_reasoning_effort"}:
+            return ApiProblem(HTTPStatus.BAD_REQUEST, code, str(exc))
+        if code == "timeout":
+            return ApiProblem(HTTPStatus.GATEWAY_TIMEOUT, code, str(exc))
+        if code == "rate_limited":
+            return ApiProblem(HTTPStatus.SERVICE_UNAVAILABLE, code, str(exc))
+        return ApiProblem(HTTPStatus.BAD_GATEWAY, code, str(exc))
+    if exc.__class__.__name__ == "CredentialStoreError":
+        return ApiProblem(HTTPStatus.CONFLICT, "credential_store_error", str(exc))
     if exc.__class__.__name__ == "DuplicatePlanError":
         return ApiProblem(HTTPStatus.CONFLICT, "duplicate_plan", str(exc))
     if isinstance(exc, KeyError):
@@ -227,11 +249,21 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
         "/api/plans/tags/apply": "plan_tags_apply",
         "/api/problems/skip": "problem_skip",
         "/api/problems/unskip": "problem_unskip",
+        "/api/problems/context": "problem_context_save",
+        "/api/ai/settings": "ai_settings",
+        "/api/ai/credential": "ai_credential",
+        "/api/ai/conversations": "ai_conversation_start",
     }
     _job_routes = {
         "/api/jobs/sync": "sync",
         "/api/jobs/verify": "verify",
         "/api/jobs/plans/tags/preview": "plan_tags_preview",
+        "/api/jobs/ai/test": "ai_test",
+        "/api/jobs/ai/recommendations": "ai_recommendations",
+        "/api/jobs/problems/context/fetch": "problem_context_fetch",
+        "/api/jobs/ai/patches/preview": "ai_patch_preview",
+        "/api/jobs/ai/patches/apply": "ai_patch_apply",
+        "/api/jobs/ai/patches/revert": "ai_patch_revert",
     }
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -263,6 +295,37 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self._read_json_object()
+            conversation_prefix = "/api/ai/conversations/"
+            if path.startswith(conversation_prefix) and path.endswith("/clear"):
+                conversation_id = unquote(
+                    path[len(conversation_prefix) : -len("/clear")]
+                )
+                if not conversation_id or "/" in conversation_id:
+                    raise ApiProblem(HTTPStatus.NOT_FOUND, "not_found", "Conversation not found")
+                if payload:
+                    raise ApiProblem(
+                        HTTPStatus.BAD_REQUEST,
+                        "invalid_request",
+                        "Conversation clear does not accept a request payload",
+                    )
+                with self.server.service_lock:
+                    result = self._invoke(
+                        "ai_conversation_clear", {"conversation_id": conversation_id}
+                    )
+                self._send_success(result)
+                return
+            if path.startswith(conversation_prefix) and path.endswith("/messages"):
+                conversation_id = unquote(
+                    path[len(conversation_prefix) : -len("/messages")]
+                )
+                if not conversation_id or "/" in conversation_id:
+                    raise ApiProblem(HTTPStatus.NOT_FOUND, "not_found", "Conversation not found")
+                with self.server.service_lock:
+                    stream = self.server.service.ai_chat_stream(
+                        conversation_id, **payload
+                    )
+                self._send_sse(stream)
+                return
             if path in {"/api/problems/skip", "/api/problems/unskip"}:
                 payload.setdefault("source", "web")
             if path in self._job_routes:
@@ -320,6 +383,29 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
                     result = self._invoke("skipped_problems", {})
                 self._send_success(result)
                 return
+            if path == "/api/ai/status":
+                with self.server.service_lock:
+                    result = self._invoke("ai_status", {})
+                self._send_success(result)
+                return
+            context_prefix = "/api/problems/"
+            if path.startswith(context_prefix) and path.endswith("/context"):
+                problem = unquote(path[len(context_prefix) : -len("/context")])
+                if not problem or "/" in problem:
+                    raise ApiProblem(HTTPStatus.NOT_FOUND, "not_found", "Problem context not found")
+                with self.server.service_lock:
+                    result = self._invoke("problem_context", {"problem": problem})
+                self._send_success(result)
+                return
+            conversation_prefix = "/api/ai/conversations/"
+            if path.startswith(conversation_prefix):
+                conversation_id = unquote(path[len(conversation_prefix) :])
+                if not conversation_id or "/" in conversation_id:
+                    raise ApiProblem(HTTPStatus.NOT_FOUND, "not_found", "Conversation not found")
+                with self.server.service_lock:
+                    result = self._invoke("ai_conversation", {"conversation_id": conversation_id})
+                self._send_success(result)
+                return
             plans_prefix = "/api/plans/"
             if path.startswith(plans_prefix):
                 suffix = unquote(path[len(plans_prefix) :])
@@ -360,6 +446,26 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(result, Mapping):
             raise TypeError(f"Service method {method_name} must return a mapping")
         return result
+
+    def _send_sse(self, stream: Any) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        iterator = iter(stream)
+        try:
+            for item in iterator:
+                event = str(item.get("event") or "message")
+                data = json.dumps(item.get("data") or {}, ensure_ascii=False, default=str)
+                self.wfile.write(f"event: {event}\ndata: {data}\n\n".encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
 
     def _authorize(self) -> bool:
         try:
@@ -559,6 +665,7 @@ def _restrict_runtime_permissions(path: Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        errors="replace",
         timeout=10,
         creationflags=creation_flags,
         check=False,
@@ -582,6 +689,7 @@ def _restrict_runtime_permissions(path: Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        errors="replace",
         timeout=10,
         creationflags=creation_flags,
         check=False,

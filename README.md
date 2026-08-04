@@ -9,6 +9,7 @@
 - 本地单页仪表盘：今日训练、做题工作台、复盘、设置和多题单管理。
 - Codeforces 官方 API 与洛谷公开页面同步；同步失败会保留最后一次成功快照。
 - 根据目标 CF rating、题单紧迫度、薄弱专题、复做到期和平台平衡生成可解释推荐。
+- 可选 DeepSeek BYOK：确定性候选池内个性化重排、按题持久化流式提示、代码诊断和确认式安全补丁。
 - `accepted`、`attempted`、`local_only` 与“已掌握但未实现”的 `skipped` 严格分离。
 - C++17 编译、样例检查、可选 sanitizer 探测和随机对拍，产物全部放入 `.acm/`。
 - 原生 HTML/CSS/JavaScript 和 Python 标准库，无 npm、数据库服务或 Python 运行依赖。
@@ -23,6 +24,8 @@
 - 在线同步需要访问 Codeforces 和洛谷的网络连接。
 
 核心运行不需要 `pip install`。
+
+AI 功能同样不需要额外依赖。Windows 用户可在 Dashboard 直接输入 DeepSeek API Key：服务使用当前用户作用域的 Windows DPAPI 加密保存，重启后自动恢复；明文不进入 JSON、SQLite、日志或 API 响应。Linux/macOS 不会退化为明文存储，可使用进程环境变量 `DEEPSEEK_API_KEY`。未显式点击“AI 个性化推荐”或使用 AI 命令时不会产生模型调用费用。
 
 ## 快速开始
 
@@ -65,14 +68,38 @@ python -m tools.acm_agent web
 
 新题推荐排除所有已 AC 和 active Skip 的题。复习模式只选择到期的 AC 题。文件存在只表示 `local_only`，绝不会被当作 AC。
 
+### 可选 DeepSeek 个性化重排
+
+Windows Dashboard 的“设置 → AI 设置”支持输入、替换和清除 API Key。加密凭据保存在忽略提交的 `.acm/deepseek-key.dpapi`，仅相同 Windows 登录用户通常可以在同一台电脑上解密；环境变量仍可作为 CLI 和非 Windows 平台的回退。
+
+`next --ai` 会让确定性引擎先生成 12–24 道合规候选，再由 DeepSeek 在候选池内重排。模型不能恢复 AC/Skip 题、绕过题单/来源/复做到期约束或创造题号；任何网络、鉴权、限流、非法 JSON 或候选校验失败都会保留确定性结果并返回结构化 fallback。
+
+推荐和对话默认使用 `deepseek-v4-flash`，可分别切换为 `deepseek-v4-pro`。推荐关闭 thinking；对话与补丁可开启 thinking 并选择 `high` 或 `max`，但 `reasoning_content` 永不展示或保存。
+
+### 按题保存 AI 对话
+
+AI 工作台以 active attempt 和题目为会话边界。多道题同时处于 active 状态时，在题号输入框切换题目会读取各自的持久对话、题面和补丁状态；页面刷新后仍可继续。切题会中断旧题正在进行的 SSE，并使用题目键与异步 epoch 丢弃迟到响应，避免回答、题面或 Diff 串到另一道题。
+
+“清除本题对话”不会物理删除审计事实：服务会在一个 SQLite 事务中归档旧 conversation，并为同一 attempt 创建新的空 conversation。旧消息不再发送给 DeepSeek，但历史最高提示等级、token usage、AI run 和补丁关联仍被保留。存在 pending/streaming 调用时清除返回 HTTP 409，等待回答结束后再操作。
+
+相关接口：
+
+```text
+POST /api/ai/conversations
+GET  /api/ai/conversations/{id}
+POST /api/ai/conversations/{id}/messages
+POST /api/ai/conversations/{id}/clear
+```
+
 ## 一次完整训练
 
 1. 在“今日训练”同步平台状态并生成下一组训练。
 2. 从推荐卡开始题目，或在“做题工作台”输入题号/URL。
 3. 系统在本地时区创建 `YYYY/M/D/题号.cpp`；已有同名文件会直接复用，不覆盖。
 4. 将样例放入 `.acm/cases/<problem-key>/`，使用网页或 CLI 验证。
-5. 结束时记录结果、独立思考时间、提示等级、失败类型和备注。
-6. 在复盘页查看到期复做、近七天结果、薄弱专题与 Skip 列表。
+5. 可在 AI 工作台请求 1–3 级提示、解释疑点或 4 级代码诊断；切换题号会恢复该 active attempt 的独立对话，“清除本题对话”会归档旧会话并保留提示等级与调用审计；补丁必须先预览服务端生成的 Diff，再确认应用。
+6. 结束时记录结果、独立思考时间、提示等级、失败类型和备注；实际提示等级会与 AI 历史最高等级取最大值。
+7. 在复盘页查看到期复做、近七天结果、薄弱专题与 Skip 列表。
 
 对应 CLI：
 
@@ -86,6 +113,20 @@ python -m tools.acm_agent web
 ```
 
 Linux/macOS 将 `.\acm.ps1` 换成 `./acm.sh`。
+
+## DeepSeek BYOK
+
+PowerShell 示例：
+
+```powershell
+$env:DEEPSEEK_API_KEY = "你的密钥"
+.\acm.ps1 ai status
+.\acm.ps1 ai test
+.\acm.ps1 next --ai --count 3 --json
+.\acm.ps1 ask CF1234A "只提示关键性质" --mode hint --hint-level 2
+```
+
+API endpoint 固定为 DeepSeek 官方 Chat Completions 地址，模型名有 allowlist，不接受自定义 URL。题面首次对话时自动抓取并缓存 30 天；人工粘贴版本优先，自动刷新不会覆盖。代码补丁使用完整候选源码生成本地 unified diff，应用时检查受管日期目录、`.cpp` 后缀、基线哈希、NUL 与大小限制；原文件备份到 `.acm/ai-backups/`。验证失败不会自动回滚，只有文件仍等于 AI 应用版本时才能安全 revert。
 
 ## 验证与对拍
 
@@ -141,10 +182,11 @@ Linux/macOS 将 `.\acm.ps1` 换成 `./acm.sh`。
 ├── build/            # 编译产物
 ├── failures/         # 对拍失败资产
 ├── reports/          # 复盘/归档候选
+├── ai-backups/       # 用户确认应用 AI 补丁前的源码备份
 └── web-runtime.json  # 当前本地服务端口、PID 和临时令牌
 ```
 
-应用不保存洛谷 cookie 或密码。首次公开仓库不包含任何账号、AC、Skip、session、源码答案或平台快照。不要将 `.acm/` 提交到 Git。
+应用不保存洛谷 cookie、密码或 DeepSeek API Key。AI 推荐只发送最多 90 天/50 次尝试的题号、平台、难度、日期、结果、耗时、提示等级、失败类型、冻结标签、薄弱度和目标 rating，不发送账号、notes、聊天、源码或路径。工作台对话会发送当前题面、有效标签、源码、attempt 与最近对话，并在首次发送前提示。首次公开仓库不包含任何账号、AC、Skip、session、源码答案或平台快照。不要将 `.acm/` 提交到 Git。
 
 ## CLI 概览
 
@@ -152,7 +194,11 @@ Linux/macOS 将 `.\acm.ps1` 换成 `./acm.sh`。
 acm init
 acm sync [--platform codeforces|luogu|all]
 acm status
-acm next [--count N] [--mode mixed|new|review]
+acm next [--count N] [--mode mixed|new|review] [--ai] [--model ...]
+acm ai status|test|settings
+acm context fetch|show|set <题号>
+acm ask <题号> [--mode hint|explain|review] [--hint-level 1|2|3]
+acm patch preview|apply|revert
 acm start <题号或 URL> [--with-stress]
 acm verify [题号] [--debug] [--exact]
 acm close <题号>

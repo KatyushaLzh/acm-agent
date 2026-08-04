@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-CONFIG_VERSION = 1
+CONFIG_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -72,7 +72,50 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "catalog_ttl_hours": 24,
         "timeout_seconds": 20,
     },
+    "ai": {
+        "recommendation_model": "deepseek-v4-flash",
+        "coaching_model": "deepseek-v4-flash",
+        "recommendation_thinking": False,
+        "coaching_thinking": True,
+        "reasoning_effort": "high",
+    },
 }
+
+
+def _is_sensitive_ai_key(key: Any) -> bool:
+    normalized = "".join(
+        character for character in str(key).casefold() if character.isalnum()
+    )
+    return normalized in {"apikey", "authorization", "accesstoken", "token", "secret"} or any(
+        marker in normalized for marker in ("apikey", "authorization", "token", "secret")
+    )
+
+
+def _merge_defaults(defaults: Any, current: Any) -> Any:
+    """Return ``current`` overlaid on defaults without dropping unknown keys."""
+    if not isinstance(defaults, dict) or not isinstance(current, dict):
+        return current
+    merged = {key: json.loads(json.dumps(value)) for key, value in defaults.items()}
+    for key, value in current.items():
+        if key in defaults:
+            merged[key] = _merge_defaults(defaults[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _upgrade_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    version = data.get("version")
+    if version not in (1, CONFIG_VERSION):
+        raise ValueError(f"Unsupported config version: {version!r}")
+    upgraded = _merge_defaults(DEFAULT_CONFIG, data)
+    ai = upgraded.get("ai")
+    if isinstance(ai, dict):
+        for key in list(ai):
+            if _is_sensitive_ai_key(key):
+                del ai[key]
+    upgraded["version"] = CONFIG_VERSION
+    return upgraded, upgraded != data
 
 
 def load_config(paths: Paths, *, required: bool = True) -> dict[str, Any]:
@@ -83,9 +126,12 @@ def load_config(paths: Paths, *, required: bool = True) -> dict[str, Any]:
             )
         return json.loads(json.dumps(DEFAULT_CONFIG))
     data = json.loads(paths.config.read_text(encoding="utf-8"))
-    if data.get("version") != CONFIG_VERSION:
-        raise ValueError(f"Unsupported config version: {data.get('version')!r}")
-    return data
+    if not isinstance(data, dict):
+        raise ValueError("Configuration root must be a JSON object")
+    config, changed = _upgrade_config(data)
+    if changed:
+        save_config(paths, config)
+    return config
 
 
 def save_config(paths: Paths, config: dict[str, Any]) -> None:
