@@ -1,15 +1,15 @@
 ---
 name: acm-workflow
-description: Operate an ACM Agent repository's local web and CLI practice workflow. Use when the user asks to open the ACM dashboard, sync Codeforces or Luogu status, choose today's problems, mark a simple problem as mastered without implementation, manage plan tags, start or verify a solution, record an ACM attempt, review recent practice, request progressive hints, or explicitly archive reusable contest knowledge after a completed problem.
+description: Operate the D:\code\acm local web and CLI practice workflow. Use when the user asks to open the ACM dashboard, sync Codeforces or Luogu status, choose today's problems, mark a simple problem as mastered without implementation, manage plan tags, start or verify a solution, record an ACM attempt, review recent practice, request progressive hints, or explicitly archive reusable contest knowledge after a completed problem.
 ---
 
 # ACM Workflow
 
-Resolve the repository root as the nearest parent containing `acm.ps1` and `tools/acm_agent`; run commands from that directory. Use the structured local API when the dashboard is running, otherwise use `.\acm.ps1 ... --json` on Windows or `./acm.sh ... --json` on Linux/macOS. Both call the same SQLite-backed service layer. Never infer acceptance from a `.cpp` filename, rendered page text, or the conversation.
+Use the structured local API when the dashboard is running, otherwise use `D:\code\acm\acm.ps1 --json`. Both call the same SQLite-backed service layer. Never infer acceptance from a `.cpp` filename, rendered page text, or the conversation.
 
 ## Dashboard and API
 
-Open the primary UI with `start-acm-web.cmd`, `.\acm.ps1 web`, or `./start-acm-web.sh`. The server binds only to `127.0.0.1`.
+Open the primary UI with `D:\code\acm\start-acm-web.cmd` or `.\acm.ps1 web`. The server binds only to `127.0.0.1`.
 
 When `.acm/web-runtime.json` exists, read its port and token, verify `/api/bootstrap`, and call the JSON API with `X-ACM-Token`. Never print, quote, persist elsewhere, or expose the token. Prefer these endpoints:
 
@@ -40,7 +40,7 @@ If the runtime file is stale or the health check fails, fall back to the CLI com
 
 ## Core Commands
 
-Run fallback commands from the resolved repository root and request JSON whenever facts feed another Agent step:
+Run fallback commands from `D:\code\acm` and request JSON whenever facts feed another Agent step:
 
 ```powershell
 .\acm.ps1 sync --json
@@ -56,11 +56,12 @@ Run fallback commands from the resolved repository root and request JSON wheneve
 .\acm.ps1 review week --json
 .\acm.ps1 plan list --json
 .\acm.ps1 plan tags preview <plan-id> --json
+.\acm.ps1 plan tags preview <plan-id> --mode cleanup --json
 .\acm.ps1 plan tags apply <plan-id> <preview-json> --json
 .\acm.ps1 plan check --json
 ```
 
-If configuration is missing, run `.\acm.ps1 init` on Windows or `./acm.sh init` on Linux/macOS and let the user enter a Codeforces handle and numeric Luogu UID. Do not invent account identifiers.
+If configuration is missing, run `.\acm.ps1 init` and let the user enter a Codeforces handle and numeric Luogu UID. Do not invent account identifiers.
 
 ## Coaching Contract
 
@@ -89,10 +90,13 @@ If configuration is missing, run `.\acm.ps1 init` on Windows or `./acm.sh init` 
 
 ### Plan tags
 
-- Prefer the dashboard's **补全标签** action. It starts `POST /api/jobs/plans/tags/preview`, waits for a preview, and only writes after explicit confirmation through `POST /api/plans/tags/apply`.
-- Platform tags are factual metadata: Codeforces comes from the official problemset catalog; Luogu comes from the public problem page. A failed lookup is an unresolved item, never a reason to invent a platform tag.
-- Default to `overwrite=false`. Preserve every non-empty human-authored tag list unless the user explicitly asks to replace it. Let the user edit proposed tags before applying them.
-- Send the preview's `base_revision` as `expected_revision` when applying. On HTTP `409 revision_conflict`, discard the stale preview, reload the plan, and preview again.
+- Treat tags as three layers. Platform `raw_tags` are immutable factual metadata; `effective_tags` merge platform and plan tags, remove deterministic metadata and global suppressions, then apply global additions; a closed attempt uses its frozen effective-tag snapshot. Recommendations, weakness analysis, and weekly review must consume effective tags, not raw tags or a newly resolved label set for historical attempts.
+- Prefer the dashboard's **补全标签** action for `mode=fill_missing` (the default) and **清理标签** for `mode=cleanup`. Both start `POST /api/jobs/plans/tags/preview`, show an editable preview, and write only after explicit confirmation through `POST /api/plans/tags/apply`.
+- Platform tags are factual metadata: Codeforces comes from the official problemset catalog; Luogu comes from the public problem page. A failed lookup is an unresolved item, never a reason to invent a platform tag. Years, regions/provincial selections, event sources, and O2/compiler-option labels remain visible as raw metadata but are ignored by training unless an explicit global `add` restores one.
+- Default to `fill_missing` and preserve every non-empty effective tag list unless the user explicitly requests cleanup. A cleanup preview must expose `raw_tags`, `current_tags`, `suggested_tags`, `added_tags`, `removed_tags`, and `ignored_meta_tags`; let the user edit the complete desired tag list before applying it.
+- In apply proposals, `tags` is the complete desired effective-tag set. An empty array is an explicit request to remove every effective tag; do not reinterpret it as “no change.” The service recomputes add/suppress differences and must not trust client-supplied diff fields.
+- Send both preview revisions when applying: `base_revision` as `expected_revision` and `override_revision` as `expected_override_revision`. On either HTTP 409 conflict, discard the stale preview, reload the plan and override state, and preview again.
+- Global add/suppress decisions apply to the same problem in every plan and catalog recommendation. Applying a preview may update the selected managed plan copy, but must never rewrite platform raw tags or bulk-rewrite unrelated plan files.
 - Tags describe subject matter only. They never imply an attempt, acceptance, or review status.
 - When the user explicitly asks the Agent to fill items that have no platform tags, the Agent may read the public problem statement and metadata, but must not read editorials, solution explanations, or full solution code. Produce a small set of stable algorithm/data-structure tags, distinguish these as Agent-generated, and show them for confirmation.
 - Apply Agent-generated tags through the same API or `plan tags apply` CLI path. These paths create/update the managed `.acm/plans/<plan_id>.json` override with revision history. Never edit a built-in repository plan file directly.
@@ -107,8 +111,8 @@ POST /api/jobs/sync {"platform":"all"}
 POST /api/sessions/start {"problem":"CF1A","with_stress":false}
 POST /api/jobs/verify {"problem":"CF1A","debug":false,"exact":false}
 POST /api/sessions/close {"problem":"CF1A","result":"AC","minutes":30,"hint_level":0,"failure":"none","notes":null}
-POST /api/jobs/plans/tags/preview {"plan_id":"data-structures-30d","expected_revision":3,"overwrite":false}
-POST /api/plans/tags/apply {"plan_id":"data-structures-30d","expected_revision":3,"proposals":[{"task_key":"day01-p3374","tags":["树状数组"]}]}
+POST /api/jobs/plans/tags/preview {"plan_id":"data-structures-30d","expected_revision":3,"mode":"cleanup"}
+POST /api/plans/tags/apply {"plan_id":"data-structures-30d","expected_revision":3,"expected_override_revision":7,"proposals":[{"task_key":"day01-p3374","tags":["树状数组"]}]}
 ```
 
 ## Skip Contract
@@ -119,7 +123,7 @@ POST /api/plans/tags/apply {"plan_id":"data-structures-30d","expected_revision":
 - Reject rather than work around `already_accepted` or `active_session` errors. Use unskip only when the user explicitly asks to restore the problem to the recommendation pool.
 - Read Skip state from `GET /api/problems/skipped`, `skipped --json`, or structured status output. Never reconstruct it from plan progress or recommendation absence.
 
-Before `close`, obtain result, minutes, highest hint level, failure mode, and notes from the user when missing; never invent them. The `close` response is the single-problem retrospective and may contain an archive candidate. `review week` is only for a weekly review.
+Before `close`, obtain result, minutes, highest hint level, failure mode, and notes from the user when missing; never invent them. `close` stores the attempt result and its effective-tag snapshot together, so later tag edits cannot change historical weakness attribution. The `close` response is the single-problem retrospective and may contain an archive candidate. `review week` is only for a weekly review; if structured output marks an older attempt as a legacy tag fallback, report that limitation instead of presenting its current labels as frozen history.
 
 For a non-interactive CLI close, use:
 

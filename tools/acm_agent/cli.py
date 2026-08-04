@@ -309,8 +309,10 @@ def command_plan_template(args: argparse.Namespace, paths: Any) -> int:
 
 
 def command_plan_tags_preview(args: argparse.Namespace, paths: Any) -> int:
+    mode = getattr(args, "mode", "fill_missing")
     payload = _service(paths).plan_tags_preview(
         args.plan_id,
+        mode=mode,
         overwrite=args.overwrite,
         refresh=not args.no_refresh,
     )
@@ -322,8 +324,9 @@ def command_plan_tags_preview(args: argparse.Namespace, paths: Any) -> int:
         )
         payload = {**payload, "output": str(args.output.resolve())}
     coverage = payload["coverage"]
+    action = "清理" if mode == "cleanup" else "补全"
     human = (
-        f"题单 {args.plan_id} 标签预览：{coverage['suggested']}/"
+        f"题单 {args.plan_id} 标签{action}预览：{coverage['suggested']}/"
         f"{coverage['eligible']} 项有建议"
     )
     if args.output:
@@ -332,29 +335,47 @@ def command_plan_tags_preview(args: argparse.Namespace, paths: Any) -> int:
     return 0
 
 
-def _tag_apply_input(path: Path) -> tuple[list[Any], int | None]:
+def _tag_apply_input(path: Path) -> tuple[list[Any], int | None, int | None]:
     value = json.loads(path.read_text(encoding="utf-8-sig"))
     if isinstance(value, list):
-        return value, None
+        return value, None, None
     if not isinstance(value, Mapping):
         raise ValueError("标签建议文件必须是 proposals 数组或预览结果对象")
     # Accept direct CLI output and a persisted web job record.
     candidate: Any = value
-    if isinstance(candidate.get("data"), Mapping):
-        candidate = candidate["data"]
-    if isinstance(candidate.get("result"), Mapping):
-        candidate = candidate["result"]
+    revisions: list[Mapping[str, Any]] = [candidate]
+    for key in ("data", "result", "preview"):
+        nested = candidate.get(key)
+        if isinstance(nested, Mapping):
+            candidate = nested
+            revisions.append(candidate)
     proposals = candidate.get("proposals")
     if not isinstance(proposals, list):
         raise ValueError("标签建议文件缺少 proposals 数组")
-    base_revision = candidate.get("base_revision")
-    return proposals, int(base_revision) if base_revision is not None else None
+    base_revision = next(
+        (item.get("base_revision") for item in reversed(revisions) if item.get("base_revision") is not None),
+        None,
+    )
+    override_revision = next(
+        (item.get("override_revision") for item in reversed(revisions) if item.get("override_revision") is not None),
+        None,
+    )
+    return (
+        proposals,
+        int(base_revision) if base_revision is not None else None,
+        int(override_revision) if override_revision is not None else None,
+    )
 
 
 def command_plan_tags_apply(args: argparse.Namespace, paths: Any) -> int:
-    proposals, file_revision = _tag_apply_input(args.file)
+    proposals, file_revision, file_override_revision = _tag_apply_input(args.file)
     service = _service(paths)
     expected = args.expected_revision if args.expected_revision is not None else file_revision
+    expected_override = (
+        getattr(args, "expected_override_revision", None)
+        if getattr(args, "expected_override_revision", None) is not None
+        else file_override_revision
+    )
     if expected is None:
         raise ValueError(
             "标签建议文件缺少 base_revision；请使用 preview 输出或提供 --expected-revision"
@@ -363,12 +384,13 @@ def command_plan_tags_apply(args: argparse.Namespace, paths: Any) -> int:
         args.plan_id,
         expected_revision=expected,
         proposals=proposals,
+        expected_override_revision=expected_override,
     )
     _emit(
         payload,
         as_json=args.json,
         human=(
-            f"题单 {args.plan_id} 已补全 {payload['updated']} 项标签，"
+            f"题单 {args.plan_id} 已更新 {payload['updated']} 项标签，"
             f"跳过 {payload['skipped']} 项；当前修订 {payload['revision']}。"
         ),
     )
@@ -519,6 +541,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     tags_preview = tags_sub.add_parser("preview", help="从平台公开数据生成标签建议")
     tags_preview.add_argument("plan_id")
+    tags_preview.add_argument(
+        "--mode",
+        choices=("fill_missing", "cleanup"),
+        default="fill_missing",
+        help="补全缺失标签（默认）或清理无关元标签",
+    )
     tags_preview.add_argument("--overwrite", action="store_true", help="也为已有标签题生成建议")
     tags_preview.add_argument("--no-refresh", action="store_true", help="CF 本地目录缺失时不刷新官方题库")
     tags_preview.add_argument("--output", type=Path, help="保存可供 apply 使用的 JSON")
@@ -529,6 +557,7 @@ def build_parser() -> argparse.ArgumentParser:
     tags_apply.add_argument("plan_id")
     tags_apply.add_argument("file", type=Path)
     tags_apply.add_argument("--expected-revision", type=int)
+    tags_apply.add_argument("--expected-override-revision", type=int)
     tags_apply.add_argument("--json", action="store_true")
     tags_apply.set_defaults(handler=command_plan_tags_apply)
 

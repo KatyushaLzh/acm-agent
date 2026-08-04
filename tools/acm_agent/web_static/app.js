@@ -16,6 +16,8 @@ const state = {
   tagPreview: null,
   tagPreviewPlanId: "",
   tagPreviewRevision: null,
+  tagPreviewOverrideRevision: null,
+  tagPreviewMode: "fill_missing",
   skipCandidate: null,
   skippedProblems: [],
 };
@@ -667,6 +669,7 @@ function renderPlanEditor() {
       <div class="plan-editor-actions">
         <button type="button" class="button ${editingMeta ? "primary" : "secondary"}" data-plan-action="edit-meta">${editingMeta ? "完成编辑" : "编辑题单信息"}</button>
         <button type="button" class="button secondary" data-plan-action="complete-tags">补全标签</button>
+        <button type="button" class="button secondary" data-plan-action="cleanup-tags">清理标签</button>
         <button type="button" class="button secondary" data-plan-action="export">导出</button>
         <button type="button" class="button secondary" data-plan-action="revisions">历史版本</button>
         <button type="button" class="button secondary" data-plan-action="toggle">${meta.enabled === false ? "启用" : "停用"}</button>
@@ -961,6 +964,18 @@ function tagList(value) {
   return [];
 }
 
+function tagDifference(left, right) {
+  const rightKeys = new Set(tagList(right).map(tag => tag.toLocaleLowerCase()));
+  return tagList(left).filter(tag => !rightKeys.has(tag.toLocaleLowerCase()));
+}
+
+function renderTagChips(tags, className = "") {
+  const values = tagList(tags);
+  return values.length
+    ? values.map(tag => `<b class="tag ${className}">${escapeHtml(tag)}</b>`).join("")
+    : "<em>无</em>";
+}
+
 function tagSourceLabel(value) {
   if (Array.isArray(value)) return value.map(tagSourceLabel).filter(Boolean).join("、");
   if (value && typeof value === "object") return String(value.label || value.name || value.provider || value.type || "");
@@ -1005,7 +1020,13 @@ function renderTagPreview(payload) {
   const before = preview?.coverage_before ?? coverage.coverage_before ?? coverage.before ?? coverage.current ?? (total ? skippedNonempty / total : (Number.isFinite(taggedBefore) ? taggedBefore : null));
   const after = preview?.coverage_after ?? coverage.coverage_after ?? coverage.after ?? coverage.projected ?? (total ? Math.min(total, skippedNonempty + suggestedCount) / total : coverage.ratio);
   state.tagPreview = { ...preview, proposals };
-  state.tagPreviewRevision = Number(preview?.base_revision ?? preview?.revision ?? state.tagPreviewRevision);
+  const revision = preview?.base_revision ?? preview?.revision;
+  const overrideRevision = preview?.override_revision;
+  if (revision != null) state.tagPreviewRevision = Number(revision);
+  if (overrideRevision != null) state.tagPreviewOverrideRevision = Number(overrideRevision);
+  state.tagPreviewMode = preview?.mode === "cleanup" ? "cleanup" : state.tagPreviewMode;
+  const cleanup = state.tagPreviewMode === "cleanup";
+  $("#plan-tags-title").textContent = cleanup ? "确认清理标签" : "确认补全标签";
 
   $("#plan-tags-summary").innerHTML = `
     <div><span>当前覆盖</span><strong>${escapeHtml(formatCoverage(before, total))}</strong></div>
@@ -1025,11 +1046,20 @@ function renderTagPreview(payload) {
     const name = item.name || item.problem_name || item.title || fallback.name || fallback.title || "题目名称待同步";
     const current = tagList(item.current_tags ?? item.existing_tags ?? item.original_tags ?? item.old_tags ?? fallback.tags);
     const suggested = tagList(item.suggested_tags ?? item.new_tags ?? item.tags ?? item.proposed_tags);
+    const raw = tagList(item.raw_tags);
+    const added = tagList(item.added_tags ?? tagDifference(suggested, current));
+    const removed = tagList(item.removed_tags ?? tagDifference(current, suggested));
+    const ignored = tagList(item.ignored_meta_tags);
     const source = tagSourceLabel(item.source ?? item.sources ?? item.tag_source ?? item.evidence);
     return `<article class="tag-proposal" data-proposal-index="${index}">
       <div class="tag-proposal-problem"><strong>${escapeHtml(problemId)}</strong><span>${escapeHtml(name)}</span></div>
-      <div class="tag-proposal-original"><span>原标签</span><p>${current.length ? current.map(tag => `<b class="tag">${escapeHtml(tag)}</b>`).join("") : '<em>无</em>'}</p></div>
-      <label>建议标签<input data-tag-task-key="${escapeHtml(item.task_key || fallback.task_key || "")}" value="${escapeHtml(suggested.join(", "))}" placeholder="使用逗号分隔" aria-label="${escapeHtml(problemId)} 的建议标签"></label>
+      <div class="tag-proposal-original"><span>当前有效标签</span><p>${renderTagChips(current)}</p>${raw.length ? `<span>平台原始标签</span><p>${renderTagChips(raw)}</p>` : ""}</div>
+      <label>期望有效标签<input data-tag-task-key="${escapeHtml(item.task_key || fallback.task_key || "")}" value="${escapeHtml(suggested.join(", "))}" placeholder="可留空；使用逗号分隔" aria-label="${escapeHtml(problemId)} 的期望有效标签"></label>
+      <div class="tag-proposal-diff">
+        <span>新增</span><p>${renderTagChips(added, "tag-added")}</p>
+        <span>删除</span><p>${renderTagChips(removed, "tag-removed")}</p>
+        <span>已忽略元标签</span><p>${renderTagChips(ignored, "tag-ignored")}</p>
+      </div>
       <div class="tag-proposal-source"><span>来源</span><strong>${escapeHtml(source)}</strong></div>
     </article>`;
   }).join("") : '<div class="empty-state compact">没有可应用的标签建议</div>';
@@ -1039,20 +1069,22 @@ function renderTagPreview(payload) {
 
 async function reloadAfterTagConflict(message) {
   if ($("#plan-tags-dialog").open) $("#plan-tags-dialog").close();
-  toast("题单版本已变化", message || "请基于最新版本重新生成标签建议。", "error");
+  toast("标签状态已变化", message || "题单或全局标签已被修改，请基于最新版本重新预览。", "error");
   await selectPlan(state.selectedPlanId, true);
   await refreshPlanSummaries();
 }
 
-async function startTagPreview(button) {
+async function startTagPreview(button, mode = "fill_missing") {
   if (!state.selectedPlan || !state.selectedPlanMeta) return;
   const planId = state.selectedPlan.plan_id;
   const revision = state.selectedPlanMeta.revision;
   state.tagPreviewPlanId = planId;
   state.tagPreviewRevision = revision;
+  state.tagPreviewOverrideRevision = null;
+  state.tagPreviewMode = mode;
   setBusy(button, true, "分析中…");
   try {
-    const started = await api("/api/jobs/plans/tags/preview", { body: { plan_id: planId, expected_revision: revision, overwrite: false } });
+    const started = await api("/api/jobs/plans/tags/preview", { body: { plan_id: planId, expected_revision: revision, mode, overwrite: false } });
     const jobId = started.job_id || started.id || started.job?.id;
     const result = jobId ? await waitForTagJob(jobId) : started;
     if (state.selectedPlanId !== planId) {
@@ -1078,11 +1110,13 @@ async function applyTagPreview(button) {
     const applied = await api("/api/plans/tags/apply", { body: {
       plan_id: state.tagPreviewPlanId,
       expected_revision: state.tagPreviewRevision,
+      expected_override_revision: state.tagPreviewOverrideRevision,
       proposals,
     } });
+    const cleanup = state.tagPreviewMode === "cleanup";
     $("#plan-tags-dialog").close();
     state.tagPreview = null;
-    toast("标签已补全", `已更新 ${applied.updated ?? proposals.filter(item => item.tags.length).length} 道题，推荐结果正在刷新。`);
+    toast(cleanup ? "标签已清理" : "标签已补全", `已更新 ${applied.updated ?? proposals.length} 道题，推荐结果正在刷新。`);
     await selectPlan(planId, true);
     await refreshPlanSummaries();
     await requestRecommendations();
@@ -1361,6 +1395,8 @@ function setupEvents() {
     state.tagPreview = null;
     state.tagPreviewPlanId = "";
     state.tagPreviewRevision = null;
+    state.tagPreviewOverrideRevision = null;
+    state.tagPreviewMode = "fill_missing";
   });
   $("#plan-editor").addEventListener("change", event => {
     const target = event.target;
@@ -1389,7 +1425,8 @@ function setupEvents() {
     else if (action === "close-revisions") $("#plan-revisions").classList.add("hidden");
     else if (action === "toggle") toggleSelectedPlan();
     else if (action === "delete") deleteSelectedPlan();
-    else if (action === "complete-tags") startTagPreview(actionButton);
+    else if (action === "complete-tags") startTagPreview(actionButton, "fill_missing");
+    else if (action === "cleanup-tags") startTagPreview(actionButton, "cleanup");
     else if (action === "reload") selectPlan(state.selectedPlanId, true);
     else if (action === "edit-meta") {
       state.editingPlanMeta = !state.editingPlanMeta;

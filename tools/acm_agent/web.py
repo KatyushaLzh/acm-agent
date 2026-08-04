@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+import csv
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hmac
@@ -18,7 +19,6 @@ import json
 import mimetypes
 import os
 from pathlib import Path
-import re
 import secrets
 import stat
 import subprocess
@@ -141,7 +141,11 @@ class JobManager:
 def _problem_from_exception(exc: Exception) -> ApiProblem:
     if isinstance(exc, ApiProblem):
         return exc
-    if exc.__class__.__name__ == "RevisionConflict":
+    if exc.__class__.__name__ in {
+        "RevisionConflict",
+        "PlanRevisionConflict",
+        "TagOverrideRevisionConflict",
+    }:
         return ApiProblem(HTTPStatus.CONFLICT, "revision_conflict", str(exc))
     if exc.__class__.__name__ == "DuplicatePlanError":
         return ApiProblem(HTTPStatus.CONFLICT, "duplicate_plan", str(exc))
@@ -554,16 +558,16 @@ def _restrict_runtime_permissions(path: Path) -> None:
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        text=True,
         timeout=10,
         creationflags=creation_flags,
         check=False,
     )
-    sid = re.search(rb"S-\d+(?:-\d+)+", whoami.stdout or b"")
-    if whoami.returncode != 0 or sid is None:
-        detail = (whoami.stdout or b"").decode("mbcs", errors="replace").strip()
-        detail = detail or f"exit code {whoami.returncode}"
-        raise PermissionError(f"Unable to determine current Windows SID: {detail}")
-    identity = f"*{sid.group().decode('ascii')}"
+    try:
+        identity = f"*{next(csv.reader([whoami.stdout.strip()]))[1]}"
+    except (IndexError, StopIteration, csv.Error) as exc:
+        detail = whoami.stdout.strip() or f"exit code {whoami.returncode}"
+        raise PermissionError(f"Unable to determine current Windows SID: {detail}") from exc
     completed = subprocess.run(
         [
             "icacls",
@@ -577,13 +581,13 @@ def _restrict_runtime_permissions(path: Path) -> None:
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        text=True,
         timeout=10,
         creationflags=creation_flags,
         check=False,
     )
     if completed.returncode != 0:
-        detail = (completed.stdout or b"").decode("mbcs", errors="replace").strip()
-        detail = detail or f"exit code {completed.returncode}"
+        detail = completed.stdout.strip() or f"exit code {completed.returncode}"
         raise PermissionError(f"Unable to protect web-runtime.json ACL: {detail}")
 
 

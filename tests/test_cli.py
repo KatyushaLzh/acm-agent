@@ -186,12 +186,21 @@ class CliEndToEndTests(unittest.TestCase):
             preview = self.run_json(
                 root,
                 "plan", "tags", "preview", "cli-plan",
-                "--no-refresh", "--output", str(proposal_file),
+                "--mode", "cleanup", "--no-refresh", "--output", str(proposal_file),
             )
+            self.assertEqual(preview["mode"], "cleanup")
+            self.assertIsInstance(preview["override_revision"], int)
             self.assertEqual(preview["coverage"]["suggested"], 1)
             self.assertTrue(proposal_file.is_file())
+            saved_preview = json.loads(proposal_file.read_text(encoding="utf-8"))
+            self.assertEqual(
+                saved_preview["override_revision"], preview["override_revision"]
+            )
             applied_tags = self.run_json(
                 root, "plan", "tags", "apply", "cli-plan", str(proposal_file)
+            )
+            self.assertGreaterEqual(
+                applied_tags["override_revision"], preview["override_revision"]
             )
             self.assertEqual(applied_tags["updated"], 1)
             self.assertEqual(

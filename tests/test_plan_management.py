@@ -202,7 +202,7 @@ class StorageMigrationTests(unittest.TestCase):
                 self.assertEqual(task["name"], "CF1A")
                 self.assertEqual(task["level"], "B")
 
-    def test_schema_three_migrates_skip_dispositions_and_audit_events(self) -> None:
+    def test_schema_three_migrates_through_current_schema_with_skip_audit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "state.db"
             connection = sqlite3.connect(path)
@@ -214,7 +214,6 @@ class StorageMigrationTests(unittest.TestCase):
 
             with Database(path) as database:
                 version = database.connection.execute("PRAGMA user_version").fetchone()[0]
-                self.assertEqual(version, 4)
                 self.assertEqual(version, SCHEMA_VERSION)
                 tables = {
                     row["name"]
