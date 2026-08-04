@@ -7,6 +7,7 @@
   <meta name="description" content="ACM Agent 本地训练仪表盘">
   <title>ACM Agent</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
@@ -74,8 +75,10 @@
             </details>
             <label><span class="sr-only">推荐数量</span><select name="count"><option value="3">3 题</option><option value="6">6 题</option><option value="9">9 题</option></select></label>
             <button class="button secondary" type="submit">重新推荐</button>
+            <button id="ai-recommend-button" class="button primary" type="button">AI 个性化</button>
           </form>
         </div>
+        <p class="subtle">“AI 个性化”会发送最近 90 天内最多 50 次结构化尝试、冻结标签、薄弱度、目标 rating 与确定性候选；不会发送账号、notes、聊天、源码或本地路径。</p>
         <div id="recommend-basis" class="basis-banner plan_only">尚未生成推荐</div>
         <div id="recommendations" class="recommend-grid empty-state"><p>同步平台状态或直接生成一组训练。</p></div>
 
@@ -158,6 +161,24 @@
           <pre id="verify-output">编译信息、样例结果和对拍诊断会显示在这里。</pre>
         </article>
 
+        <article class="panel ai-workbench-panel">
+          <div class="panel-heading"><div><p class="eyebrow">DEEPSEEK</p><h2>AI 做题对话</h2></div><span id="ai-chat-state" class="badge neutral">未连接</span></div>
+          <p class="subtle">发送时会将当前题面、源码、attempt 与本次对话提交给你配置的 DeepSeek API。不会发送账号、文件路径或 API Key。</p>
+          <div class="ai-context-grid">
+            <label>题号<input id="ai-problem" autocomplete="off" placeholder="开始题目后自动填入，也可切换 active session"></label>
+            <label>模式<select id="ai-mode"><option value="hint">分级提示</option><option value="explain">解释疑点</option><option value="review">代码诊断</option></select></label>
+            <label>提示等级<select id="ai-hint-level"><option value="1">1 — 反例提问</option><option value="2">2 — 关键性质</option><option value="3">3 — 转化 / 伪代码</option></select></label>
+            <button id="ai-context-button" class="button secondary" type="button">读取 / 抓取题面</button>
+          </div>
+          <details class="ai-statement-editor"><summary>题面上下文</summary><textarea id="ai-statement" rows="8" maxlength="131072" placeholder="自动抓取失败时可粘贴题面；保存后人工版本优先。"></textarea><div class="card-actions"><button id="ai-statement-save" class="button secondary" type="button">保存人工题面</button><button id="ai-statement-restore" class="button secondary" type="button">恢复自动题面</button><span id="ai-context-source" class="subtle">尚未读取</span></div></details>
+          <div id="ai-chat-messages" class="ai-chat-messages empty-state compact">开始题目后可在这里请求分级提示或代码诊断。</div>
+          <form id="ai-chat-form" class="ai-chat-form">
+            <textarea name="message" rows="3" maxlength="12000" required placeholder="描述你的思路、卡点或希望检查的代码问题"></textarea>
+            <div class="card-actions"><button class="button primary" type="submit">发送</button><button id="ai-patch-preview" class="button secondary" type="button">生成AI修改代码</button><button id="ai-chat-clear" class="button danger" type="button">清除本题对话</button></div>
+          </form>
+          <div id="ai-patch-box" class="result-box hidden"><div class="patch-preview-heading"><strong>修改后的完整代码</strong><span class="subtle">注释会说明原代码错误与修复原因</span></div><pre id="ai-patch-code" class="cpp-code" aria-label="修改后的 C++ 代码"></pre><div class="card-actions"><button id="ai-patch-apply" class="button primary" type="button">确认应用并验证</button><button id="ai-patch-revert" class="button secondary" type="button">回退补丁</button></div></div>
+        </article>
+
         <article class="panel close-panel">
           <div class="panel-heading"><div><p class="eyebrow">RETROSPECT</p><h2>结束与复盘</h2></div><span class="subtle">只生成归档候选，不修改知识索引</span></div>
           <form id="close-form" class="form-grid close-form">
@@ -212,6 +233,22 @@
             <div class="settings-actions"><button id="plan-check-button" class="button secondary">校验 30 天题单</button><button id="shutdown-button" class="button danger">停止本地服务</button></div>
             <div id="plan-result" class="result-box hidden"></div>
           </article>
+          <article class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">DEEPSEEK BYOK</p><h2>AI 设置</h2></div><span id="ai-key-state" class="badge neutral">未检测</span></div>
+            <p class="subtle">可直接在这里保存并启用。密钥由 Windows DPAPI 按当前登录用户加密，服务重启后自动恢复；明文不会写入 JSON、SQLite、日志或接口响应。</p>
+            <form id="ai-credential-form" class="stack-form credential-form">
+              <label>DeepSeek API Key<input name="api_key" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" maxlength="512" placeholder="输入新 Key；保存后输入框会立即清空"></label>
+              <p id="ai-key-detail" class="credential-detail">正在读取凭据状态…</p>
+              <div class="card-actions"><button class="button primary" type="submit">保存并启用</button><button id="ai-key-clear" class="button danger" type="button">清除已保存 Key</button></div>
+            </form>
+            <form id="ai-settings-form" class="stack-form">
+              <label>推荐模型<select name="recommendation_model"><option value="deepseek-v4-flash">DeepSeek V4 Flash</option><option value="deepseek-v4-pro">DeepSeek V4 Pro</option></select></label>
+              <label>对话模型<select name="coaching_model"><option value="deepseek-v4-flash">DeepSeek V4 Flash</option><option value="deepseek-v4-pro">DeepSeek V4 Pro</option></select></label>
+              <label class="check"><input name="coaching_thinking" type="checkbox">对话和补丁启用 thinking</label>
+              <label>推理强度<select name="reasoning_effort"><option value="high">high</option><option value="max">max</option></select></label>
+              <div class="card-actions"><button class="button primary" type="submit">保存 AI 设置</button><button id="ai-test-button" class="button secondary" type="button">测试连接</button></div>
+            </form>
+          </article>
         </div>
       </section>
     </main>
@@ -251,6 +288,8 @@
     </form>
   </dialog>
   <template id="toast-template"><div class="toast"><strong></strong><p></p></div></template>
+  <script src="/static/vendor/katex/katex.min.js" defer></script>
+  <script src="/static/vendor/katex/contrib/auto-render.min.js" defer></script>
   <script src="/static/app.js" defer></script>
 </body>
 </html>

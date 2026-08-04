@@ -38,6 +38,16 @@ Status precedence is `accepted > skipped > attempted > local_only > not_started 
 - Do not silently continue when both platform state and cache are unavailable.
 - Keep stdout JSON machine-readable; user-facing explanations belong in the Agent response.
 
+## DeepSeek AI Rules
+
+- `GET /api/ai/status` returns only detection, source (`secure_store`, `environment`, `injected`, or `none`), persisted state, and a sanitized load error; it never returns the key.
+- `POST /api/ai/credential` is the only endpoint that accepts a key. It is synchronous, loopback-token protected, excluded from the job registry, and persists only a Windows current-user DPAPI ciphertext. `{ "clear": true }` deletes that ciphertext. Browser code must clear the password input after every attempt and must not use browser storage.
+- Models are restricted to `deepseek-v4-flash` and `deepseek-v4-pro`. Recommendation requests always disable thinking.
+- AI recommendation items retain deterministic `score`, `breakdown`, and `reasons`, and add `ranking_basis`, `ai_reason`, `training_focus`, `ai_run_id`, and `ai_usage`. Provider/protocol/candidate failures return deterministic order plus `ai.fallback`.
+- Coaching conversation messages persist locally. SSE event names are exactly `meta`, `delta`, `usage`, `done`, and `error`; a disconnected partial answer is stored as `interrupted`.
+- `review` and every patch proposal count as hint level 4. `close` stores the maximum of explicit input and persisted AI assistant history.
+- A patch proposal is a complete replacement guarded by a baseline hash. `apply` and `revert` conflicts are HTTP 409 and must never overwrite a newer local edit.
+
 ## Plan and Recommendation Rules
 
 - `source_mode` is `balanced`, `catalog_only`, or `plan_only`. Balanced mode caps plan tasks at `ceil(2 * count / 3)` and does not silently exceed the cap when the catalog is short.

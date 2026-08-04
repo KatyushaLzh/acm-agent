@@ -21,6 +21,8 @@ Python 3.13 标准库驱动的本地训练系统。网页是主要入口，CLI �
 .\acm.ps1 sync
 .\acm.ps1 status
 .\acm.ps1 next
+.\acm.ps1 ai status
+.\acm.ps1 next --ai
 .\acm.ps1 plan list
 .\acm.ps1 plan import .\my-plan.json
 ```
@@ -41,7 +43,39 @@ Python 3.13 标准库驱动的本地训练系统。网页是主要入口，CLI �
 
 所有读取状态的命令都支持 `--json`。推荐输出包含数据新鲜度、位置、总分、每项分数和选择原因；平台同步失败不会删除最后一次成功快照。
 
-网页与 CLI 直接调用同一业务服务层，不通过子进程互相调用。旧版 `.acm/state.db` 会自动升级；从 schema v4 升级前会先通过 SQLite backup API 保存一次数据库备份。
+网页与 CLI 直接调用同一业务服务层，不通过子进程互相调用。旧版 `.acm/state.db` 会自动升级；从 schema v4/v5 升级前会分别通过 SQLite backup API 保存一次数据库备份。
+
+## DeepSeek BYOK 与 AI 工作台
+
+AI 功能是显式 opt-in：普通 `next` 和原有工作流不会因为检测到密钥而调用模型。Windows Dashboard 的“AI 设置”可直接输入 API Key；服务使用 Windows DPAPI 按当前登录用户加密后保存到 `.acm/deepseek-key.dpapi`，重启后自动恢复。磁盘文件不含明文，密钥不会进入 JSON 配置、SQLite、日志或 API 响应。非 Windows 环境不会退化为明文存储，可继续使用进程环境变量：
+
+```powershell
+$env:DEEPSEEK_API_KEY = "你的密钥"
+.\acm.ps1 ai status
+.\acm.ps1 ai test
+.\acm.ps1 next --ai --count 3
+```
+
+网页可随时替换或清除已加密凭据。若同时存在 DPAPI 凭据和环境变量，DPAPI 凭据优先；清除后仍可回退到环境变量。
+
+推荐和对话默认使用 `deepseek-v4-flash`，可分别改为 `deepseek-v4-pro`。推荐始终先由确定性引擎生成合规候选，DeepSeek 只重排候选；网络、鉴权、余额、限流、非法 JSON 或越权题号都会回退到原确定性顺序，并保留原有分数、分项和原因。
+
+做题工作台支持按题目持久化的流式对话、1–3 级提示、4 级代码诊断，以及“生成带错误说明注释的完整候选源码 → C++ 语法高亮预览 → 用户确认 → 备份并验证”的补丁流程。预览区只显示修改后的完整代码，不展示 unified diff；diff 仍由服务端生成并保留用于审计和安全应用。切换题号时会恢复该 active attempt 对应的会话，不会把另一道题的消息混入当前面板。“清除本题对话”会归档旧会话并创建新的空会话；旧消息不再参与后续模型上下文，但仍保留提示等级、token 用量和补丁审计。题面自动抓取仅读取 Codeforces 的 `.problem-statement` 或洛谷公开题面字段，不读取题解；失败时可粘贴人工题面，人工版本优先并可显式恢复自动版本。补丁应用前校验受管 `.cpp` 路径与基线 SHA-256，冲突不会覆盖新修改，验证失败也不会自动回滚。
+
+首次发送前，Dashboard 会提示数据出站范围。AI 推荐只发送最多 90 天/50 次尝试的结构化结果与冻结标签，不发送账号、notes、聊天、源码或本地路径；工作台对话会发送当前题面、有效标签、源码、attempt 和最近对话，但不会发送账号、文件路径或 API Key。`reasoning_content` 不展示也不保存。
+
+常用 CLI：
+
+```powershell
+.\acm.ps1 ai settings --recommend-model deepseek-v4-flash --coach-model deepseek-v4-pro --thinking --reasoning-effort high
+.\acm.ps1 context fetch CF1234A
+.\acm.ps1 context show CF1234A --json
+.\acm.ps1 context set CF1234A --file .\statement.md
+.\acm.ps1 ask CF1234A "我这个不变量哪里错了？" --mode hint --hint-level 2
+.\acm.ps1 patch preview CF1234A "修复越界" --json
+.\acm.ps1 patch apply <proposal-id> --json
+.\acm.ps1 patch revert <proposal-id> --json
+```
 
 ## 多题单
 

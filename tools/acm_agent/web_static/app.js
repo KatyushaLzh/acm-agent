@@ -20,6 +20,15 @@ const state = {
   tagPreviewMode: "fill_missing",
   skipCandidate: null,
   skippedProblems: [],
+  aiStatus: null,
+  aiProblemKey: "",
+  aiConversationId: "",
+  aiConversationProblemKey: "",
+  aiEpoch: 0,
+  aiStreamController: null,
+  aiContextHash: null,
+  aiPatchProposalId: "",
+  aiPatchProblemKey: "",
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -73,6 +82,86 @@ function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>'"]/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
 }
 
+const CPP_KEYWORDS = new Set([
+  "alignas", "alignof", "asm", "auto", "break", "case", "catch", "class", "concept", "const",
+  "consteval", "constexpr", "constinit", "const_cast", "continue", "co_await", "co_return", "co_yield",
+  "decltype", "default", "delete", "do", "dynamic_cast", "else", "enum", "explicit", "export", "extern",
+  "for", "friend", "goto", "if", "inline", "mutable", "namespace", "new", "noexcept", "operator",
+  "private", "protected", "public", "register", "reinterpret_cast", "requires", "return", "sizeof", "static",
+  "static_assert", "static_cast", "struct", "switch", "template", "this", "thread_local", "throw", "try",
+  "typedef", "typeid", "typename", "union", "using", "virtual", "volatile", "while",
+]);
+const CPP_TYPES = new Set([
+  "bool", "char", "char8_t", "char16_t", "char32_t", "double", "float", "int", "long", "short", "signed",
+  "unsigned", "void", "wchar_t", "size_t", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t",
+  "uint16_t", "uint32_t", "uint64_t", "string", "vector", "array", "map", "set", "queue", "deque",
+  "stack", "pair", "tuple",
+]);
+const CPP_LITERALS = new Set(["true", "false", "nullptr", "NULL"]);
+
+function cppSpan(kind, value) {
+  return `<span class="cpp-${kind}">${escapeHtml(value)}</span>`;
+}
+
+function highlightCpp(source) {
+  const value = String(source ?? "");
+  let output = ""; let index = 0; let lineStart = true;
+  while (index < value.length) {
+    const char = value[index]; const next = value[index + 1] || "";
+    if (char === "\n") { output += "\n"; index += 1; lineStart = true; continue; }
+    if (/\s/.test(char)) { output += escapeHtml(char); index += 1; continue; }
+    if (lineStart && char === "#") {
+      let end = index;
+      while (end < value.length && value[end] !== "\n") end += 1;
+      output += cppSpan("preprocessor", value.slice(index, end)); index = end; lineStart = false; continue;
+    }
+    lineStart = false;
+    if (char === "/" && next === "/") {
+      let end = index + 2;
+      while (end < value.length && value[end] !== "\n") end += 1;
+      output += cppSpan("comment", value.slice(index, end)); index = end; continue;
+    }
+    if (char === "/" && next === "*") {
+      let end = value.indexOf("*/", index + 2);
+      end = end < 0 ? value.length : end + 2;
+      output += cppSpan("comment", value.slice(index, end));
+      lineStart = value.slice(index, end).endsWith("\n"); index = end; continue;
+    }
+    if (char === '"' || char === "'") {
+      const quote = char; let end = index + 1;
+      while (end < value.length) {
+        if (value[end] === "\\") { end += 2; continue; }
+        if (value[end] === quote) { end += 1; break; }
+        end += 1;
+      }
+      output += cppSpan("string", value.slice(index, end)); index = end; continue;
+    }
+    if (/[A-Za-z_]/.test(char)) {
+      let end = index + 1;
+      while (end < value.length && /[A-Za-z0-9_]/.test(value[end])) end += 1;
+      const token = value.slice(index, end);
+      const kind = CPP_KEYWORDS.has(token) ? "keyword" : CPP_TYPES.has(token) ? "type" : CPP_LITERALS.has(token) ? "literal" : "identifier";
+      output += kind === "identifier" ? escapeHtml(token) : cppSpan(kind, token); index = end; continue;
+    }
+    if (/\d/.test(char) || (char === "." && /\d/.test(next))) {
+      let end = index + 1;
+      while (end < value.length && /[A-Za-z0-9_.'+-]/.test(value[end])) end += 1;
+      output += cppSpan("number", value.slice(index, end)); index = end; continue;
+    }
+    if (/[{}()[\];,.?:~!%^&*+\-/|<>=]/.test(char)) {
+      let end = index + 1;
+      while (end < value.length && end < index + 3 && /[~!%^&*+\-/|<>=]/.test(value[end])) end += 1;
+      output += cppSpan("operator", value.slice(index, end)); index = end; continue;
+    }
+    output += escapeHtml(char); index += 1;
+  }
+  return output;
+}
+
+function renderCppSource(node, source) {
+  node.innerHTML = highlightCpp(source);
+}
+
 function safeHref(value) {
   try {
     const url = new URL(String(value));
@@ -98,12 +187,20 @@ function showAlert(message = "") {
 function setBusy(button, busy, busyText = "处理中…") {
   if (!button) return;
   if (busy) {
-    button.dataset.label = button.textContent;
+    if (button.dataset.busy !== "true") {
+      button.dataset.busyLabel = button.textContent;
+      button.dataset.busyWasDisabled = button.disabled ? "true" : "false";
+    }
+    button.dataset.busy = "true";
     button.textContent = busyText;
     button.disabled = true;
   } else {
-    button.textContent = button.dataset.label || button.textContent;
-    button.disabled = false;
+    if (button.dataset.busy !== "true") return;
+    button.textContent = button.dataset.busyLabel ?? button.textContent;
+    button.disabled = button.dataset.busyWasDisabled === "true";
+    delete button.dataset.busy;
+    delete button.dataset.busyLabel;
+    delete button.dataset.busyWasDisabled;
   }
 }
 
@@ -193,6 +290,7 @@ function renderActive(session) {
   node.className = "session-card";
   node.innerHTML = `<div class="card-top"><h3>${escapeHtml(id)}</h3><span class="badge good">计时中</span></div><span class="subtle">开始于 ${escapeHtml(formatTime(session.started_at || session.start_time))}</span>${path ? `<div class="path-row"><code title="${escapeHtml(path)}">${escapeHtml(path)}</code><button class="text-button copy-path" data-path="${escapeHtml(path)}">复制路径</button></div>` : ""}`;
   ["#verify-form input[name=problem]", "#close-form input[name=problem]"].forEach(selector => { if (!$(selector).value) $(selector).value = id; });
+  if (!$("#ai-problem").value) switchAiProblem(id);
 }
 
 function fillSettings(config, accounts) {
@@ -257,6 +355,8 @@ function renderRecommendations(data) {
       <div class="tags">${tags.slice(0, 4).map(tag => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</div>
       ${planSources.length || urgency ? `<div class="plan-source-row">${urgency ? `<span class="badge ${overdue ? "bad" : "warn"}">${escapeHtml(urgency)}</span>` : ""}${planSources.map(source => `<span class="tag">题单 · ${escapeHtml(source)}</span>`).join("")}</div>` : ""}
       <ul class="reasons">${(item.reasons || ["题库补充"]).slice(0, 3).map(reason => `<li>${escapeHtml(reason)}</li>`).join("")}</ul>
+      ${item.ai_reason ? `<p><strong>AI：</strong>${escapeHtml(item.ai_reason)}</p>` : ""}
+      ${item.training_focus ? `<p class="subtle">训练重点：${escapeHtml(item.training_focus)}</p>` : ""}
       ${scoreParts.length ? `<details class="score-details"><summary>查看分数分解</summary><div class="score-grid">${scoreParts.map(([key, value]) => `<span>${escapeHtml(key)}</span><b>${escapeHtml(value)}</b>`).join("")}</div></details>` : ""}
       <div class="card-actions"><button class="button primary start-recommendation" data-problem="${escapeHtml(id)}">开始这题</button><button class="button secondary skip-recommendation" data-recommendation-index="${recommendationIndex}">Skip</button>${item.url ? `<a href="${safeHref(item.url)}" target="_blank" rel="noopener noreferrer">打开题面 ↗</a>` : ""}</div>
     </article>`;
@@ -277,6 +377,406 @@ async function requestRecommendations() {
     } });
     renderRecommendations(data || {});
   } catch (error) { toast("推荐失败", error.message, "error"); }
+  finally { setBusy(button, false); }
+}
+
+async function waitForJob(jobId, label = "AI 任务处理中…") {
+  showJobProgress(label);
+  try {
+    for (;;) {
+      const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
+      const status = String(job.status || "running").toLowerCase();
+      if (["failed", "error", "cancelled"].includes(status)) throw new Error(job.error?.message || job.error || "后台任务失败");
+      if (["done", "success", "succeeded", "finished", "complete", "completed"].includes(status) || job.done === true) return jobResult(job) || job;
+      await new Promise(resolve => window.setTimeout(resolve, 600));
+    }
+  } finally { $("#job-progress").classList.add("hidden"); }
+}
+
+async function requestAiRecommendations(button) {
+  const form = $("#recommend-controls");
+  setBusy(button, true, "DeepSeek 重排中…");
+  try {
+    if (!state.aiStatus?.api_key_detected) {
+      toast("尚未启用 DeepSeek", "请先在设置页输入 API Key 并保存。", "error");
+      navigate("settings");
+      return;
+    }
+    const planIds = $$("input[type=checkbox]:checked", $("#recommend-plan-options")).map(input => input.value);
+    const started = await api("/api/jobs/ai/recommendations", { body: {
+      mode: form.elements.mode.value,
+      count: Number(form.elements.count.value),
+      source_mode: form.elements.source_mode.value,
+      plan_ids: planIds.length ? planIds : null,
+    } });
+    const result = await waitForJob(started.job_id, "正在用最近尝试明细重排候选…");
+    renderRecommendations(result || {});
+    toast(result?.ai?.fallback ? "AI 已降级" : "AI 推荐完成", result?.ai?.fallback || "确定性资格过滤保持不变。");
+  } catch (error) { toast("AI 推荐失败", error.message, "error"); }
+  finally { setBusy(button, false); }
+}
+
+async function loadAiStatus() {
+  try {
+    const status = await api("/api/ai/status");
+    state.aiStatus = status;
+    const sourceLabels = {
+      secure_store: "已安全保存",
+      environment: "环境变量",
+      injected: "测试凭据",
+      none: "未配置",
+    };
+    const sourceLabel = sourceLabels[status.credential_source] || "状态未知";
+    const badge = $("#ai-key-state");
+    badge.className = `badge ${status.api_key_detected ? "good" : "warn"}`;
+    badge.textContent = status.api_key_detected ? sourceLabel : "未配置";
+    $("#ai-chat-state").className = `badge ${status.api_key_detected ? "good" : "warn"}`;
+    $("#ai-chat-state").textContent = status.api_key_detected ? "可用" : "未配置";
+    const detail = $("#ai-key-detail");
+    detail.className = `credential-detail${status.credential_error ? " error" : ""}`;
+    detail.textContent = status.credential_error
+      ? `已保存凭据无法加载：${status.credential_error}`
+      : status.credential_source === "secure_store"
+        ? "已使用 Windows DPAPI 加密保存；重启本地服务后仍会自动启用。"
+        : status.credential_source === "environment"
+          ? "当前使用 DEEPSEEK_API_KEY 环境变量；可在上方输入新 Key 并改用加密存储。"
+          : status.api_key_detected
+            ? "当前测试服务已注入凭据。"
+            : "尚未配置。输入 Key 后点击“保存并启用”。";
+    const form = $("#ai-settings-form");
+    form.elements.recommendation_model.value = status.settings?.recommendation_model || "deepseek-v4-flash";
+    form.elements.coaching_model.value = status.settings?.coaching_model || "deepseek-v4-flash";
+    form.elements.coaching_thinking.checked = Boolean(status.settings?.coaching_thinking);
+    form.elements.reasoning_effort.value = status.settings?.reasoning_effort || "high";
+  } catch (error) { toast("AI 状态读取失败", error.message, "error"); }
+}
+
+async function saveAiCredential(form) {
+  const button = $("button[type=submit]", form);
+  const input = form.elements.api_key;
+  const key = input.value;
+  if (!key.trim()) return toast("无法启用", "请输入 DeepSeek API Key。", "error");
+  setBusy(button, true, "正在安全保存…");
+  try {
+    state.aiStatus = await api("/api/ai/credential", { body: { api_key: key } });
+    toast("DeepSeek 已启用", "密钥已由 Windows DPAPI 加密保存，服务重启后无需重新输入。");
+    await loadAiStatus();
+  } catch (error) { toast("API Key 保存失败", error.message, "error"); }
+  finally {
+    input.value = "";
+    setBusy(button, false);
+  }
+}
+
+async function clearAiCredential(button) {
+  if (!window.confirm("确认删除已加密保存的 DeepSeek API Key？")) return;
+  setBusy(button, true, "正在清除…");
+  try {
+    state.aiStatus = await api("/api/ai/credential", { body: { clear: true } });
+    toast("已清除保存的 Key", state.aiStatus.api_key_detected ? "环境变量中的 Key 仍然可用。" : "DeepSeek 已停用。");
+    await loadAiStatus();
+  } catch (error) { toast("API Key 清除失败", error.message, "error"); }
+  finally { setBusy(button, false); }
+}
+
+async function saveAiSettings(form) {
+  const button = $("button[type=submit]", form); setBusy(button, true);
+  try {
+    state.aiStatus = await api("/api/ai/settings", { body: {
+      recommendation_model: form.elements.recommendation_model.value,
+      coaching_model: form.elements.coaching_model.value,
+      coaching_thinking: form.elements.coaching_thinking.checked,
+      reasoning_effort: form.elements.reasoning_effort.value,
+    } });
+    toast("AI 设置已保存", "模型与 thinking 设置已更新。凭据由独立的 DPAPI 存储管理。");
+    await loadAiStatus();
+  } catch (error) { toast("AI 设置失败", error.message, "error"); }
+  finally { setBusy(button, false); }
+}
+
+function currentAiProblem() {
+  return $("#ai-problem").value.trim();
+}
+
+function aiProblemKey(problem) { return String(problem || "").trim().toUpperCase(); }
+function aiOperationIsCurrent(problemKey, epoch) { return state.aiProblemKey === problemKey && state.aiEpoch === epoch; }
+function isAbortError(error) { return error?.name === "AbortError"; }
+
+function resetAiWorkbenchUi(problem = "") {
+  $("#ai-problem").value = problem;
+  $("#ai-statement").value = "";
+  $("#ai-context-source").textContent = problem ? "尚未读取" : "尚未选择题目";
+  const messages = $("#ai-chat-messages");
+  messages.className = "ai-chat-messages empty-state compact";
+  messages.textContent = problem ? "正在读取本题的持久对话…" : "开始题目后可在这里请求分级提示或代码诊断。";
+  $("#ai-patch-code").textContent = "";
+  $("#ai-patch-box").classList.add("hidden");
+}
+
+function switchAiProblem(problem, { force = false } = {}) {
+  const value = String(problem || "").trim();
+  const key = aiProblemKey(value);
+  if (!force && key === state.aiProblemKey) return state.aiEpoch;
+  if (state.aiStreamController) state.aiStreamController.abort();
+  state.aiStreamController = null;
+  $("#ai-problem").disabled = false;
+  state.aiEpoch += 1;
+  state.aiProblemKey = key;
+  state.aiConversationId = "";
+  state.aiConversationProblemKey = "";
+  state.aiContextHash = null;
+  state.aiPatchProposalId = "";
+  state.aiPatchProblemKey = "";
+  resetAiWorkbenchUi(value);
+  return state.aiEpoch;
+}
+
+async function loadAiProblemState(problem, { force = false, fetchContext = false } = {}) {
+  const value = String(problem || "").trim();
+  switchAiProblem(value, { force });
+  if (!value) return;
+  const problemKey = aiProblemKey(value); const epoch = state.aiEpoch;
+  const conversation = ensureAiConversation().catch(error => {
+    if (!isAbortError(error) && aiOperationIsCurrent(problemKey, epoch)) {
+      $("#ai-chat-state").textContent = `会话不可用：${error.message}`;
+    }
+  });
+  const context = loadProblemContext({ fetch: fetchContext }).catch(error => {
+    if (!isAbortError(error) && aiOperationIsCurrent(problemKey, epoch)) {
+      $("#ai-context-source").textContent = `${fetchContext ? "自动抓取" : "题面读取"}失败：${error.message}`;
+    }
+  });
+  await Promise.allSettled([conversation, context]);
+}
+
+async function loadProblemContext({ fetch = false, force = false } = {}) {
+  const problem = currentAiProblem();
+  if (!problem) throw new Error("请先填写题号或开始一个 session");
+  if (state.aiProblemKey !== aiProblemKey(problem)) switchAiProblem(problem);
+  const problemKey = aiProblemKey(problem); const epoch = state.aiEpoch;
+  let data;
+  try {
+    if (fetch) {
+      const started = await api("/api/jobs/problems/context/fetch", { body: { problem, force } });
+      data = await waitForJob(started.job_id, "正在读取公开题面…");
+    } else data = await api(`/api/problems/${encodeURIComponent(problem)}/context`);
+  } catch (error) {
+    if (!aiOperationIsCurrent(problemKey, epoch)) return null;
+    throw error;
+  }
+  if (data.ok === false && data.error) throw new Error(data.error.message || String(data.error));
+  if (!aiOperationIsCurrent(problemKey, epoch)) return null;
+  $("#ai-statement").value = data.content || "";
+  state.aiContextHash = data.content_hash || null;
+  $("#ai-context-source").textContent = data.available === false ? (data.error || "暂无题面") : `来源：${data.source || "unknown"}`;
+  return data;
+}
+
+async function saveManualContext(button) {
+  const problem = currentAiProblem();
+  if (!problem) return toast("无法保存题面", "请先填写题号。", "error");
+  const problemKey = aiProblemKey(problem); const epoch = state.aiEpoch;
+  setBusy(button, true);
+  try {
+    const data = await api("/api/problems/context", { body: { problem, content: $("#ai-statement").value, expected_hash: state.aiContextHash } });
+    if (!aiOperationIsCurrent(problemKey, epoch)) return;
+    state.aiContextHash = data.content_hash;
+    $("#ai-context-source").textContent = "来源：manual";
+    toast("题面已保存", "人工版本将优先于自动抓取。");
+  } catch (error) { if (aiOperationIsCurrent(problemKey, epoch)) toast("题面保存失败", error.message, "error"); }
+  finally { setBusy(button, false); }
+}
+
+async function restoreAutomaticContext(button) {
+  const problem = currentAiProblem();
+  if (!problem) return toast("无法恢复题面", "请先填写题号。", "error");
+  if (!window.confirm("移除人工题面并恢复最近一次自动抓取版本？")) return;
+  const problemKey = aiProblemKey(problem); const epoch = state.aiEpoch;
+  setBusy(button, true);
+  try {
+    const data = await api("/api/problems/context", { body: { problem, restore_auto: true, expected_hash: state.aiContextHash } });
+    if (!aiOperationIsCurrent(problemKey, epoch)) return;
+    $("#ai-statement").value = data.content || "";
+    state.aiContextHash = data.content_hash || null;
+    $("#ai-context-source").textContent = data.available === false ? "暂无自动题面" : `来源：${data.source || "unknown"}`;
+    toast("已恢复自动题面", data.available === false ? "可重新抓取公开题面。" : "人工版本已移除。");
+  } catch (error) { if (aiOperationIsCurrent(problemKey, epoch)) toast("恢复失败", error.message, "error"); }
+  finally { setBusy(button, false); }
+}
+
+function renderAssistantMath(node) {
+  if (!node?.classList.contains("assistant") || !node.textContent) return;
+  if (typeof window.renderMathInElement !== "function") return;
+  const source = node.textContent;
+  try {
+    window.renderMathInElement(node, {
+      delimiters: [
+        { left: "$$", right: "$$", display: true },
+        { left: "\\[", right: "\\]", display: true },
+        { left: "\\(", right: "\\)", display: false },
+        { left: "$", right: "$", display: false },
+      ],
+      throwOnError: false,
+      trust: false,
+    });
+  } catch {
+    // Auto-render should never make a saved answer unreadable.
+    node.textContent = source;
+  }
+}
+
+function appendAiMessage(role, content = "", status = "complete") {
+  const root = $("#ai-chat-messages");
+  if (root.classList.contains("empty-state")) { root.className = "ai-chat-messages"; root.innerHTML = ""; }
+  const node = document.createElement("div");
+  node.className = `ai-chat-message ${role}${status === "interrupted" ? " interrupted" : ""}`;
+  node.textContent = content;
+  root.append(node); root.scrollTop = root.scrollHeight;
+  if (role === "assistant") renderAssistantMath(node);
+  return node;
+}
+
+async function ensureAiConversation() {
+  const problem = currentAiProblem();
+  if (!problem) throw new Error("请先填写题号或开始一个 session");
+  if (state.aiProblemKey !== aiProblemKey(problem)) switchAiProblem(problem);
+  const problemKey = aiProblemKey(problem); const epoch = state.aiEpoch;
+  if (state.aiConversationId && state.aiConversationProblemKey === problemKey) return state.aiConversationId;
+  let data;
+  try { data = await api("/api/ai/conversations", { body: { problem } }); }
+  catch (error) { if (!aiOperationIsCurrent(problemKey, epoch)) return null; throw error; }
+  if (!aiOperationIsCurrent(problemKey, epoch)) return null;
+  state.aiConversationId = data.conversation_id;
+  state.aiConversationProblemKey = problemKey;
+  $("#ai-chat-state").className = "badge good";
+  $("#ai-chat-state").textContent = "已连接";
+  const root = $("#ai-chat-messages");
+  root.className = (data.messages || []).length ? "ai-chat-messages" : "ai-chat-messages empty-state compact";
+  root.innerHTML = (data.messages || []).length ? "" : "当前对话暂无消息。";
+  for (const message of data.messages || []) appendAiMessage(message.role, message.content, message.status);
+  return state.aiConversationId;
+}
+
+function parseSseBlock(block) {
+  let event = "message"; const data = [];
+  for (const line of block.split(/\r?\n/)) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+  }
+  if (!data.length) return null;
+  try { return { event, data: JSON.parse(data.join("\n")) }; }
+  catch { return { event, data: { content: data.join("\n") } }; }
+}
+
+async function streamAiChat(message, mode, hintLevel) {
+  const conversationId = await ensureAiConversation();
+  if (!conversationId) return false;
+  const problemKey = state.aiProblemKey; const epoch = state.aiEpoch;
+  if (state.aiStreamController) state.aiStreamController.abort();
+  const controller = new AbortController();
+  state.aiStreamController = controller;
+  const problemInput = $("#ai-problem");
+  problemInput.disabled = true;
+  appendAiMessage("user", message);
+  const assistant = appendAiMessage("assistant", "");
+  try {
+    const response = await fetch(`/api/ai/conversations/${encodeURIComponent(conversationId)}/messages`, {
+      method: "POST",
+      headers: { Accept: "text/event-stream", "Content-Type": "application/json", "X-ACM-Token": state.token },
+      body: JSON.stringify({ message, mode, hint_level: hintLevel }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      let detail = `HTTP ${response.status}`;
+      try { const payload = await response.json(); detail = payload.error?.message || payload.error || detail; } catch {}
+      assistant.remove(); throw new Error(String(detail));
+    }
+    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let completed = false;
+    for (;;) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+      const blocks = buffer.split(/\r?\n\r?\n/); buffer = blocks.pop() || "";
+      for (const block of blocks) {
+        if (!aiOperationIsCurrent(problemKey, epoch) || state.aiStreamController !== controller) { controller.abort(); break; }
+        const item = parseSseBlock(block); if (!item) continue;
+        if (item.event === "delta") { assistant.textContent += item.data.content || ""; $("#ai-chat-messages").scrollTop = $("#ai-chat-messages").scrollHeight; }
+        else if (item.event === "done") completed = true;
+        else if (item.event === "error") throw new Error(item.data.message || "DeepSeek 流式请求失败");
+      }
+      if (completed) { await reader.cancel(); break; }
+      if (done) break;
+    }
+  } catch (error) {
+    assistant.classList.add("interrupted");
+    if (isAbortError(error)) return false;
+    throw error;
+  } finally {
+    renderAssistantMath(assistant);
+    if (state.aiStreamController === controller) {
+      state.aiStreamController = null;
+      problemInput.disabled = false;
+    }
+  }
+  return true;
+}
+
+async function clearAiConversation(button) {
+  if (state.aiStreamController) {
+    toast("暂时无法清除", "请等待当前 AI 回答结束，或先切换题目以中断回答。", "error");
+    return;
+  }
+  const conversationId = await ensureAiConversation();
+  if (!conversationId) return;
+  if (!window.confirm("清除本题当前显示的 AI 对话？旧记录会退出后续对话上下文，但仍保留提示等级与调用审计。")) return;
+  const problemKey = state.aiProblemKey;
+  const epoch = ++state.aiEpoch;
+  setBusy(button, true, "清空中…");
+  try {
+    const data = await api(`/api/ai/conversations/${encodeURIComponent(conversationId)}/clear`, { body: {} });
+    if (!aiOperationIsCurrent(problemKey, epoch)) return;
+    if (!data.conversation_id) throw new Error("服务未返回新的 conversation_id");
+    state.aiConversationId = data.conversation_id;
+    state.aiConversationProblemKey = problemKey;
+    const root = $("#ai-chat-messages");
+    root.className = "ai-chat-messages empty-state compact";
+    root.textContent = "当前对话暂无消息。";
+    toast("本题对话已清除", "后续消息将写入新的持久会话。");
+  } catch (error) { if (!isAbortError(error) && aiOperationIsCurrent(problemKey, epoch)) toast("清空失败", error.message, "error"); }
+  finally { setBusy(button, false); }
+}
+
+async function previewAiPatch(button) {
+  const problem = currentAiProblem(); const instruction = $("#ai-chat-form").elements.message.value.trim();
+  if (!problem || !instruction) return toast("无法生成补丁", "需要题号和修复要求。", "error");
+  const problemKey = aiProblemKey(problem); const epoch = state.aiEpoch;
+  setBusy(button, true, "生成中…");
+  try {
+    const conversationId = state.aiConversationProblemKey === problemKey ? state.aiConversationId : null;
+    const started = await api("/api/jobs/ai/patches/preview", { body: { problem, instruction, conversation_id: conversationId || null } });
+    const data = await waitForJob(started.job_id, "正在生成带错误注释的候选源码…");
+    if (!aiOperationIsCurrent(problemKey, epoch)) return;
+    if (typeof data.candidate_code !== "string" || !data.candidate_code.trim()) throw new Error("服务未返回修改后的 C++ 源码");
+    state.aiPatchProposalId = data.proposal_id;
+    state.aiPatchProblemKey = problemKey;
+    renderCppSource($("#ai-patch-code"), data.candidate_code);
+    $("#ai-patch-box").classList.remove("hidden");
+  } catch (error) { if (aiOperationIsCurrent(problemKey, epoch)) toast("补丁预览失败", error.message, "error"); }
+  finally { setBusy(button, false); }
+}
+
+async function runPatchAction(action, button) {
+  if (!state.aiPatchProposalId) return toast("没有候选代码", "请先生成 AI 修改代码。", "error");
+  if (state.aiPatchProblemKey !== state.aiProblemKey) return toast("候选代码已过期", "请为当前题目重新生成修改代码。", "error");
+  if (action === "apply" && !window.confirm("应用当前修改后代码、备份原源码并运行本地验证？")) return;
+  const problemKey = state.aiProblemKey; const epoch = state.aiEpoch;
+  setBusy(button, true);
+  try {
+    const started = await api(`/api/jobs/ai/patches/${action}`, { body: { proposal_id: state.aiPatchProposalId } });
+    const data = await waitForJob(started.job_id, action === "apply" ? "正在应用并验证…" : "正在安全回退…");
+    if (!aiOperationIsCurrent(problemKey, epoch)) return;
+    if (data.verify) renderVerify(data.verify);
+    toast(action === "apply" ? "补丁已应用" : "补丁已回退", data.verify?.passed === false ? "本地验证未通过，备份仍可回退。" : "操作完成。");
+  } catch (error) { if (aiOperationIsCurrent(problemKey, epoch)) toast(action === "apply" ? "补丁应用失败" : "补丁回退失败", error.message, "error"); }
   finally { setBusy(button, false); }
 }
 
@@ -379,6 +879,8 @@ function renderStart(data) {
   box.className = "result-box success";
   box.innerHTML = `<strong>${escapeHtml(id)} 已开始</strong><p>${data.reused ? "已复用当日同名文件，不会覆盖原代码。" : "源码已创建。"}</p>${path ? `<div class="path-row"><code>${escapeHtml(path)}</code><button type="button" class="text-button copy-path" data-path="${escapeHtml(path)}">复制路径</button></div>` : ""}`;
   ["#verify-form input[name=problem]", "#close-form input[name=problem]"].forEach(selector => $(selector).value = id);
+  switchAiProblem(id, { force: true });
+  loadAiProblemState(id, { fetchContext: true });
   renderActive({ problem_id: id, source: path, started_at: data.started_at || new Date().toISOString() });
   navigate("workbench");
 }
@@ -1306,15 +1808,27 @@ function setupEvents() {
   });
   $("#setup-form").addEventListener("submit", event => { event.preventDefault(); submitSetup(event.currentTarget); });
   $("#settings-form").addEventListener("submit", event => { event.preventDefault(); submitSetup(event.currentTarget, true); });
+  $("#ai-settings-form").addEventListener("submit", event => { event.preventDefault(); saveAiSettings(event.currentTarget); });
+  $("#ai-credential-form").addEventListener("submit", event => { event.preventDefault(); saveAiCredential(event.currentTarget); });
+  $("#ai-key-clear").addEventListener("click", event => clearAiCredential(event.currentTarget));
+  $("#ai-test-button").addEventListener("click", async event => {
+    const button = event.currentTarget;
+    setBusy(button, true, "测试中…");
+    try { const started = await api("/api/jobs/ai/test", { body: {} }); const result = await waitForJob(started.job_id, "正在验证 DeepSeek API…"); toast("DeepSeek 连接成功", result.model || "API 可用"); await loadAiStatus(); }
+    catch (error) { toast("DeepSeek 测试失败", error.message, "error"); }
+    finally { setBusy(button, false); }
+  });
   $("#recommend-controls").addEventListener("submit", event => { event.preventDefault(); requestRecommendations(); });
+  $("#ai-recommend-button").addEventListener("click", event => requestAiRecommendations(event.currentTarget));
   $("#recommend-controls [name=source_mode]").addEventListener("change", event => {
     $("#recommend-plan-filter").classList.toggle("hidden", event.currentTarget.value === "catalog_only");
   });
   $("#sync-button").addEventListener("click", async event => {
-    setBusy(event.currentTarget, true, "同步中…");
+    const button = event.currentTarget;
+    setBusy(button, true, "同步中…");
     try { await startJob("/api/jobs/sync", { platform: "all" }, "sync"); }
     catch (error) { toast("无法启动同步", error.message, "error"); }
-    finally { setBusy(event.currentTarget, false); }
+    finally { setBusy(button, false); }
   });
   $("#recommendations").addEventListener("click", event => {
     const skipButton = event.target.closest(".skip-recommendation");
@@ -1340,14 +1854,47 @@ function setupEvents() {
     catch (error) { renderVerify({ ok: false, error: error.message }); toast("无法启动验证", error.message, "error"); }
     finally { setBusy(button, false); }
   });
+  $("#ai-context-button").addEventListener("click", async event => {
+    const button = event.currentTarget;
+    setBusy(button, true, "抓取中…");
+    try { const data = await loadProblemContext({ fetch: true, force: true }); if (data) toast("题面已更新", "抓取成功或已使用人工版本。"); }
+    catch (error) { $("#ai-context-source").textContent = `抓取失败：${error.message}`; toast("题面抓取失败", "可粘贴题面后保存。", "error"); }
+    finally { setBusy(button, false); }
+  });
+  $("#ai-statement-save").addEventListener("click", event => saveManualContext(event.currentTarget));
+  $("#ai-statement-restore").addEventListener("click", event => restoreAutomaticContext(event.currentTarget));
+  $("#ai-problem").addEventListener("change", event => {
+    const problem = event.currentTarget.value.trim();
+    loadAiProblemState(problem).catch(error => {
+      if (!isAbortError(error)) toast("切换题目失败", error.message, "error");
+    });
+  });
+  $("#ai-chat-form").addEventListener("submit", async event => {
+    event.preventDefault(); const form = event.currentTarget; const button = $("button[type=submit]", form);
+    const message = form.elements.message.value.trim(); if (!message) return;
+    setBusy(button, true, "回答中…");
+    try { if (await streamAiChat(message, $("#ai-mode").value, Number($("#ai-hint-level").value))) form.reset(); }
+    catch (error) { if (!isAbortError(error)) toast("AI 对话失败", error.message, "error"); }
+    finally { setBusy(button, false); }
+  });
+  $("#ai-chat-clear").addEventListener("click", event => {
+    clearAiConversation(event.currentTarget).catch(error => {
+      if (!isAbortError(error)) toast("清空失败", error.message, "error");
+    });
+  });
+  $("#ai-patch-preview").addEventListener("click", event => previewAiPatch(event.currentTarget));
+  $("#ai-patch-apply").addEventListener("click", event => runPatchAction("apply", event.currentTarget));
+  $("#ai-patch-revert").addEventListener("click", event => runPatchAction("revert", event.currentTarget));
   $("#close-form").addEventListener("submit", async event => {
     event.preventDefault(); const form = event.currentTarget; const button = $("button[type=submit]", form); setBusy(button, true);
     try {
       const data = await api("/api/sessions/close", { body: { problem: form.elements.problem.value.trim(), result: form.elements.result.value, minutes: Number(form.elements.minutes.value), hint_level: Number(form.elements.hint_level.value), failure: form.elements.failure.value, notes: form.elements.notes.value.trim() || null } });
       const box = $("#close-result"); box.className = "result-box success";
       box.innerHTML = `<strong>Session 已结束</strong><p>状态：${escapeHtml(data.status || data.close?.result || "已记录")}${data.review_due ? ` · 复做日期：${escapeHtml(data.review_due)}` : ""}</p><p>归档候选已保存，但尚未修改 <code>algorithms.md</code> 或 <code>tricks.md</code>。</p>`;
-      renderActive(null); toast("复盘已记录", data.review_due ? `已加入 ${data.review_due} 复做队列。` : "本次结果已影响后续推荐。");
-      await loadBootstrap(); await requestRecommendations();
+      renderActive(null); switchAiProblem("", { force: true }); toast("复盘已记录", data.review_due ? `已加入 ${data.review_due} 复做队列。` : "本次结果已影响后续推荐。");
+      await loadBootstrap();
+      if (currentAiProblem()) await loadAiProblemState(currentAiProblem());
+      await requestRecommendations();
     } catch (error) { toast("结束失败", error.message, "error"); }
     finally { setBusy(button, false); }
   });
@@ -1360,16 +1907,18 @@ function setupEvents() {
   });
   $("#session-filter").addEventListener("change", event => renderRecentSessions(state.bootstrap?.recent_sessions || [], event.currentTarget.value));
   $("#plan-check-button").addEventListener("click", async event => {
-    setBusy(event.currentTarget, true, "校验中…"); const box = $("#plan-result");
+    const button = event.currentTarget;
+    setBusy(button, true, "校验中…"); const box = $("#plan-result");
     try { const data = await api("/api/plan/check", { body: {} }); box.className = `result-box ${data.ok === false ? "error" : "success"}`; box.textContent = data.ok === false ? `校验失败：${(data.errors || []).join("；")}` : `题单校验通过${data.warnings?.length ? `，警告：${data.warnings.join("；")}` : ""}`; }
     catch (error) { box.className = "result-box error"; box.textContent = error.message; }
-    finally { setBusy(event.currentTarget, false); }
+    finally { setBusy(button, false); }
   });
   $("#shutdown-button").addEventListener("click", async event => {
     if (!window.confirm("停止 ACM Agent 本地服务？当前页面随后将无法继续使用。")) return;
-    setBusy(event.currentTarget, true, "正在停止…");
+    const button = event.currentTarget;
+    setBusy(button, true, "正在停止…");
     try { await api("/api/server/shutdown", { body: {} }); $("#server-dot").className = "status-dot offline"; $("#server-label").textContent = "本地服务已停止"; toast("服务已停止", "可以关闭此页面。"); }
-    catch (error) { toast("停止失败", error.message, "error"); setBusy(event.currentTarget, false); }
+    catch (error) { toast("停止失败", error.message, "error"); setBusy(button, false); }
   });
   $("#plan-list").addEventListener("click", event => {
     const button = event.target.closest("[data-plan-id]");
@@ -1454,6 +2003,8 @@ async function boot() {
   const initial = location.hash.replace(/^#/, "");
   if (["today", "workbench", "plans", "review", "settings"].includes(initial)) navigate(initial);
   await loadBootstrap();
+  await loadAiStatus();
+  if (currentAiProblem()) await loadAiProblemState(currentAiProblem(), { force: true });
   if (state.bootstrap?.configured !== false) {
     await loadPlans();
     await requestRecommendations();

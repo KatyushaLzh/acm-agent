@@ -7,6 +7,7 @@ to commit it, so a broken/partial network response never erases a good snapshot.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -18,7 +19,10 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from .tag_policy import effective_tags, normalize_tags, tag_key
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+
+
+_UNSET = object()
 
 
 class PlanRevisionConflict(RuntimeError):
@@ -44,12 +48,27 @@ class TagOverrideRevisionConflict(RuntimeError):
         )
 
 
+class ProblemContextConflict(RuntimeError):
+    """Raised when a problem statement edit targets stale cached content."""
+
+    def __init__(self, expected: str | None, actual: str | None):
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"problem context conflict: expected hash {expected!r}, current {actual!r}"
+        )
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 _VERDICT_ALIASES = {
@@ -369,6 +388,125 @@ MIGRATIONS: dict[int, str] = {
         FOREIGN KEY (attempt_id) REFERENCES attempts(id) ON DELETE CASCADE
     );
     """,
+    6: """
+    CREATE TABLE problem_contexts (
+        platform TEXT NOT NULL,
+        problem_id TEXT NOT NULL,
+        source TEXT NOT NULL CHECK (
+            source IN ('codeforces_auto', 'luogu_auto', 'manual')
+        ),
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        source_url TEXT,
+        fetched_at TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (platform, problem_id, source),
+        FOREIGN KEY (platform, problem_id)
+            REFERENCES problems(platform, problem_id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX problem_contexts_resolve_idx
+        ON problem_contexts(platform, problem_id, source, updated_at DESC);
+
+    CREATE TABLE ai_conversations (
+        id TEXT PRIMARY KEY,
+        attempt_id INTEGER,
+        platform TEXT NOT NULL,
+        problem_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active'
+            CHECK (status IN ('active', 'closed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        closed_at TEXT,
+        FOREIGN KEY (attempt_id) REFERENCES attempts(id) ON DELETE CASCADE,
+        FOREIGN KEY (platform, problem_id)
+            REFERENCES problems(platform, problem_id) ON DELETE CASCADE
+    );
+
+    CREATE UNIQUE INDEX ai_conversations_active_attempt_idx
+        ON ai_conversations(attempt_id)
+        WHERE attempt_id IS NOT NULL AND status='active';
+    CREATE INDEX ai_conversations_problem_idx
+        ON ai_conversations(platform, problem_id, updated_at DESC);
+
+    CREATE TABLE ai_messages (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+        mode TEXT,
+        hint_level INTEGER NOT NULL DEFAULT 0
+            CHECK (hint_level BETWEEN 0 AND 4),
+        content TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending', 'streaming', 'complete', 'interrupted', 'error')),
+        model TEXT,
+        usage_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        FOREIGN KEY (conversation_id)
+            REFERENCES ai_conversations(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX ai_messages_conversation_idx
+        ON ai_messages(conversation_id, created_at, id);
+
+    CREATE TABLE ai_runs (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        model TEXT NOT NULL,
+        conversation_id TEXT,
+        message_id TEXT,
+        request_summary_json TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL,
+        finish_reason TEXT,
+        usage_json TEXT NOT NULL DEFAULT '{}',
+        error_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        FOREIGN KEY (conversation_id)
+            REFERENCES ai_conversations(id) ON DELETE SET NULL,
+        FOREIGN KEY (message_id) REFERENCES ai_messages(id) ON DELETE SET NULL
+    );
+
+    CREATE INDEX ai_runs_recent_idx ON ai_runs(created_at DESC, id);
+    CREATE INDEX ai_runs_conversation_idx
+        ON ai_runs(conversation_id, created_at DESC);
+
+    CREATE TABLE ai_patch_proposals (
+        id TEXT PRIMARY KEY,
+        run_id TEXT,
+        conversation_id TEXT,
+        attempt_id INTEGER,
+        platform TEXT NOT NULL,
+        problem_id TEXT NOT NULL,
+        source_path TEXT NOT NULL,
+        baseline_hash TEXT NOT NULL,
+        candidate_code TEXT NOT NULL,
+        diff_text TEXT NOT NULL,
+        diagnosis TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'preview',
+        applied_hash TEXT,
+        backup_path TEXT,
+        verify_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        applied_at TEXT,
+        reverted_at TEXT,
+        FOREIGN KEY (run_id) REFERENCES ai_runs(id) ON DELETE SET NULL,
+        FOREIGN KEY (conversation_id)
+            REFERENCES ai_conversations(id) ON DELETE SET NULL,
+        FOREIGN KEY (attempt_id) REFERENCES attempts(id) ON DELETE SET NULL,
+        FOREIGN KEY (platform, problem_id)
+            REFERENCES problems(platform, problem_id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX ai_patch_proposals_problem_idx
+        ON ai_patch_proposals(platform, problem_id, created_at DESC);
+    CREATE INDEX ai_patch_proposals_attempt_idx
+        ON ai_patch_proposals(attempt_id, created_at DESC);
+    """,
 }
 
 
@@ -413,6 +551,28 @@ class Database:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def _backup_v5_before_ai_migration(self) -> None:
+        """Create one consistent adjacent backup immediately before schema v6."""
+
+        current = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
+        if current != 5 or not self.path.exists():
+            return
+        backup_path = self.path.with_name(f"{self.path.name}.v5.bak")
+        if backup_path.exists():
+            return
+        temporary = backup_path.with_name(f".{backup_path.name}.tmp")
+        temporary.unlink(missing_ok=True)
+        destination = sqlite3.connect(temporary)
+        try:
+            self.connection.backup(destination)
+            destination.commit()
+        finally:
+            destination.close()
+        try:
+            os.replace(temporary, backup_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def __enter__(self) -> "Database":
         return self
 
@@ -428,15 +588,41 @@ class Database:
             raise RuntimeError(
                 f"database schema {current} is newer than supported {SCHEMA_VERSION}"
             )
+        if current == 5:
+            self._backup_v5_before_ai_migration()
         for version in range(current + 1, SCHEMA_VERSION + 1):
             migration = MIGRATIONS.get(version)
             if migration is None:
                 raise RuntimeError(f"missing database migration {version}")
-            with self.connection:
-                self.connection.executescript(migration)
+            try:
+                # ``executescript`` commits any pending transaction before it
+                # runs. Put BEGIN in the script itself so DDL and user_version
+                # remain one crash-safe migration under autocommit mode.
+                self.connection.executescript("BEGIN IMMEDIATE;\n" + migration)
                 if version == 5:
                     self._backfill_attempt_tag_snapshots_v5()
                 self.connection.execute(f"PRAGMA user_version = {version}")
+                self.connection.execute("COMMIT")
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.execute("ROLLBACK")
+                raise
+
+    def reconcile_interrupted_ai_state(self) -> None:
+        """Close call state left in-flight by a previous service process."""
+
+        stamp = utc_now()
+        with self.atomic():
+            self.connection.execute(
+                """UPDATE ai_messages SET status='interrupted',completed_at=?
+                   WHERE status IN ('pending','streaming')""",
+                (stamp,),
+            )
+            self.connection.execute(
+                """UPDATE ai_runs SET status='interrupted',completed_at=?
+                   WHERE status IN ('pending','running')""",
+                (stamp,),
+            )
 
     def _backfill_attempt_tag_snapshots_v5(self) -> None:
         """Freeze the best current effective tags for pre-v5 closed attempts."""
@@ -633,6 +819,130 @@ class Database:
         return self.query(
             "SELECT * FROM problems WHERE platform=? ORDER BY problem_id", (platform,)
         )
+
+    def save_problem_context(
+        self,
+        platform: str,
+        problem_id: str,
+        content: str,
+        *,
+        source: str,
+        source_url: str | None = None,
+        fetched_at: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        expected_hash: str | None | object = _UNSET,
+    ) -> sqlite3.Row:
+        """Save one statement source without letting auto data replace manual data.
+
+        Automatic and manual statements occupy separate rows.  Resolution via
+        :meth:`problem_context` always prefers the manual row, while refreshes
+        may continue updating the platform cache underneath it.
+        """
+
+        platform = str(platform).strip().lower()
+        problem_id = str(problem_id).strip()
+        source = str(source).strip().lower()
+        allowed = {"manual", "codeforces_auto", "luogu_auto"}
+        if source not in allowed:
+            raise ValueError(f"unsupported problem context source {source!r}")
+        if source != "manual" and source != f"{platform}_auto":
+            raise ValueError(f"context source {source!r} does not match {platform!r}")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("problem context content must be non-empty text")
+
+        current = self.problem_context(platform, problem_id)
+        actual_hash = str(current["content_hash"]) if current else None
+        if expected_hash is not _UNSET and expected_hash != actual_hash:
+            raise ProblemContextConflict(
+                None if expected_hash is None else str(expected_hash), actual_hash
+            )
+
+        self.upsert_problem({"platform": platform, "problem_id": problem_id})
+        now = utc_now()
+        content_hash = _sha256_text(content)
+        self.connection.execute(
+            """INSERT INTO problem_contexts(
+                   platform,problem_id,source,content,content_hash,source_url,
+                   fetched_at,metadata_json,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(platform,problem_id,source) DO UPDATE SET
+                   content=excluded.content,
+                   content_hash=excluded.content_hash,
+                   source_url=excluded.source_url,
+                   fetched_at=excluded.fetched_at,
+                   metadata_json=excluded.metadata_json,
+                   updated_at=excluded.updated_at""",
+            (
+                platform,
+                problem_id,
+                source,
+                content,
+                content_hash,
+                source_url,
+                fetched_at or (now if source != "manual" else None),
+                _json(metadata or {}),
+                now,
+                now,
+            ),
+        )
+        row = self.connection.execute(
+            """SELECT * FROM problem_contexts
+               WHERE platform=? AND problem_id=? AND source=?""",
+            (platform, problem_id, source),
+        ).fetchone()
+        assert row is not None
+        return row
+
+    def problem_context(
+        self, platform: str, problem_id: str
+    ) -> sqlite3.Row | None:
+        """Return the effective statement, preferring a manual override."""
+
+        return self.connection.execute(
+            """SELECT * FROM problem_contexts
+               WHERE platform=? AND problem_id=?
+               ORDER BY CASE source WHEN 'manual' THEN 0 ELSE 1 END,
+                        updated_at DESC
+               LIMIT 1""",
+            (str(platform).strip().lower(), str(problem_id).strip()),
+        ).fetchone()
+
+    def problem_context_rows(
+        self, platform: str, problem_id: str
+    ) -> list[sqlite3.Row]:
+        return self.query(
+            """SELECT * FROM problem_contexts
+               WHERE platform=? AND problem_id=?
+               ORDER BY CASE source WHEN 'manual' THEN 0 ELSE 1 END,
+                        updated_at DESC""",
+            (str(platform).strip().lower(), str(problem_id).strip()),
+        )
+
+    def delete_manual_problem_context(
+        self,
+        platform: str,
+        problem_id: str,
+        *,
+        expected_hash: str | None | object = _UNSET,
+    ) -> bool:
+        """Remove a manual override, revealing the latest automatic context."""
+
+        row = self.connection.execute(
+            """SELECT content_hash FROM problem_contexts
+               WHERE platform=? AND problem_id=? AND source='manual'""",
+            (str(platform).strip().lower(), str(problem_id).strip()),
+        ).fetchone()
+        actual_hash = str(row["content_hash"]) if row else None
+        if expected_hash is not _UNSET and expected_hash != actual_hash:
+            raise ProblemContextConflict(
+                None if expected_hash is None else str(expected_hash), actual_hash
+            )
+        cursor = self.connection.execute(
+            """DELETE FROM problem_contexts
+               WHERE platform=? AND problem_id=? AND source='manual'""",
+            (str(platform).strip().lower(), str(problem_id).strip()),
+        )
+        return bool(cursor.rowcount)
 
     @staticmethod
     def _problem_id_variants(platform: str, problem_id: str) -> tuple[str, ...]:
@@ -856,6 +1166,363 @@ class Database:
         return self.query(
             f"SELECT * FROM attempts{where} ORDER BY started_at DESC, id DESC", params
         )
+
+    def get_or_create_ai_conversation(
+        self,
+        conversation_id: str,
+        attempt_id: int,
+        platform: str,
+        problem_id: str,
+    ) -> tuple[sqlite3.Row, bool]:
+        """Return the active conversation for an attempt or create it.
+
+        ``conversation_id`` is generated by the caller so API/SSE code can
+        publish a stable identifier before any model request begins.
+        """
+
+        attempt = self.connection.execute(
+            "SELECT platform,problem_id,active FROM attempts WHERE id=?",
+            (attempt_id,),
+        ).fetchone()
+        if attempt is None:
+            raise KeyError(f"attempt {attempt_id} not found")
+        platform = str(platform).strip().lower()
+        problem_id = str(problem_id).strip()
+        if attempt["platform"] != platform or attempt["problem_id"] != problem_id:
+            raise ValueError("conversation problem does not match its attempt")
+        if not int(attempt["active"]):
+            raise ValueError("cannot create a conversation for a closed attempt")
+
+        existing = self.active_ai_conversation(attempt_id)
+        if existing is not None:
+            return existing, False
+        now = utc_now()
+        try:
+            self.connection.execute(
+                """INSERT INTO ai_conversations(
+                       id,attempt_id,platform,problem_id,status,created_at,updated_at)
+                   VALUES(?,?,?,?,'active',?,?)""",
+                (str(conversation_id), attempt_id, platform, problem_id, now, now),
+            )
+        except sqlite3.IntegrityError:
+            # A concurrent creator may have won the partial unique index.
+            existing = self.active_ai_conversation(attempt_id)
+            if existing is None:
+                raise
+            return existing, False
+        row = self.ai_conversation(str(conversation_id))
+        assert row is not None
+        return row, True
+
+    def ai_conversation(self, conversation_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM ai_conversations WHERE id=?", (str(conversation_id),)
+        ).fetchone()
+
+    def active_ai_conversation(self, attempt_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            """SELECT * FROM ai_conversations
+               WHERE attempt_id=? AND status='active' LIMIT 1""",
+            (attempt_id,),
+        ).fetchone()
+
+    def close_ai_conversation(
+        self, conversation_id: str, *, closed_at: str | None = None
+    ) -> bool:
+        stamp = closed_at or utc_now()
+        cursor = self.connection.execute(
+            """UPDATE ai_conversations
+               SET status='closed',closed_at=?,updated_at=?
+               WHERE id=? AND status='active'""",
+            (stamp, stamp, str(conversation_id)),
+        )
+        return bool(cursor.rowcount)
+
+    def create_ai_message(
+        self,
+        message_id: str,
+        conversation_id: str,
+        *,
+        role: str,
+        content: str = "",
+        mode: str | None = None,
+        hint_level: int = 0,
+        status: str = "pending",
+        model: str | None = None,
+        usage: Mapping[str, Any] | None = None,
+        created_at: str | None = None,
+    ) -> sqlite3.Row:
+        stamp = created_at or utc_now()
+        self.connection.execute(
+            """INSERT INTO ai_messages(
+                   id,conversation_id,role,mode,hint_level,content,status,model,
+                   usage_json,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (
+                str(message_id),
+                str(conversation_id),
+                role,
+                mode,
+                int(hint_level),
+                content,
+                status,
+                model,
+                _json(usage or {}),
+                stamp,
+            ),
+        )
+        self.connection.execute(
+            "UPDATE ai_conversations SET updated_at=? WHERE id=?",
+            (stamp, str(conversation_id)),
+        )
+        row = self.ai_message(str(message_id))
+        assert row is not None
+        return row
+
+    def update_ai_message(
+        self,
+        message_id: str,
+        *,
+        content: str | object = _UNSET,
+        status: str | object = _UNSET,
+        model: str | None | object = _UNSET,
+        usage: Mapping[str, Any] | object = _UNSET,
+        completed_at: str | None | object = _UNSET,
+    ) -> sqlite3.Row:
+        assignments: list[str] = []
+        values: list[Any] = []
+        for column, value in (
+            ("content", content),
+            ("status", status),
+            ("model", model),
+            ("completed_at", completed_at),
+        ):
+            if value is not _UNSET:
+                assignments.append(f"{column}=?")
+                values.append(value)
+        if usage is not _UNSET:
+            assignments.append("usage_json=?")
+            values.append(_json(usage))
+        if not assignments:
+            row = self.ai_message(str(message_id))
+            if row is None:
+                raise KeyError(f"AI message {message_id!r} not found")
+            return row
+        values.append(str(message_id))
+        cursor = self.connection.execute(
+            f"UPDATE ai_messages SET {','.join(assignments)} WHERE id=?", values
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(f"AI message {message_id!r} not found")
+        row = self.ai_message(str(message_id))
+        assert row is not None
+        self.connection.execute(
+            "UPDATE ai_conversations SET updated_at=? WHERE id=?",
+            (utc_now(), row["conversation_id"]),
+        )
+        return row
+
+    def ai_message(self, message_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM ai_messages WHERE id=?", (str(message_id),)
+        ).fetchone()
+
+    def ai_messages(
+        self, conversation_id: str, *, limit: int | None = 24
+    ) -> list[sqlite3.Row]:
+        if limit is None:
+            return self.query(
+                """SELECT * FROM ai_messages WHERE conversation_id=?
+                   ORDER BY created_at,rowid""",
+                (str(conversation_id),),
+            )
+        return self.query(
+            """SELECT * FROM ai_messages
+               WHERE rowid IN (
+                   SELECT rowid FROM ai_messages WHERE conversation_id=?
+                   ORDER BY created_at DESC,rowid DESC LIMIT ?
+               ) ORDER BY created_at,rowid""",
+            (str(conversation_id), max(0, int(limit))),
+        )
+
+    def max_ai_hint_level(self, attempt_id: int) -> int:
+        row = self.connection.execute(
+            """SELECT COALESCE(MAX(m.hint_level),0) AS hint_level
+               FROM ai_messages m
+               JOIN ai_conversations c ON c.id=m.conversation_id
+               WHERE c.attempt_id=? AND m.role='assistant'
+                 AND m.status IN ('streaming','complete','interrupted')
+                """,
+            (attempt_id,),
+        ).fetchone()
+        return int(row["hint_level"] if row else 0)
+
+    def create_ai_run(
+        self,
+        run_id: str,
+        *,
+        kind: str,
+        model: str,
+        request_summary: Mapping[str, Any] | None = None,
+        status: str = "pending",
+        conversation_id: str | None = None,
+        message_id: str | None = None,
+        created_at: str | None = None,
+    ) -> sqlite3.Row:
+        self.connection.execute(
+            """INSERT INTO ai_runs(
+                   id,kind,model,conversation_id,message_id,request_summary_json,
+                   status,created_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                str(run_id),
+                kind,
+                model,
+                conversation_id,
+                message_id,
+                _json(request_summary or {}),
+                status,
+                created_at or utc_now(),
+            ),
+        )
+        row = self.ai_run(str(run_id))
+        assert row is not None
+        return row
+
+    def update_ai_run(
+        self,
+        run_id: str,
+        *,
+        status: str | object = _UNSET,
+        finish_reason: str | None | object = _UNSET,
+        usage: Mapping[str, Any] | object = _UNSET,
+        error: Mapping[str, Any] | object = _UNSET,
+        completed_at: str | None | object = _UNSET,
+    ) -> sqlite3.Row:
+        assignments: list[str] = []
+        values: list[Any] = []
+        for column, value in (
+            ("status", status),
+            ("finish_reason", finish_reason),
+            ("completed_at", completed_at),
+        ):
+            if value is not _UNSET:
+                assignments.append(f"{column}=?")
+                values.append(value)
+        if usage is not _UNSET:
+            assignments.append("usage_json=?")
+            values.append(_json(usage))
+        if error is not _UNSET:
+            assignments.append("error_json=?")
+            values.append(_json(error))
+        if not assignments:
+            row = self.ai_run(str(run_id))
+            if row is None:
+                raise KeyError(f"AI run {run_id!r} not found")
+            return row
+        values.append(str(run_id))
+        cursor = self.connection.execute(
+            f"UPDATE ai_runs SET {','.join(assignments)} WHERE id=?", values
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(f"AI run {run_id!r} not found")
+        row = self.ai_run(str(run_id))
+        assert row is not None
+        return row
+
+    def ai_run(self, run_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM ai_runs WHERE id=?", (str(run_id),)
+        ).fetchone()
+
+    def create_ai_patch_proposal(
+        self,
+        proposal_id: str,
+        *,
+        platform: str,
+        problem_id: str,
+        source_path: str | Path,
+        baseline_hash: str,
+        candidate_code: str,
+        diff_text: str,
+        diagnosis: str = "",
+        run_id: str | None = None,
+        conversation_id: str | None = None,
+        attempt_id: int | None = None,
+        created_at: str | None = None,
+    ) -> sqlite3.Row:
+        self.upsert_problem({"platform": platform, "problem_id": problem_id})
+        stamp = created_at or utc_now()
+        self.connection.execute(
+            """INSERT INTO ai_patch_proposals(
+                   id,run_id,conversation_id,attempt_id,platform,problem_id,
+                   source_path,baseline_hash,candidate_code,diff_text,diagnosis,
+                   status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,'preview',?,?)""",
+            (
+                str(proposal_id),
+                run_id,
+                conversation_id,
+                attempt_id,
+                platform,
+                str(problem_id),
+                str(source_path),
+                baseline_hash,
+                candidate_code,
+                diff_text,
+                diagnosis,
+                stamp,
+                stamp,
+            ),
+        )
+        row = self.ai_patch_proposal(str(proposal_id))
+        assert row is not None
+        return row
+
+    def ai_patch_proposal(self, proposal_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM ai_patch_proposals WHERE id=?", (str(proposal_id),)
+        ).fetchone()
+
+    def update_ai_patch_proposal(
+        self,
+        proposal_id: str,
+        *,
+        status: str | object = _UNSET,
+        applied_hash: str | None | object = _UNSET,
+        backup_path: str | Path | None | object = _UNSET,
+        verify: Mapping[str, Any] | object = _UNSET,
+        applied_at: str | None | object = _UNSET,
+        reverted_at: str | None | object = _UNSET,
+    ) -> sqlite3.Row:
+        assignments = ["updated_at=?"]
+        values: list[Any] = [utc_now()]
+        for column, value in (
+            ("status", status),
+            ("applied_hash", applied_hash),
+            ("backup_path", backup_path),
+            ("applied_at", applied_at),
+            ("reverted_at", reverted_at),
+        ):
+            if value is not _UNSET:
+                assignments.append(f"{column}=?")
+                values.append(
+                    str(value)
+                    if column == "backup_path" and value is not None
+                    else value
+                )
+        if verify is not _UNSET:
+            assignments.append("verify_json=?")
+            values.append(_json(verify))
+        values.append(str(proposal_id))
+        cursor = self.connection.execute(
+            f"UPDATE ai_patch_proposals SET {','.join(assignments)} WHERE id=?", values
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(f"AI patch proposal {proposal_id!r} not found")
+        row = self.ai_patch_proposal(str(proposal_id))
+        assert row is not None
+        return row
 
     def record_recommendations(
         self, mode: str, recommendations: Iterable[Mapping[str, Any]], *, generated_at: str | None = None

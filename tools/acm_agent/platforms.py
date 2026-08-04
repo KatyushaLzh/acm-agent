@@ -556,10 +556,15 @@ class LuoguClient:
         """Read a public problem page and require exactly one matching pid."""
         problem_id = str(problem_id).strip().upper()
         return parse_luogu_problem(
-            self._get(f"/problem/{problem_id}", _contentOnly=1),
+            self.problem_payload(problem_id),
             problem_id,
             tag_names,
         )
+
+    def problem_payload(self, problem_id: str) -> Any:
+        """Return the anonymous public payload without interpreting numeric tags."""
+        problem_id = str(problem_id).strip().upper()
+        return self._get(f"/problem/{problem_id}", _contentOnly=1)
 
 
 def _normalise_preview_tags(value: Any) -> list[str]:

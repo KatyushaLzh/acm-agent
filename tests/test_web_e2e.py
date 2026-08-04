@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import hashlib
 import http.client
 import json
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -91,18 +92,16 @@ class WebEndToEndTest(unittest.TestCase):
         )
 
     def request(self, method: str, path: str, payload: dict[str, object] | None = None):
-        connection = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=10)
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=3)
         headers = {"X-ACM-Token": "e2e-token"}
         body = None
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        try:
-            connection.request(method, path, body=body, headers=headers)
-            response = connection.getresponse()
-            decoded = json.loads(response.read())
-        finally:
-            connection.close()
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        decoded = json.loads(response.read())
+        connection.close()
         self.assertIn(response.status, {200, 202}, decoded)
         self.assertTrue(decoded["ok"], decoded)
         return decoded["data"]
@@ -117,6 +116,28 @@ class WebEndToEndTest(unittest.TestCase):
                 self.fail(str(job))
             time.sleep(0.01)
         self.fail("background job timed out")
+
+    @unittest.skipUnless(os.name == "nt", "Dashboard credential persistence uses Windows DPAPI")
+    def test_dashboard_credential_persists_without_http_or_disk_plaintext(self) -> None:
+        secret = "sk-dashboard-e2e-fixture-never-echo"
+        enabled = self.request(
+            "POST", "/api/ai/credential", {"api_key": secret}
+        )
+        self.assertTrue(enabled["api_key_detected"])
+        self.assertTrue(enabled["credential_persisted"])
+        self.assertEqual(enabled["credential_source"], "secure_store")
+        self.assertNotIn(secret, json.dumps(enabled))
+
+        encrypted = self.root / ".acm" / "deepseek-key.dpapi"
+        self.assertTrue(encrypted.is_file())
+        self.assertNotIn(secret.encode("utf-8"), encrypted.read_bytes())
+        restarted = AcmService(self.root)
+        self.assertTrue(restarted.ai_status()["api_key_detected"])
+        self.assertEqual(restarted.ai_status()["credential_source"], "secure_store")
+
+        cleared = self.request("POST", "/api/ai/credential", {"clear": True})
+        self.assertFalse(cleared["api_key_detected"])
+        self.assertFalse(encrypted.exists())
 
     def test_setup_sync_recommend_start_verify_close_and_review(self) -> None:
         bootstrap = self.request("GET", "/api/bootstrap")

@@ -288,6 +288,55 @@ class CliEndToEndTests(unittest.TestCase):
             payload = self.run_json(root, "next", "--count", "1")
             self.assertEqual(len(payload["recommendations"]), 1)
 
+    def test_ai_context_and_patch_cli_forward_structured_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.prepare_root(root)
+            statement = root / "statement.md"
+            statement.write_text("fixture statement", encoding="utf-8")
+
+            with mock.patch.object(
+                __import__("tools.acm_agent.service", fromlist=["AcmService"]).AcmService,
+                "ai_status",
+                return_value={"ok": True, "api_key_detected": False},
+            ):
+                status = self.run_json(root, "ai", "status")
+            self.assertFalse(status["api_key_detected"])
+
+            with mock.patch.object(
+                __import__("tools.acm_agent.service", fromlist=["AcmService"]).AcmService,
+                "ai_recommendations",
+                return_value={"ok": True, "warnings": [], "recommendations": []},
+            ) as rerank:
+                self.run_json(root, "next", "--ai", "--model", "deepseek-v4-pro")
+            self.assertEqual(rerank.call_args.kwargs["model"], "deepseek-v4-pro")
+
+            with mock.patch.object(
+                __import__("tools.acm_agent.service", fromlist=["AcmService"]).AcmService,
+                "problem_context_save",
+                return_value={"ok": True, "problem_id": "CF1A"},
+            ) as save_context:
+                self.run_json(
+                    root,
+                    "context",
+                    "set",
+                    "CF1A",
+                    "--file",
+                    str(statement),
+                    "--expected-hash",
+                    "abc",
+                )
+            self.assertEqual(save_context.call_args.kwargs["content"], "fixture statement")
+            self.assertEqual(save_context.call_args.kwargs["expected_hash"], "abc")
+
+            with mock.patch.object(
+                __import__("tools.acm_agent.service", fromlist=["AcmService"]).AcmService,
+                "ai_patch_revert",
+                return_value={"ok": True, "proposal_id": "p1"},
+            ) as revert:
+                self.run_json(root, "patch", "revert", "p1")
+            revert.assert_called_once_with("p1")
+
 
 if __name__ == "__main__":
     unittest.main()

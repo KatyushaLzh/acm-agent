@@ -132,12 +132,16 @@ def command_skipped(args: argparse.Namespace, paths: Any) -> int:
 
 
 def command_next(args: argparse.Namespace, paths: Any) -> int:
-    payload = _service(paths).recommendations(
-        count=args.count,
-        mode=args.mode,
-        source_mode=args.source_mode,
-        plan_ids=args.plan_ids or None,
-    )
+    method = _service(paths).ai_recommendations if args.ai else _service(paths).recommendations
+    kwargs = {
+        "count": args.count,
+        "mode": args.mode,
+        "source_mode": args.source_mode,
+        "plan_ids": args.plan_ids or None,
+    }
+    if args.ai:
+        kwargs["model"] = args.model
+    payload = method(**kwargs)
     lines: list[str] = []
     for item in payload["recommendations"]:
         why = "；".join(item["reasons"][:3]) or "题库补充"
@@ -151,6 +155,91 @@ def command_next(args: argparse.Namespace, paths: Any) -> int:
         as_json=args.json,
         human="\n".join(lines) or "当前没有符合条件的题目。",
     )
+    return 0
+
+
+def command_ai_status(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_status()
+    detected = "已检测" if payload["api_key_detected"] else "未检测"
+    _emit(payload, as_json=args.json, human=f"DeepSeek API Key：{detected}")
+    return 0
+
+
+def command_ai_test(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_test(model=args.model)
+    _emit(payload, as_json=args.json, human=f"DeepSeek 连接成功：{payload['model']}")
+    return 0
+
+
+def command_ai_settings(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_settings(
+        recommendation_model=args.recommend_model,
+        coaching_model=args.coach_model,
+        coaching_thinking=args.thinking,
+        reasoning_effort=args.reasoning_effort,
+    )
+    _emit(payload, as_json=args.json, human="AI 设置已保存（API Key 未写入配置）。")
+    return 0
+
+
+def command_context_fetch(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).problem_context_fetch(args.problem, force=args.force)
+    _emit(payload, as_json=args.json, human=f"题面已缓存：{payload['problem_id']}（{payload['source']}）")
+    return 0
+
+
+def command_context_show(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).problem_context(args.problem)
+    _emit(payload, as_json=args.json, human=payload.get("content") or "暂无题面缓存。")
+    return 0
+
+
+def command_context_set(args: argparse.Namespace, paths: Any) -> int:
+    content = args.file.read_text(encoding="utf-8")
+    payload = _service(paths).problem_context_save(
+        args.problem,
+        content=content,
+        expected_hash=args.expected_hash,
+    )
+    _emit(payload, as_json=args.json, human=f"人工题面已保存：{payload['problem_id']}")
+    return 0
+
+
+def command_ask(args: argparse.Namespace, paths: Any) -> int:
+    message = args.message or input("问题: ").strip()
+    payload = _service(paths).ai_chat(
+        args.problem,
+        message=message,
+        mode=args.mode,
+        hint_level=args.hint_level,
+        model=args.model,
+        conversation_id=args.conversation,
+    )
+    _emit(payload, as_json=args.json, human=payload.get("content") or "")
+    return 0
+
+
+def command_patch_preview(args: argparse.Namespace, paths: Any) -> int:
+    instruction = args.instruction or input("修复要求: ").strip()
+    payload = _service(paths).ai_patch_preview(
+        args.problem,
+        instruction=instruction,
+        model=args.model,
+        conversation_id=args.conversation,
+    )
+    _emit(payload, as_json=args.json, human=payload.get("diff") or "")
+    return 0
+
+
+def command_patch_apply(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_patch_apply(args.proposal_id)
+    _emit(payload, as_json=args.json, human=f"补丁已应用并验证：{payload['proposal_id']}")
+    return 0 if payload.get("verify", {}).get("passed") else 3
+
+
+def command_patch_revert(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_patch_revert(args.proposal_id)
+    _emit(payload, as_json=args.json, human=f"已恢复 AI 补丁：{payload['proposal_id']}")
     return 0
 
 
@@ -462,8 +551,73 @@ def build_parser() -> argparse.ArgumentParser:
         default="balanced",
     )
     nxt.add_argument("--plan", dest="plan_ids", action="append", help="限定已启用题单，可重复")
+    nxt.add_argument("--ai", action="store_true", help="显式使用 DeepSeek 对确定性候选重排")
+    nxt.add_argument("--model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
     nxt.add_argument("--json", action="store_true")
     nxt.set_defaults(handler=command_next)
+
+    ai = sub.add_parser("ai", help="DeepSeek BYOK 设置与连通性")
+    ai_sub = ai.add_subparsers(dest="ai_command", required=True)
+    ai_status = ai_sub.add_parser("status")
+    ai_status.add_argument("--json", action="store_true")
+    ai_status.set_defaults(handler=command_ai_status)
+    ai_test = ai_sub.add_parser("test")
+    ai_test.add_argument("--model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
+    ai_test.add_argument("--json", action="store_true")
+    ai_test.set_defaults(handler=command_ai_test)
+    ai_settings = ai_sub.add_parser("settings")
+    ai_settings.add_argument("--recommend-model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
+    ai_settings.add_argument("--coach-model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
+    ai_settings.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=None)
+    ai_settings.add_argument("--reasoning-effort", choices=("high", "max"))
+    ai_settings.add_argument("--json", action="store_true")
+    ai_settings.set_defaults(handler=command_ai_settings)
+
+    context = sub.add_parser("context", help="管理 AI 使用的公开题面上下文")
+    context_sub = context.add_subparsers(dest="context_command", required=True)
+    context_fetch = context_sub.add_parser("fetch")
+    context_fetch.add_argument("problem")
+    context_fetch.add_argument("--force", action="store_true")
+    context_fetch.add_argument("--json", action="store_true")
+    context_fetch.set_defaults(handler=command_context_fetch)
+    context_show = context_sub.add_parser("show")
+    context_show.add_argument("problem")
+    context_show.add_argument("--json", action="store_true")
+    context_show.set_defaults(handler=command_context_show)
+    context_set = context_sub.add_parser("set")
+    context_set.add_argument("problem")
+    context_set.add_argument("--file", type=Path, required=True)
+    context_set.add_argument("--expected-hash")
+    context_set.add_argument("--json", action="store_true")
+    context_set.set_defaults(handler=command_context_set)
+
+    ask = sub.add_parser("ask", help="在当前做题 session 中询问 DeepSeek")
+    ask.add_argument("problem")
+    ask.add_argument("message", nargs="?")
+    ask.add_argument("--mode", choices=("hint", "explain", "review"), default="hint")
+    ask.add_argument("--hint-level", type=int, default=1)
+    ask.add_argument("--model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
+    ask.add_argument("--conversation")
+    ask.add_argument("--json", action="store_true")
+    ask.set_defaults(handler=command_ask)
+
+    patch = sub.add_parser("patch", help="预览、应用或回退 AI 代码补丁")
+    patch_sub = patch.add_subparsers(dest="patch_command", required=True)
+    patch_preview = patch_sub.add_parser("preview")
+    patch_preview.add_argument("problem")
+    patch_preview.add_argument("instruction", nargs="?")
+    patch_preview.add_argument("--model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
+    patch_preview.add_argument("--conversation")
+    patch_preview.add_argument("--json", action="store_true")
+    patch_preview.set_defaults(handler=command_patch_preview)
+    patch_apply = patch_sub.add_parser("apply")
+    patch_apply.add_argument("proposal_id")
+    patch_apply.add_argument("--json", action="store_true")
+    patch_apply.set_defaults(handler=command_patch_apply)
+    patch_revert = patch_sub.add_parser("revert")
+    patch_revert.add_argument("proposal_id")
+    patch_revert.add_argument("--json", action="store_true")
+    patch_revert.set_defaults(handler=command_patch_revert)
 
     start = sub.add_parser("start", help="创建/复用今日代码并开启 session")
     start.add_argument("problem")
