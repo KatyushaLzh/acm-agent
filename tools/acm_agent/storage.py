@@ -8,6 +8,7 @@ to commit it, so a broken/partial network response never erases a good snapshot.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -15,8 +16,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
+from .tag_policy import effective_tags, normalize_tags, tag_key
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class PlanRevisionConflict(RuntimeError):
@@ -28,6 +30,17 @@ class PlanRevisionConflict(RuntimeError):
         self.actual = actual
         super().__init__(
             f"plan {plan_id!r} revision conflict: expected {expected}, current {actual}"
+        )
+
+
+class TagOverrideRevisionConflict(RuntimeError):
+    """Raised when a cleanup preview targets stale global tag decisions."""
+
+    def __init__(self, expected: int | None, actual: int):
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"tag override revision conflict: expected {expected}, current {actual}"
         )
 
 
@@ -321,6 +334,41 @@ MIGRATIONS: dict[int, str] = {
     CREATE INDEX problem_disposition_events_problem_idx
         ON problem_disposition_events(platform, problem_id, created_at DESC, id DESC);
     """,
+    5: """
+    CREATE TABLE problem_tag_overrides (
+        platform TEXT NOT NULL,
+        problem_id TEXT NOT NULL,
+        tag_key TEXT NOT NULL,
+        tag TEXT NOT NULL,
+        action TEXT NOT NULL CHECK (action IN ('add', 'suppress')),
+        source TEXT NOT NULL,
+        reason TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (platform, problem_id, tag_key),
+        FOREIGN KEY (platform, problem_id)
+            REFERENCES problems(platform, problem_id)
+    );
+
+    CREATE INDEX problem_tag_overrides_problem_idx
+        ON problem_tag_overrides(platform, problem_id, action);
+
+    CREATE TABLE tag_override_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        revision INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    );
+
+    INSERT INTO tag_override_state(singleton, revision, updated_at)
+        VALUES(1, 0, CURRENT_TIMESTAMP);
+
+    CREATE TABLE attempt_tag_snapshots (
+        attempt_id INTEGER PRIMARY KEY,
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        source TEXT NOT NULL,
+        captured_at TEXT NOT NULL,
+        FOREIGN KEY (attempt_id) REFERENCES attempts(id) ON DELETE CASCADE
+    );
+    """,
 }
 
 
@@ -336,7 +384,34 @@ class Database:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
-        self.migrate()
+        try:
+            self._backup_v4_before_tag_migration()
+            self.migrate()
+        except Exception:
+            self.connection.close()
+            raise
+
+    def _backup_v4_before_tag_migration(self) -> None:
+        """Create one consistent SQLite backup before the v5 data migration."""
+
+        current = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
+        if current != 4 or not self.path.exists():
+            return
+        backup_path = self.path.with_name(f"{self.path.name}.v4.bak")
+        if backup_path.exists():
+            return
+        temporary = backup_path.with_name(f".{backup_path.name}.tmp")
+        temporary.unlink(missing_ok=True)
+        destination = sqlite3.connect(temporary)
+        try:
+            self.connection.backup(destination)
+            destination.commit()
+        finally:
+            destination.close()
+        try:
+            os.replace(temporary, backup_path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def __enter__(self) -> "Database":
         return self
@@ -359,7 +434,27 @@ class Database:
                 raise RuntimeError(f"missing database migration {version}")
             with self.connection:
                 self.connection.executescript(migration)
+                if version == 5:
+                    self._backfill_attempt_tag_snapshots_v5()
                 self.connection.execute(f"PRAGMA user_version = {version}")
+
+    def _backfill_attempt_tag_snapshots_v5(self) -> None:
+        """Freeze the best current effective tags for pre-v5 closed attempts."""
+
+        has_attempts = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='attempts'"
+        ).fetchone()
+        if not has_attempts:
+            return
+        rows = self.query("SELECT id,platform,problem_id,closed_at FROM attempts WHERE closed_at IS NOT NULL")
+        for row in rows:
+            tags = self.effective_problem_tags(row["platform"], row["problem_id"])
+            self.connection.execute(
+                """INSERT OR IGNORE INTO attempt_tag_snapshots(
+                       attempt_id,tags_json,source,captured_at)
+                   VALUES(?,?,?,?)""",
+                (row["id"], _json(tags), "migration_v5", utc_now()),
+            )
 
     @contextmanager
     def atomic(self) -> Iterator[sqlite3.Connection]:
@@ -539,6 +634,118 @@ class Database:
             "SELECT * FROM problems WHERE platform=? ORDER BY problem_id", (platform,)
         )
 
+    @staticmethod
+    def _problem_id_variants(platform: str, problem_id: str) -> tuple[str, ...]:
+        value = str(problem_id).upper()
+        if platform == "codeforces":
+            bare = value[2:] if value.startswith("CF") else value
+            return bare, f"CF{bare}"
+        return (value,)
+
+    def problem_base_tags(self, platform: str, problem_id: str) -> list[str]:
+        """Merge raw platform tags with every current plan occurrence."""
+
+        variants = self._problem_id_variants(platform, problem_id)
+        row = self.connection.execute(
+            "SELECT tags_json FROM problems WHERE platform=? AND problem_id=?",
+            (platform, variants[0]),
+        ).fetchone()
+        values: list[str] = []
+        if row:
+            try:
+                values.extend(json.loads(row["tags_json"] or "[]"))
+            except (TypeError, json.JSONDecodeError):
+                pass
+        placeholders = ",".join("?" for _ in variants)
+        plan_rows = self.query(
+            f"SELECT tags_json FROM plan_tasks WHERE platform=? AND UPPER(problem_id) IN ({placeholders})",
+            (platform, *variants),
+        )
+        for plan_row in plan_rows:
+            try:
+                values.extend(json.loads(plan_row["tags_json"] or "[]"))
+            except (TypeError, json.JSONDecodeError):
+                continue
+        return normalize_tags(values)
+
+    def problem_tag_overrides(self, platform: str, problem_id: str) -> list[sqlite3.Row]:
+        variants = self._problem_id_variants(platform, problem_id)
+        return self.query(
+            """SELECT * FROM problem_tag_overrides
+               WHERE platform=? AND problem_id=?
+               ORDER BY updated_at,tag_key""",
+            (platform, variants[0]),
+        )
+
+    def effective_problem_tags(self, platform: str, problem_id: str) -> list[str]:
+        return effective_tags(
+            self.problem_base_tags(platform, problem_id),
+            self.problem_tag_overrides(platform, problem_id),
+        )
+
+    def tag_override_revision(self) -> int:
+        row = self.connection.execute(
+            "SELECT revision FROM tag_override_state WHERE singleton=1"
+        ).fetchone()
+        return int(row["revision"] if row else 0)
+
+    def require_tag_override_revision(self, expected: int | None) -> int:
+        actual = self.tag_override_revision()
+        if expected is not None and int(expected) != actual:
+            raise TagOverrideRevisionConflict(int(expected), actual)
+        return actual
+
+    def replace_problem_tag_overrides(
+        self,
+        platform: str,
+        problem_id: str,
+        *,
+        additions: Sequence[str] = (),
+        suppressions: Sequence[str] = (),
+        source: str = "user",
+        reason: str | None = None,
+    ) -> bool:
+        """Replace every explicit decision for one problem without bumping revision."""
+
+        variants = self._problem_id_variants(platform, problem_id)
+        normalized_add = normalize_tags(list(additions))
+        normalized_suppress = normalize_tags(list(suppressions))
+        desired = {
+            tag_key(tag): (tag, "add") for tag in normalized_add
+        }
+        desired.update(
+            {tag_key(tag): (tag, "suppress") for tag in normalized_suppress}
+        )
+        before = {
+            row["tag_key"]: (row["tag"], row["action"])
+            for row in self.problem_tag_overrides(platform, variants[0])
+        }
+        if before == desired:
+            return False
+        self.connection.execute(
+            "DELETE FROM problem_tag_overrides WHERE platform=? AND problem_id=?",
+            (platform, variants[0]),
+        )
+        now = utc_now()
+        for key, (tag, action) in desired.items():
+            self.connection.execute(
+                """INSERT INTO problem_tag_overrides(
+                       platform,problem_id,tag_key,tag,action,source,reason,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (platform, variants[0], key, tag, action, source, reason, now),
+            )
+        return True
+
+    def bump_tag_override_revision(self, expected: int | None) -> int:
+        actual = self.require_tag_override_revision(expected)
+        revision = actual + 1
+        self.connection.execute(
+            """UPDATE tag_override_state SET revision=?,updated_at=?
+               WHERE singleton=1 AND revision=?""",
+            (revision, utc_now(), actual),
+        )
+        return revision
+
     def submissions(
         self, platform: str | None = None, problem_id: str | None = None
     ) -> list[sqlite3.Row]:
@@ -610,6 +817,29 @@ class Database:
         )
         if cursor.rowcount != 1:
             raise KeyError(f"active attempt {attempt_id} not found")
+
+    def save_attempt_tag_snapshot(
+        self,
+        attempt_id: int,
+        tags: Sequence[str],
+        *,
+        source: str = "close",
+        captured_at: str | None = None,
+    ) -> None:
+        self.connection.execute(
+            """INSERT INTO attempt_tag_snapshots(attempt_id,tags_json,source,captured_at)
+               VALUES(?,?,?,?)
+               ON CONFLICT(attempt_id) DO UPDATE SET
+                 tags_json=excluded.tags_json,
+                 source=excluded.source,
+                 captured_at=excluded.captured_at""",
+            (attempt_id, _json(normalize_tags(list(tags))), source, captured_at or utc_now()),
+        )
+
+    def attempt_tag_snapshot(self, attempt_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM attempt_tag_snapshots WHERE attempt_id=?", (attempt_id,)
+        ).fetchone()
 
     def attempts(
         self, platform: str | None = None, problem_id: str | None = None

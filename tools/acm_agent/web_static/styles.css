@@ -331,21 +331,26 @@ label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weig
 .import-summary p { width: 100%; margin: 0; color: var(--muted); }
 .json-preview { max-height: 320px; overflow: auto; margin: 0; padding: 13px; color: #dcece3; background: #111813; border-radius: 9px; font-size: 10px; white-space: pre-wrap; }
 .import-errors { max-height: 150px; overflow: auto; padding: 10px 12px; color: var(--danger); background: var(--danger-soft); border-radius: 9px; font-size: 11px; }
-.plan-tags-dialog { width: min(980px, calc(100vw - 40px)); }
+.plan-tags-dialog { width: min(1180px, calc(100vw - 40px)); }
 .plan-tags-dialog .dialog-shell { max-height: calc(100vh - 60px); overflow: hidden; grid-template-rows: auto auto auto minmax(120px, 1fr) auto auto; }
 .tag-preview-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
 .tag-preview-summary > div { display: grid; gap: 2px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
 .tag-preview-summary span { color: var(--muted); font-size: 10px; }
 .tag-preview-summary strong { font: 800 18px/1.25 var(--mono); }
 .tag-proposal-list { display: grid; gap: 7px; min-height: 0; overflow: auto; padding-right: 3px; }
-.tag-proposal { display: grid; grid-template-columns: minmax(150px, 1.1fr) minmax(150px, 1fr) minmax(220px, 1.5fr) minmax(100px, .65fr); gap: 12px; align-items: center; padding: 11px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.tag-proposal { display: grid; grid-template-columns: minmax(130px, .8fr) minmax(170px, 1fr) minmax(210px, 1.2fr) minmax(190px, 1.1fr) minmax(90px, .55fr); gap: 12px; align-items: center; padding: 11px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
 .tag-proposal-problem { display: grid; min-width: 0; }
 .tag-proposal-problem strong { font: 800 12px var(--mono); }
 .tag-proposal-problem span { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.tag-proposal-original > span, .tag-proposal-source > span { display: block; margin-bottom: 4px; color: var(--muted); font-size: 9px; font-weight: 700; }
-.tag-proposal-original p { display: flex; flex-wrap: wrap; gap: 4px; margin: 0; }
-.tag-proposal-original .tag { padding: 3px 6px; font-size: 9px; }
-.tag-proposal-original em { color: var(--muted); font-size: 10px; font-style: normal; }
+.tag-proposal-original > span, .tag-proposal-source > span, .tag-proposal-diff > span { display: block; margin: 5px 0 4px; color: var(--muted); font-size: 9px; font-weight: 700; }
+.tag-proposal-original > span:first-child, .tag-proposal-diff > span:first-child { margin-top: 0; }
+.tag-proposal-original p, .tag-proposal-diff p { display: flex; flex-wrap: wrap; gap: 4px; margin: 0; }
+.tag-proposal-original .tag, .tag-proposal-diff .tag { padding: 3px 6px; font-size: 9px; }
+.tag-proposal-original em, .tag-proposal-diff em { color: var(--muted); font-size: 10px; font-style: normal; }
+.tag-proposal-diff { min-width: 0; }
+.tag-added { color: var(--brand); background: var(--brand-soft); }
+.tag-removed { color: var(--danger); background: var(--danger-soft); text-decoration: line-through; }
+.tag-ignored { color: var(--muted); opacity: .8; }
 .tag-proposal label { min-width: 0; }
 .tag-proposal input { padding: 8px 9px; font-size: 10px; }
 .tag-proposal-source { min-width: 0; }

@@ -21,6 +21,14 @@ from .platforms import (
 )
 from .recommend import compute_weakness, recommend
 from .storage import Database
+from .tag_policy import (
+    effective_tags,
+    meta_tag_reason,
+    normalize_tags,
+    split_meta_tags,
+    tag_diff,
+    tag_key,
+)
 from .verify import verify_problem
 from .workspace import ProblemRef, parse_problem_ref, scan_local_solutions, start_problem
 
@@ -314,6 +322,9 @@ class AcmService:
                 item["status"] = db.problem_status(row["platform"], row["problem_id"])
                 item["review_due"] = due_by_key.get(item["problem_key"])
                 item["source"] = "platform_catalog"
+                item["tags"] = db.effective_problem_tags(
+                    row["platform"], row["problem_id"]
+                )
                 catalog.append(item)
             plan_manager = PlanManager(self.paths.root, db, builtin_plan=self.paths.plan)
             plan_records = plan_manager.recommendation_records(plan_ids=plan_ids)
@@ -325,8 +336,11 @@ class AcmService:
                     else db.problem_status(item["platform"], db_id)
                 )
                 item["review_due"] = due_by_key.get(item["problem_key"])
-                platform_tags = json.loads(metadata["tags_json"] or "[]") if metadata else []
-                item["tags"] = list(dict.fromkeys([item["topic"], *platform_tags]))
+                base_tags = db.problem_base_tags(item["platform"], db_id)
+                item["tags"] = effective_tags(
+                    [*base_tags, item.get("topic", "")],
+                    db.problem_tag_overrides(item["platform"], db_id),
+                )
                 if metadata:
                     item["name"] = metadata["name"] or ""
                     item["rating"] = metadata["rating"]
@@ -627,47 +641,52 @@ class AcmService:
         problem_id = _db_problem_id(ref.platform, ref.problem_id)
         today = date.today()
         with Database(self.paths.database) as db:
-            attempt_id = self._find_or_start_attempt(db, ref)
-            previous = [
-                row for row in db.attempts(ref.platform, problem_id)
-                if row["id"] != attempt_id
-            ]
-            previous_wa = sum(str(row["result"] or "").upper() == "WA" for row in previous)
-            previous_abandoned = any(
-                str(row["result"] or "").upper() == "ABANDONED" for row in previous
-            )
-            previous_stage = max((int(row["review_stage"] or 0) for row in previous), default=0)
-            previous_due = next(
-                (row["review_due"][:10] for row in previous if row["review_due"]), None
-            )
-            qualifies = normalized_result == "AC" and (
-                hint >= 2
-                or previous_wa >= 2
-                or previous_abandoned
-                or (failure or "") in {"selection", "modeling", "invariant", "editorial"}
-                or previous_stage > 0
-            )
-            if qualifies:
-                next_stage = previous_stage + 1
-                review_stage = min(next_stage, 3)
-                delay = {1: 7, 2: 30, 3: 90}.get(next_stage)
-                review_due = (today + timedelta(days=delay)).isoformat() if delay else None
-            elif previous_stage > 0 and normalized_result != "AC":
-                review_stage = previous_stage
-                review_due = previous_due or today.isoformat()
-            else:
-                review_stage = 0
-                review_due = None
-            db.close_attempt(
-                attempt_id,
-                result=normalized_result,
-                minutes=minutes,
-                hint_level=hint,
-                failure_mode=None if failure == "none" else failure,
-                notes=notes,
-                review_stage=review_stage,
-                review_due=review_due,
-            )
+            with db.atomic():
+                attempt_id = self._find_or_start_attempt(db, ref)
+                previous = [
+                    row for row in db.attempts(ref.platform, problem_id)
+                    if row["id"] != attempt_id
+                ]
+                previous_wa = sum(str(row["result"] or "").upper() == "WA" for row in previous)
+                previous_abandoned = any(
+                    str(row["result"] or "").upper() == "ABANDONED" for row in previous
+                )
+                previous_stage = max((int(row["review_stage"] or 0) for row in previous), default=0)
+                previous_due = next(
+                    (row["review_due"][:10] for row in previous if row["review_due"]), None
+                )
+                qualifies = normalized_result == "AC" and (
+                    hint >= 2
+                    or previous_wa >= 2
+                    or previous_abandoned
+                    or (failure or "") in {"selection", "modeling", "invariant", "editorial"}
+                    or previous_stage > 0
+                )
+                if qualifies:
+                    next_stage = previous_stage + 1
+                    review_stage = min(next_stage, 3)
+                    delay = {1: 7, 2: 30, 3: 90}.get(next_stage)
+                    review_due = (today + timedelta(days=delay)).isoformat() if delay else None
+                elif previous_stage > 0 and normalized_result != "AC":
+                    review_stage = previous_stage
+                    review_due = previous_due or today.isoformat()
+                else:
+                    review_stage = 0
+                    review_due = None
+                snapshot_tags = db.effective_problem_tags(ref.platform, problem_id)
+                db.close_attempt(
+                    attempt_id,
+                    result=normalized_result,
+                    minutes=minutes,
+                    hint_level=hint,
+                    failure_mode=None if failure == "none" else failure,
+                    notes=notes,
+                    review_stage=review_stage,
+                    review_due=review_due,
+                )
+                db.save_attempt_tag_snapshot(
+                    attempt_id, snapshot_tags, source="close"
+                )
             state = db.problem_status(ref.platform, problem_id)
 
         candidate = {
@@ -684,6 +703,7 @@ class AcmService:
             "archive_candidate": bool(
                 normalized_result == "AC" and (hint >= 2 or failure not in {None, "none"})
             ),
+            "tags_snapshot": snapshot_tags,
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         self.paths.reports.mkdir(parents=True, exist_ok=True)
@@ -760,10 +780,20 @@ class AcmService:
         with Database(self.paths.database) as db:
             manager = PlanManager(self.paths.root, db, builtin_plan=self.paths.plan)
             detail = manager.get_plan(str(plan_id))
+            task_effective_tags: dict[str, dict[str, Any]] = {}
+            for task in self._plan_document_tasks(detail["plan"]):
+                platform = str(task["platform"]).lower()
+                problem_id = _db_problem_id(platform, str(task["problem_id"]))
+                task_effective_tags[str(task["task_key"])] = {
+                    "current_tags": normalize_tags(task.get("tags", [])),
+                    "effective_tags": db.effective_problem_tags(platform, problem_id),
+                }
             return {
                 "ok": True,
                 **detail,
                 "task_statuses": manager.task_statuses(detail["plan"]),
+                "task_effective_tags": task_effective_tags,
+                "override_revision": db.tag_override_revision(),
             }
 
     def plan_template(self) -> dict[str, Any]:
@@ -912,8 +942,12 @@ class AcmService:
         expected_revision: int | None = None,
         overwrite: bool = False,
         refresh: bool = True,
+        mode: str = "fill_missing",
     ) -> dict[str, Any]:
         """Build tag proposals; only the platform catalog may be refreshed."""
+        mode = str(mode or "fill_missing").lower()
+        if mode not in {"fill_missing", "cleanup"}:
+            raise ValueError("mode 必须是 fill_missing 或 cleanup")
         with Database(self.paths.database) as db:
             manager = PlanManager(self.paths.root, db, builtin_plan=self.paths.plan)
             current = manager.get_plan(str(plan_id))
@@ -927,46 +961,155 @@ class AcmService:
                     str(plan_id), int(expected_revision), int(current["revision"])
                 )
             tasks = self._plan_document_tasks(current["plan"])
-            preview = preview_plan_task_tags(
-                db,
-                tasks,
-                codeforces_client=self._codeforces_client_factory(),
-                luogu_client=self._luogu_client_factory(),
-                overwrite=bool(overwrite),
-                refresh_codeforces=bool(refresh),
+            if mode == "cleanup" and not refresh:
+                cached_proposals: list[dict[str, Any]] = []
+                for task in tasks:
+                    platform = str(task["platform"]).lower()
+                    problem_id = _db_problem_id(platform, str(task["problem_id"]))
+                    row = db.connection.execute(
+                        "SELECT tags_json FROM problems WHERE platform=? AND problem_id=?",
+                        (platform, problem_id),
+                    ).fetchone()
+                    try:
+                        cached_tags = normalize_tags(
+                            json.loads(row["tags_json"] or "[]") if row else []
+                        )
+                    except json.JSONDecodeError:
+                        cached_tags = []
+                    cached_proposals.append(
+                        {
+                            "task_key": str(task["task_key"]),
+                            "platform": platform,
+                            "problem_id": _display_problem_id(platform, problem_id),
+                            "name": str(task.get("name") or task.get("title") or task["problem_id"]),
+                            "current_tags": normalize_tags(task.get("tags", [])),
+                            "suggested_tags": cached_tags,
+                            "source": "sqlite_catalog" if cached_tags else "unresolved",
+                        }
+                    )
+                preview = {
+                    "proposals": cached_proposals,
+                    "coverage": {},
+                    "errors": [],
+                    "warnings": ["cleanup 使用本地平台标签快照；未请求远端刷新。"],
+                }
+            else:
+                preview = preview_plan_task_tags(
+                    db,
+                    tasks,
+                    codeforces_client=self._codeforces_client_factory(),
+                    luogu_client=self._luogu_client_factory(),
+                    overwrite=bool(overwrite or mode == "cleanup"),
+                    refresh_codeforces=bool(refresh),
+                )
+            if mode == "cleanup":
+                platform_by_task = {
+                    str(item["task_key"]): item for item in preview["proposals"]
+                }
+                for item in preview["proposals"]:
+                    raw_tags = normalize_tags(item.get("suggested_tags", []))
+                    if raw_tags:
+                        platform = str(item["platform"]).lower()
+                        db.upsert_problem(
+                            {
+                                "platform": platform,
+                                "problem_id": _db_problem_id(
+                                    platform, str(item["problem_id"])
+                                ),
+                                "tags": raw_tags,
+                            }
+                        )
+                proposals: list[dict[str, Any]] = []
+                for task in tasks:
+                    task_key = str(task["task_key"])
+                    platform = str(task["platform"]).lower()
+                    problem_id = _db_problem_id(platform, str(task["problem_id"]))
+                    platform_item = platform_by_task.get(task_key, {})
+                    raw_tags = normalize_tags(platform_item.get("suggested_tags", []))
+                    if not raw_tags:
+                        row = db.connection.execute(
+                            "SELECT tags_json FROM problems WHERE platform=? AND problem_id=?",
+                            (platform, problem_id),
+                        ).fetchone()
+                        if row:
+                            try:
+                                raw_tags = normalize_tags(json.loads(row["tags_json"] or "[]"))
+                            except json.JSONDecodeError:
+                                raw_tags = []
+                    current_tags = normalize_tags(task.get("tags", []))
+                    suggested_tags = db.effective_problem_tags(platform, problem_id)
+                    added_tags, removed_tags = tag_diff(current_tags, suggested_tags)
+                    _subject, ignored_meta = split_meta_tags([*raw_tags, *current_tags])
+                    proposals.append(
+                        {
+                            "task_key": task_key,
+                            "platform": platform,
+                            "problem_id": _display_problem_id(platform, problem_id),
+                            "name": str(task.get("name") or task.get("title") or task["problem_id"]),
+                            "raw_tags": raw_tags,
+                            "current_tags": current_tags,
+                            "suggested_tags": suggested_tags,
+                            "added_tags": added_tags,
+                            "removed_tags": removed_tags,
+                            "ignored_meta_tags": ignored_meta,
+                            "source": platform_item.get("source", "effective_policy"),
+                        }
+                    )
+                changed = sum(
+                    bool(item["added_tags"] or item["removed_tags"])
+                    for item in proposals
+                )
+                preview = {
+                    "proposals": proposals,
+                    "coverage": {
+                        "eligible": len(tasks),
+                        "suggested": sum(bool(item["suggested_tags"]) for item in proposals),
+                        "unresolved": sum(not item["suggested_tags"] for item in proposals),
+                        "skipped_nonempty": 0,
+                        "changed": changed,
+                        "added": sum(len(item["added_tags"]) for item in proposals),
+                        "removed": sum(len(item["removed_tags"]) for item in proposals),
+                        "ratio": (len(tasks) - changed) / len(tasks) if tasks else 1.0,
+                    },
+                    "errors": preview["errors"],
+                    "warnings": preview["warnings"],
+                }
+
+            total_tasks = len(tasks)
+            tagged_before = sum(bool(task.get("tags")) for task in tasks)
+            newly_tagged = sum(
+                bool(proposal.get("suggested_tags")) and not proposal.get("current_tags")
+                for proposal in preview["proposals"]
             )
-        total_tasks = len(tasks)
-        tagged_before = sum(bool(task.get("tags")) for task in tasks)
-        newly_tagged = sum(
-            bool(proposal.get("suggested_tags")) and not proposal.get("current_tags")
-            for proposal in preview["proposals"]
-        )
-        projected = min(total_tasks, tagged_before + newly_tagged)
-        preview["coverage"].update(
-            {
+            projected = min(total_tasks, tagged_before + newly_tagged)
+            preview["coverage"].update(
+                {
+                    "total_tasks": total_tasks,
+                    "tagged_before": tagged_before,
+                    "before": tagged_before / total_tasks if total_tasks else 1.0,
+                    "current": tagged_before / total_tasks if total_tasks else 1.0,
+                    "tagged_after": projected,
+                    "after": projected / total_tasks if total_tasks else 1.0,
+                    "projected": projected / total_tasks if total_tasks else 1.0,
+                }
+            )
+            return {
+                "ok": True,
+                "plan_id": str(plan_id),
+                "base_revision": current["revision"],
+                "override_revision": db.tag_override_revision(),
                 "total_tasks": total_tasks,
-                "tagged_before": tagged_before,
-                "before": tagged_before / total_tasks if total_tasks else 1.0,
-                "current": tagged_before / total_tasks if total_tasks else 1.0,
-                "tagged_after": projected,
-                "after": projected / total_tasks if total_tasks else 1.0,
-                "projected": projected / total_tasks if total_tasks else 1.0,
+                "overwrite": bool(overwrite),
+                "mode": mode,
+                **preview,
             }
-        )
-        return {
-            "ok": True,
-            "plan_id": str(plan_id),
-            "base_revision": current["revision"],
-            "total_tasks": total_tasks,
-            "overwrite": bool(overwrite),
-            **preview,
-        }
 
     def plan_tags_apply(
         self,
         plan_id: str,
         expected_revision: int,
         proposals: Any,
+        expected_override_revision: int | None = None,
     ) -> dict[str, Any]:
         if not isinstance(proposals, list):
             raise ValueError("proposals 必须是数组")
@@ -979,11 +1122,13 @@ class AcmService:
                 raise RevisionConflict(
                     str(plan_id), int(expected_revision), int(current["revision"])
                 )
+            db.require_tag_override_revision(expected_override_revision)
             document = json.loads(json.dumps(current["plan"], ensure_ascii=False))
             task_by_key = {
                 str(task["task_key"]): task for task in self._plan_document_tasks(document)
             }
             seen: set[str] = set()
+            desired_by_problem: dict[tuple[str, str], list[str]] = {}
             updated = 0
             skipped = 0
             for raw in proposals:
@@ -1004,17 +1149,82 @@ class AcmService:
                     _display_problem_id(task["platform"], task["problem_id"]),
                 ):
                     raise ValueError(f"{task_key}: problem_id 与当前题单不一致")
+                if "tags" not in raw and "suggested_tags" not in raw:
+                    raise ValueError(f"{task_key}: proposal 缺少 tags")
                 tags = self._normalise_plan_tags(
-                    raw.get("suggested_tags", raw.get("tags", []))
+                    raw["tags"] if "tags" in raw else raw["suggested_tags"]
                 )
-                if not tags or tags == task.get("tags", []):
+                platform = str(task["platform"]).lower()
+                problem_id = _db_problem_id(platform, str(task["problem_id"]))
+                problem_key = (platform, problem_id)
+                previous_desired = desired_by_problem.get(problem_key)
+                if previous_desired is not None and {
+                    tag_key(tag) for tag in previous_desired
+                } != {tag_key(tag) for tag in tags}:
+                    raise ValueError(
+                        f"{_display_problem_id(platform, problem_id)} 的全局标签建议不一致"
+                    )
+                desired_by_problem[problem_key] = tags
+                if tags == normalize_tags(task.get("tags", [])):
                     skipped += 1
                     continue
                 task["tags"] = tags
                 updated += 1
-            if updated:
+
+            override_specs: dict[tuple[str, str], tuple[list[str], list[str]]] = {}
+            override_changed = False
+            for (platform, problem_id), desired in desired_by_problem.items():
+                base_tags = db.problem_base_tags(platform, problem_id)
+                subject_base, _ignored = split_meta_tags(base_tags)
+                subject_by_key = {tag_key(tag): tag for tag in subject_base}
+                desired_keys = {tag_key(tag) for tag in desired}
+                additions = [
+                    tag for tag in desired
+                    if tag_key(tag) not in subject_by_key or meta_tag_reason(tag)
+                ]
+                suppressions = [
+                    tag for tag in subject_base if tag_key(tag) not in desired_keys
+                ]
+                override_specs[(platform, problem_id)] = (additions, suppressions)
+                wanted = {
+                    **{tag_key(tag): (tag, "add") for tag in additions},
+                    **{tag_key(tag): (tag, "suppress") for tag in suppressions},
+                }
+                existing = {
+                    row["tag_key"]: (row["tag"], row["action"])
+                    for row in db.problem_tag_overrides(platform, problem_id)
+                }
+                override_changed = override_changed or wanted != existing
+
+            override_revision = db.tag_override_revision()
+
+            def mutate_overrides() -> None:
+                nonlocal override_revision
+                changed = False
+                db.require_tag_override_revision(expected_override_revision)
+                for (platform, problem_id), (additions, suppressions) in override_specs.items():
+                    db.upsert_problem(
+                        {"platform": platform, "problem_id": problem_id}
+                    )
+                    changed = db.replace_problem_tag_overrides(
+                        platform,
+                        problem_id,
+                        additions=additions,
+                        suppressions=suppressions,
+                        source="user",
+                        reason="plan_tag_apply",
+                    ) or changed
+                if changed:
+                    override_revision = db.bump_tag_override_revision(
+                        expected_override_revision
+                    )
+
+            if updated or override_changed:
                 result = manager.edit_plan(
-                    str(plan_id), int(expected_revision), document=document
+                    str(plan_id),
+                    int(expected_revision),
+                    document=document,
+                    db_mutation=mutate_overrides,
                 )
             else:
                 result = current
@@ -1022,6 +1232,8 @@ class AcmService:
             "ok": True,
             "plan_id": str(plan_id),
             "updated": updated,
+            "override_updated": override_changed,
+            "override_revision": override_revision,
             "skipped": skipped,
             **result,
         }
@@ -1082,14 +1294,29 @@ class AcmService:
 
     @staticmethod
     def _attempt_rows_with_tags(db: Database) -> list[dict[str, Any]]:
-        problem_tags = {
-            (row["platform"], row["problem_id"]): json.loads(row["tags_json"] or "[]")
-            for row in db.problems()
-        }
-        return [
-            {**dict(row), "tags": problem_tags.get((row["platform"], row["problem_id"]), [])}
-            for row in db.attempts()
-        ]
+        result: list[dict[str, Any]] = []
+        for row in db.attempts():
+            snapshot = db.attempt_tag_snapshot(int(row["id"]))
+            if snapshot is not None:
+                try:
+                    tags = normalize_tags(json.loads(snapshot["tags_json"] or "[]"))
+                except json.JSONDecodeError:
+                    tags = []
+                source = "snapshot"
+                snapshot_source = snapshot["source"]
+            else:
+                tags = db.effective_problem_tags(row["platform"], row["problem_id"])
+                source = "legacy_fallback"
+                snapshot_source = None
+            result.append(
+                {
+                    **dict(row),
+                    "tags": tags,
+                    "tag_source": source,
+                    "tag_snapshot_source": snapshot_source,
+                }
+            )
+        return result
 
     @staticmethod
     def _review_due_by_key(db: Database) -> dict[str, str]:

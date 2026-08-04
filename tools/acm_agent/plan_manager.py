@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .plan import (
     PlanError,
@@ -292,20 +292,25 @@ class PlanManager:
         enabled: bool,
         source: str,
         builtin_path: str | Path | None,
+        db_mutation: Callable[[], None] | None = None,
     ) -> int:
         plan_id = str(document["plan_id"])
         path = self._managed_path(plan_id)
         previous = path.read_bytes() if path.exists() else None
         self._atomic_write(path, self._serialize(document))
         try:
-            return self.db.save_plan(
-                document,
-                enabled=enabled,
-                source=source,
-                builtin_path=builtin_path,
-                managed_path=path,
-                expected_revision=expected_revision,
-            )
+            with self.db.atomic():
+                revision = self.db.save_plan(
+                    document,
+                    enabled=enabled,
+                    source=source,
+                    builtin_path=builtin_path,
+                    managed_path=path,
+                    expected_revision=expected_revision,
+                )
+                if db_mutation is not None:
+                    db_mutation()
+            return revision
         except Exception:
             if previous is None:
                 path.unlink(missing_ok=True)
@@ -351,6 +356,7 @@ class PlanManager:
         *,
         document: Mapping[str, Any] | None = None,
         operations: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
+        db_mutation: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         current = self.get_plan(plan_id)
         if document is not None and operations is not None:
@@ -372,6 +378,7 @@ class PlanManager:
             enabled=current["enabled"],
             source=current["source"],
             builtin_path=current["builtin_path"],
+            db_mutation=db_mutation,
         )
         result = self.get_plan(plan_id)
         result["revision"] = revision

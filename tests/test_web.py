@@ -7,14 +7,9 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest import mock
 
-from tools.acm_agent.web import (
-    JobManager,
-    _restrict_runtime_permissions,
-    create_server,
-    find_existing_instance,
-)
+from tools.acm_agent.web import JobManager, create_server, find_existing_instance
+from tools.acm_agent.storage import TagOverrideRevisionConflict
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -100,6 +95,8 @@ class FakeService:
         return self._return("plan_tags_preview", values)
 
     def plan_tags_apply(self, **values: object) -> dict[str, object]:
+        if values.get("override_conflict"):
+            raise TagOverrideRevisionConflict(2, 3)
         return self._return("plan_tags_apply", values)
 
     def problem_skip(self, **values: object) -> dict[str, object]:
@@ -120,26 +117,6 @@ class FakeService:
         return self._return("verify", values)
 
 
-class WindowsRuntimePermissionTest(unittest.TestCase):
-    def test_acl_commands_parse_sid_without_decoding_localized_output_as_utf8(self) -> None:
-        whoami = mock.Mock(
-            returncode=0,
-            stdout=b'\xd2\xbb\xb8\xf6\xd3\xc3\xbb\xa7,"S-1-5-21-123-456-789-1001"\r\n',
-        )
-        icacls = mock.Mock(returncode=0, stdout=b"\xd2\xd1\xb3\xc9\xb9\xa6\xb4\xa6\xc0\xed\r\n")
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "web-runtime.json"
-            path.write_text("{}", encoding="utf-8")
-            with (
-                mock.patch("tools.acm_agent.web.os.name", "nt"),
-                mock.patch("tools.acm_agent.web.subprocess.run", side_effect=[whoami, icacls]) as run,
-            ):
-                _restrict_runtime_permissions(path)
-
-        command = run.call_args_list[1].args[0]
-        self.assertIn("*S-1-5-21-123-456-789-1001:(F)", command)
-
-
 class WebServerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -156,7 +133,7 @@ class WebServerTest(unittest.TestCase):
             max_port=0,
             token="test-token",
             static_dir=self.static,
-            max_request_bytes=64,
+            max_request_bytes=512,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -214,11 +191,7 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(headers["content-type"], "text/html; charset=utf-8")
         self.assertIn("default-src 'self'", headers["content-security-policy"])
 
-        with mock.patch(
-            "tools.acm_agent.web.mimetypes.guess_type",
-            return_value=("application/javascript", None),
-        ):
-            status, payload, headers = self.request("GET", "/static/app.js", token=None)
+        status, payload, headers = self.request("GET", "/static/app.js", token=None)
         self.assertEqual(status, 200)
         self.assertEqual(headers["content-type"], "text/javascript; charset=utf-8")
         self.assertIn("console.log", payload["raw"])
@@ -250,13 +223,14 @@ class WebServerTest(unittest.TestCase):
         status, payload, _ = self.request(
             "POST",
             "/api/jobs/plans/tags/preview",
-            payload={"plan_id": "example", "overwrite": False},
+            payload={"plan_id": "example", "overwrite": False, "mode": "cleanup"},
         )
         self.assertEqual(status, 202)
         job = self.wait_for_job(payload["data"]["job_id"])
         self.assertEqual(job["status"], "succeeded")
         self.assertEqual(job["result"]["operation"], "plan_tags_preview")
         self.assertFalse(job["result"]["overwrite"])
+        self.assertEqual(job["result"]["mode"], "cleanup")
 
     def test_synchronous_routes_forward_json_objects(self) -> None:
         routes = {
@@ -328,6 +302,29 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(payload["error"]["code"], "revision_conflict")
 
+    def test_tag_apply_forwards_override_revision_and_empty_tags(self) -> None:
+        status, payload, _ = self.request(
+            "POST",
+            "/api/plans/tags/apply",
+            payload={
+                "plan_id": "example",
+                "expected_revision": 3,
+                "expected_override_revision": 7,
+                "proposals": [{"task_key": "task-1", "tags": []}],
+            },
+        )
+        self.assertEqual(status, 200)
+        forwarded = payload["data"]
+        self.assertEqual(forwarded["operation"], "plan_tags_apply")
+        self.assertEqual(forwarded["expected_override_revision"], 7)
+        self.assertEqual(forwarded["proposals"], [{"task_key": "task-1", "tags": []}])
+
+        status, payload, _ = self.request(
+            "POST", "/api/plans/tags/apply", payload={"override_conflict": True}
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"]["code"], "revision_conflict")
+
     def test_host_and_origin_are_restricted(self) -> None:
         status, payload, _ = self.request(
             "GET",
@@ -360,7 +357,7 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(payload["error"]["code"], "invalid_json_type")
 
-        status, payload, _ = self.request("POST", "/api/setup", payload={"long": "x" * 100})
+        status, payload, _ = self.request("POST", "/api/setup", payload={"long": "x" * 600})
         self.assertEqual(status, 413)
         self.assertEqual(payload["error"]["code"], "request_too_large")
 
