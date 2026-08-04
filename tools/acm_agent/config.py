@@ -1,0 +1,105 @@
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+CONFIG_VERSION = 1
+
+
+@dataclass(frozen=True)
+class Paths:
+    root: Path
+    state_dir: Path
+    config: Path
+    database: Path
+    cache: Path
+    build: Path
+    cases: Path
+    reports: Path
+    failures: Path
+    plan: Path
+    plan_readme: Path
+
+    @classmethod
+    def for_root(cls, root: Path) -> "Paths":
+        root = root.resolve()
+        state = root / ".acm"
+        return cls(
+            root=root,
+            state_dir=state,
+            config=state / "config.json",
+            database=state / "state.db",
+            cache=state / "cache",
+            build=state / "build",
+            cases=state / "cases",
+            reports=state / "reports",
+            failures=state / "failures",
+            plan=root / "training" / "data-structures-30d" / "plan.json",
+            plan_readme=root / "training" / "data-structures-30d" / "README.md",
+        )
+
+    def ensure(self) -> None:
+        for path in (
+            self.state_dir,
+            self.cache,
+            self.build,
+            self.cases,
+            self.reports,
+            self.failures,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "version": CONFIG_VERSION,
+    "accounts": {
+        "codeforces": {"handle": ""},
+        "luogu": {"uid": ""},
+    },
+    "recommendation": {
+        "mode": "plan_first",
+        "count": 3,
+        "target_cf_rating": None,
+        "platform_ratio": {"codeforces": 0.6, "luogu": 0.4},
+    },
+    "sync": {
+        "status_ttl_hours": 6,
+        "catalog_ttl_hours": 24,
+        "timeout_seconds": 20,
+    },
+}
+
+
+def load_config(paths: Paths, *, required: bool = True) -> dict[str, Any]:
+    if not paths.config.exists():
+        if required:
+            raise FileNotFoundError(
+                f"Configuration not found: {paths.config}. Run '.\\acm.ps1 init' first."
+            )
+        return json.loads(json.dumps(DEFAULT_CONFIG))
+    data = json.loads(paths.config.read_text(encoding="utf-8"))
+    if data.get("version") != CONFIG_VERSION:
+        raise ValueError(f"Unsupported config version: {data.get('version')!r}")
+    return data
+
+
+def save_config(paths: Paths, config: dict[str, Any]) -> None:
+    paths.ensure()
+    payload = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+    fd, temporary = tempfile.mkstemp(
+        prefix="config-", suffix=".json", dir=paths.state_dir
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, paths.config)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)

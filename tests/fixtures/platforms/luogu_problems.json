@@ -1,0 +1,10 @@
+{
+  "currentData": {
+    "problems": {
+      "result": [
+        {"pid": "P3372", "title": "线段树 1", "difficulty": 3, "tags": [3]},
+        {"pid": "P1000", "title": "超级玛丽游戏", "difficulty": 1, "tags": [1]}
+      ]
+    }
+  }
+}

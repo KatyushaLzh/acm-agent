@@ -1,0 +1,32 @@
+# ACM Agent local state: accounts, SQLite, caches, builds, reports and tokens
+.acm/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local agent/tool state
+.codex/
+.firecrawl/
+.learnings/
+.tmp/
+tmp/
+
+# Local diagnostics
+*.log
+*.tmp

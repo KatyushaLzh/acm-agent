@@ -1,0 +1,13 @@
+{
+  "status": "OK",
+  "result": {
+    "problems": [
+      {"contestId": 100, "index": "A", "name": "Known", "rating": 1000, "tags": ["implementation"]},
+      {"contestId": 100, "index": "B", "name": "New", "rating": 1200, "tags": ["greedy"]}
+    ],
+    "problemStatistics": [
+      {"contestId": 100, "index": "A", "solvedCount": 20000},
+      {"contestId": 100, "index": "B", "solvedCount": 10000}
+    ]
+  }
+}

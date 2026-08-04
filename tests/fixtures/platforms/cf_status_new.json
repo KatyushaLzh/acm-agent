@@ -1,0 +1,19 @@
+{
+  "status": "OK",
+  "result": [
+    {
+      "id": 12,
+      "creationTimeSeconds": 1700000012,
+      "verdict": "OK",
+      "programmingLanguage": "GNU C++17",
+      "problem": {"contestId": 100, "index": "B", "name": "New", "rating": 1200, "tags": ["greedy"]}
+    },
+    {
+      "id": 11,
+      "creationTimeSeconds": 1700000011,
+      "verdict": "WRONG_ANSWER",
+      "programmingLanguage": "GNU C++17",
+      "problem": {"contestId": 100, "index": "A", "name": "Known", "rating": 1000, "tags": ["implementation"]}
+    }
+  ]
+}

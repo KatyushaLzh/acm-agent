@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="ACM Agent 本地训练仪表盘">
+  <title>ACM Agent</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#today" aria-label="ACM Agent 首页">
+        <span class="brand-mark">A</span>
+        <span><strong>ACM Agent</strong><small>训练控制台</small></span>
+      </a>
+      <nav class="nav" aria-label="主导航">
+        <button class="nav-item active" data-view="today"><span>◫</span>今日训练</button>
+        <button class="nav-item" data-view="workbench"><span>⌁</span>做题工作台</button>
+        <button class="nav-item" data-view="plans"><span>☷</span>题单</button>
+        <button class="nav-item" data-view="review"><span>↻</span>复盘</button>
+        <button class="nav-item" data-view="settings"><span>⚙</span>设置</button>
+      </nav>
+      <div class="sidebar-foot">
+        <span id="server-dot" class="status-dot"></span>
+        <span id="server-label">连接本地服务…</span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow" id="today-label"></p>
+          <h1 id="page-title">今日训练</h1>
+        </div>
+        <div class="top-actions">
+          <button class="icon-button" id="theme-toggle" type="button" title="切换主题" aria-label="切换主题">◐</button>
+          <button class="button primary" id="sync-button" type="button">同步平台状态</button>
+        </div>
+      </header>
+
+      <div id="global-alert" class="alert hidden" role="alert"></div>
+
+      <section id="setup-view" class="setup-panel hidden" aria-labelledby="setup-title">
+        <div class="setup-copy">
+          <span class="kicker">首次使用</span>
+          <h2 id="setup-title">连接你的做题记录</h2>
+          <p>平台 AC 是权威状态，本地文件只会记为 <code>local_only</code>。账号信息仅保存在这台电脑。</p>
+        </div>
+        <form id="setup-form" class="form-grid">
+          <label>Codeforces handle<input name="codeforces" autocomplete="off" required placeholder="例如 tourist"></label>
+          <label>洛谷数字 UID<input name="luogu" inputmode="numeric" pattern="[0-9]+" required placeholder="例如 123456"></label>
+          <label>目标 CF rating（可选）<input name="target_rating" inputmode="numeric" type="number" min="800" max="4000" step="100"></label>
+          <details class="advanced"><summary>高级选项</summary><label class="check"><input name="skip_validate" type="checkbox">离线保存，不验证账号 <span class="warning-text">可能导致账号填写错误</span></label></details>
+          <button class="button primary wide" type="submit">保存并进入仪表盘</button>
+        </form>
+      </section>
+
+      <section id="today-view" class="view active">
+        <div class="stats-grid" id="account-stats">
+          <article class="stat-card skeleton"></article><article class="stat-card skeleton"></article><article class="stat-card skeleton"></article>
+        </div>
+
+        <div class="section-heading">
+          <div><p class="eyebrow">NEXT SET</p><h2>下一组训练</h2></div>
+          <form id="recommend-controls" class="inline-controls">
+            <label><span class="sr-only">推荐模式</span><select name="mode"><option value="mixed">混合模式</option><option value="new">只做新题</option><option value="review">只做复习</option></select></label>
+            <label><span class="sr-only">推荐来源</span><select name="source_mode"><option value="balanced">题单与题库均衡</option><option value="catalog_only">仅题库</option><option value="plan_only">仅题单</option></select></label>
+            <details id="recommend-plan-filter" class="plan-filter">
+              <summary>全部已启用题单</summary>
+              <div id="recommend-plan-options" class="plan-filter-options"><span class="subtle">暂无已启用题单</span></div>
+            </details>
+            <label><span class="sr-only">推荐数量</span><select name="count"><option value="3">3 题</option><option value="6">6 题</option><option value="9">9 题</option></select></label>
+            <button class="button secondary" type="submit">重新推荐</button>
+          </form>
+        </div>
+        <div id="recommend-basis" class="basis-banner plan_only">尚未生成推荐</div>
+        <div id="recommendations" class="recommend-grid empty-state"><p>同步平台状态或直接生成一组训练。</p></div>
+
+        <div class="two-column lower-grid">
+          <article class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">CURRENT</p><h2>进行中的题目</h2></div><button class="text-button" data-go="workbench">进入工作台 →</button></div>
+            <div id="active-session" class="empty-state compact">没有 active session</div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">SYNC</p><h2>数据来源</h2></div></div>
+            <div id="source-list" class="source-list"></div>
+            <div id="job-progress" class="job-progress hidden"><div class="progress-track"><span></span></div><p>正在处理…</p></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="plans-view" class="view">
+        <div class="plans-toolbar">
+          <div>
+            <p class="eyebrow">PLAN LIBRARY</p>
+            <h2>训练题单</h2>
+            <p class="subtle plans-intro">编辑后立即保存，并在下一次推荐中生效。</p>
+          </div>
+          <div class="plans-toolbar-actions">
+            <input id="plan-file-input" type="file" accept="application/json,.json" class="sr-only">
+            <button id="plan-import-button" class="button secondary" type="button">导入 JSON</button>
+            <button id="plan-template-button" class="button secondary" type="button">下载 v2 模板</button>
+            <button id="plan-refresh-button" class="icon-button" type="button" title="刷新题单" aria-label="刷新题单">↻</button>
+          </div>
+        </div>
+
+        <div class="plan-workspace">
+          <aside class="plan-library panel" aria-label="题单列表">
+            <div class="plan-library-head">
+              <strong>全部题单</strong>
+              <span id="plan-count" class="badge neutral">0</span>
+            </div>
+            <div id="plan-list" class="plan-list empty-state compact">正在读取题单…</div>
+          </aside>
+
+          <div id="plan-editor" class="plan-editor panel">
+            <div class="empty-state plan-editor-empty">
+              <div><strong>选择一个题单开始编辑</strong><p>可调整阶段、题目、顺序和日期。</p></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="workbench-view" class="view">
+        <div class="two-column workbench-grid">
+          <article class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">START</p><h2>开始做题</h2></div></div>
+            <form id="start-form" class="stack-form">
+              <label>题号或题目 URL<input name="problem" required autocomplete="off" placeholder="CF1234A 或 P1000"></label>
+              <label class="check"><input name="with_stress" type="checkbox">同时创建暴力和数据生成器</label>
+              <button class="button primary" type="submit">创建 / 复用源码并开始计时</button>
+            </form>
+            <div id="start-result" class="result-box hidden"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">VERIFY</p><h2>本地验证</h2></div></div>
+            <form id="verify-form" class="stack-form">
+              <label>题号（留空时使用 active session）<input name="problem" autocomplete="off" placeholder="CF1234A"></label>
+              <div class="form-row">
+                <label>输出比较<select name="compare"><option value="token">Token 比较</option><option value="exact">字节精确比较</option></select></label>
+                <label>超时（秒）<input name="timeout" type="number" min="0.1" max="60" step="0.1" value="2"></label>
+              </div>
+              <div class="form-row">
+                <label>对拍次数<input name="stress_iterations" type="number" min="1" max="10000" value="100"></label>
+                <label>随机种子（可选）<input name="seed" type="number"></label>
+              </div>
+              <label class="check"><input name="debug" type="checkbox">探测并启用 ASan / UBSan</label>
+              <button class="button secondary" type="submit">编译并验证</button>
+            </form>
+          </article>
+        </div>
+
+        <article class="panel output-panel">
+          <div class="panel-heading"><div><p class="eyebrow">OUTPUT</p><h2>验证输出</h2></div><span id="verify-state" class="badge neutral">尚未运行</span></div>
+          <pre id="verify-output">编译信息、样例结果和对拍诊断会显示在这里。</pre>
+        </article>
+
+        <article class="panel close-panel">
+          <div class="panel-heading"><div><p class="eyebrow">RETROSPECT</p><h2>结束与复盘</h2></div><span class="subtle">只生成归档候选，不修改知识索引</span></div>
+          <form id="close-form" class="form-grid close-form">
+            <label>题号<input name="problem" required autocomplete="off" placeholder="CF1234A"></label>
+            <label>结果<select name="result"><option>AC</option><option>WA</option><option>TLE</option><option>MLE</option><option>RE</option><option>ABANDONED</option></select></label>
+            <label>独立思考分钟数<input name="minutes" required type="number" min="0" max="1440" value="45"></label>
+            <label>提示等级<select name="hint_level"><option value="0">0 — 无提示</option><option value="1">1 — 反例提问</option><option value="2">2 — 性质提示</option><option value="3">3 — 核心转化 / 伪代码</option><option value="4">4 — 完整代码</option></select></label>
+            <label>失败类型<select name="failure"><option value="none">无</option><option value="implementation">实现错误</option><option value="edge_case">边界条件</option><option value="selection">选型错误</option><option value="modeling">建模错误</option><option value="invariant">不变量错误</option><option value="complexity">复杂度错误</option><option value="editorial">看过题解</option></select></label>
+            <label class="span-2">简短备注<textarea name="notes" rows="3" maxlength="1000" placeholder="关键错误、反例或下一次复做关注点"></textarea></label>
+            <button class="button primary span-2" type="submit">结束 session</button>
+          </form>
+          <div id="close-result" class="result-box hidden"></div>
+        </article>
+      </section>
+
+      <section id="review-view" class="view">
+        <div class="section-heading"><div><p class="eyebrow">WEEKLY</p><h2>近七天复盘</h2></div><button id="review-button" class="button secondary">刷新周复盘</button></div>
+        <div id="review-summary" class="stats-grid"></div>
+        <div class="two-column lower-grid">
+          <article class="panel"><div class="panel-heading"><h2>到期复做</h2></div><div id="review-due" class="list empty-state compact">暂无到期题目</div></article>
+          <article class="panel"><div class="panel-heading"><h2>薄弱专题</h2></div><div id="weak-topics" class="bar-list empty-state compact">暂无训练数据</div></article>
+        </div>
+        <div class="two-column lower-grid">
+          <article class="panel"><div class="panel-heading"><h2>结果分布</h2></div><div id="result-distribution" class="chip-list"></div></article>
+          <article class="panel"><div class="panel-heading"><h2>失败类型</h2></div><div id="failure-distribution" class="chip-list"></div></article>
+        </div>
+        <article class="panel lower-grid">
+          <div class="panel-heading"><div><p class="eyebrow">SKIPPED</p><h2>已 Skip 题目</h2></div><span class="subtle">可撤销并重新进入推荐池</span></div>
+          <div id="skipped-problems" class="skipped-list empty-state compact">暂无 Skip 记录</div>
+        </article>
+        <article class="panel lower-grid">
+          <div class="panel-heading"><div><p class="eyebrow">HISTORY</p><h2>最近 session</h2></div><label><span class="sr-only">按结果筛选</span><select id="session-filter"><option value="all">全部结果</option><option value="AC">AC</option><option value="WA">WA</option><option value="TLE">TLE</option><option value="RE">RE</option><option value="ABANDONED">ABANDONED</option><option value="active">进行中</option></select></label></div>
+          <div id="recent-sessions" class="session-list empty-state compact">暂无 session</div>
+        </article>
+      </section>
+
+      <section id="settings-view" class="view">
+        <div class="two-column">
+          <article class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">ACCOUNT</p><h2>平台账号</h2></div></div>
+            <form id="settings-form" class="stack-form">
+              <label>Codeforces handle<input name="codeforces" autocomplete="off"></label>
+              <label>洛谷数字 UID<input name="luogu" inputmode="numeric" pattern="[0-9]+"></label>
+              <label>目标 CF rating<input name="target_rating" type="number" min="800" max="4000" step="100"></label>
+              <label class="check"><input name="skip_validate" type="checkbox">离线保存（跳过账号验证）</label>
+              <button class="button primary" type="submit">保存设置</button>
+            </form>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">SYSTEM</p><h2>本地服务</h2></div></div>
+            <dl class="details-list"><div><dt>版本</dt><dd id="service-version">—</dd></div><div><dt>监听地址</dt><dd id="service-address">127.0.0.1</dd></div><div><dt>状态库</dt><dd>SQLite · 本地唯一事实源</dd></div></dl>
+            <div class="settings-actions"><button id="plan-check-button" class="button secondary">校验 30 天题单</button><button id="shutdown-button" class="button danger">停止本地服务</button></div>
+            <div id="plan-result" class="result-box hidden"></div>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <dialog id="plan-import-dialog" class="dialog plan-import-dialog">
+    <form method="dialog" class="dialog-shell">
+      <div class="dialog-heading"><div><p class="eyebrow">IMPORT</p><h2>导入题单 JSON</h2></div><button class="icon-button dialog-close" value="cancel" aria-label="关闭">×</button></div>
+      <div id="plan-import-summary" class="import-summary"></div>
+      <pre id="plan-import-preview" class="json-preview"></pre>
+      <div id="plan-import-errors" class="import-errors hidden" role="alert"></div>
+      <label id="plan-replace-confirm" class="check hidden"><input type="checkbox">我确认用导入内容替换同 ID 题单</label>
+      <div class="dialog-actions"><button class="button secondary" value="cancel">取消</button><button id="plan-import-confirm" class="button primary" type="button" disabled>确认导入</button></div>
+    </form>
+  </dialog>
+  <dialog id="plan-tags-dialog" class="dialog plan-tags-dialog" aria-labelledby="plan-tags-title">
+    <form method="dialog" class="dialog-shell">
+      <div class="dialog-heading"><div><p class="eyebrow">TAG PREVIEW</p><h2 id="plan-tags-title">确认补全标签</h2></div><button class="icon-button dialog-close" value="cancel" aria-label="关闭补全标签确认框">×</button></div>
+      <div id="plan-tags-summary" class="tag-preview-summary" aria-live="polite"></div>
+      <div id="plan-tags-failures" class="import-errors hidden" role="alert"></div>
+      <div id="plan-tags-proposals" class="tag-proposal-list"></div>
+      <p class="subtle tag-preview-note">确认前可直接修改建议标签；取消不会写入题单。</p>
+      <div class="dialog-actions"><button class="button secondary" value="cancel">取消</button><button id="plan-tags-apply" class="button primary" type="button">应用标签</button></div>
+    </form>
+  </dialog>
+  <dialog id="skip-dialog" class="dialog skip-dialog" aria-labelledby="skip-dialog-title">
+    <form method="dialog" class="dialog-shell">
+      <div class="dialog-heading"><div><p class="eyebrow">SKIP PROBLEM</p><h2 id="skip-dialog-title">确认 Skip</h2></div><button class="icon-button dialog-close" value="cancel" aria-label="关闭 Skip 确认框">×</button></div>
+      <div id="skip-problem-summary" class="skip-problem-summary"></div>
+      <div class="skip-contract" role="note">
+        <strong>仅在以下情况使用 Skip</strong>
+        <ul><li>没有查看题解或完整代码</li><li>已经有完整、可实现的解题思路</li><li>本次不计为 AC</li><li>不会创建源码或复做记录</li></ul>
+      </div>
+      <label>备注（可选）<textarea id="skip-note" rows="3" maxlength="500" placeholder="例如：已独立推导出状态设计与转移"></textarea></label>
+      <div class="dialog-actions"><button class="button secondary" value="cancel">取消</button><button id="skip-confirm" class="button primary" type="button">确认 Skip</button></div>
+    </form>
+  </dialog>
+  <template id="toast-template"><div class="toast"><strong></strong><p></p></div></template>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
