@@ -214,7 +214,11 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(headers["content-type"], "text/html; charset=utf-8")
         self.assertIn("default-src 'self'", headers["content-security-policy"])
 
-        status, payload, headers = self.request("GET", "/static/app.js", token=None)
+        with mock.patch(
+            "tools.acm_agent.web.mimetypes.guess_type",
+            return_value=("application/javascript", None),
+        ):
+            status, payload, headers = self.request("GET", "/static/app.js", token=None)
         self.assertEqual(status, 200)
         self.assertEqual(headers["content-type"], "text/javascript; charset=utf-8")
         self.assertIn("console.log", payload["raw"])

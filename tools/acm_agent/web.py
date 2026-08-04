@@ -38,6 +38,13 @@ DEFAULT_PORT = 8765
 LAST_PORT = 8775
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_JOBS = 100
+STATIC_MEDIA_TYPES = {
+    ".css": "text/css",
+    ".html": "text/html",
+    ".js": "text/javascript",
+    ".json": "application/json",
+    ".svg": "image/svg+xml",
+}
 
 
 def _utc_now() -> str:
@@ -418,7 +425,9 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
         except OSError:
             self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "static_read_error", "Unable to read static asset")
             return
-        media_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+        media_type = STATIC_MEDIA_TYPES.get(candidate.suffix.lower())
+        if media_type is None:
+            media_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", media_type + ("; charset=utf-8" if media_type.startswith("text/") else ""))
         self.send_header("Content-Length", str(len(content)))
