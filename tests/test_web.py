@@ -665,6 +665,28 @@ class StaticPlanEditorTest(unittest.TestCase):
         self.assertIn('event === "delta"', self.script)
         self.assertIn("window.confirm", self.script)
 
+    def test_patch_preview_shows_only_highlighted_candidate_source(self) -> None:
+        self.assertIn('id="ai-patch-code"', self.html)
+        self.assertNotIn('id="ai-patch-diff"', self.html)
+        self.assertIn("修改后的完整代码", self.html)
+        self.assertIn("function highlightCpp(source)", self.script)
+        self.assertIn("node.innerHTML = highlightCpp(source)", self.script)
+        self.assertIn('typeof data.candidate_code !== "string"', self.script)
+        self.assertIn('renderCppSource($("#ai-patch-code"), data.candidate_code)', self.script)
+        self.assertNotIn('$("#ai-patch-diff").textContent = data.diff', self.script)
+        styles = (
+            REPO_ROOT / "tools/acm_agent/web_static/styles.css"
+        ).read_text(encoding="utf-8")
+        for token_class in (
+            ".cpp-keyword",
+            ".cpp-type",
+            ".cpp-string",
+            ".cpp-comment",
+            ".cpp-number",
+            ".cpp-preprocessor",
+        ):
+            self.assertIn(token_class, styles)
+
     def test_ai_key_form_uses_password_input_and_never_browser_storage(self) -> None:
         self.assertIn('id="ai-credential-form"', self.html)
         self.assertIn('name="api_key" type="password"', self.html)

@@ -176,7 +176,7 @@
             <textarea name="message" rows="3" maxlength="12000" required placeholder="描述你的思路、卡点或希望检查的代码问题"></textarea>
             <div class="card-actions"><button class="button primary" type="submit">发送</button><button id="ai-patch-preview" class="button secondary" type="button">生成AI修改代码</button><button id="ai-chat-clear" class="button danger" type="button">清除本题对话</button></div>
           </form>
-          <div id="ai-patch-box" class="result-box hidden"><pre id="ai-patch-diff"></pre><div class="card-actions"><button id="ai-patch-apply" class="button primary" type="button">确认应用并验证</button><button id="ai-patch-revert" class="button secondary" type="button">回退补丁</button></div></div>
+          <div id="ai-patch-box" class="result-box hidden"><div class="patch-preview-heading"><strong>修改后的完整代码</strong><span class="subtle">注释会说明原代码错误与修复原因</span></div><pre id="ai-patch-code" class="cpp-code" aria-label="修改后的 C++ 代码"></pre><div class="card-actions"><button id="ai-patch-apply" class="button primary" type="button">确认应用并验证</button><button id="ai-patch-revert" class="button secondary" type="button">回退补丁</button></div></div>
         </article>
 
         <article class="panel close-panel">

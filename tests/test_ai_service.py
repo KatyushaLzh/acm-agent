@@ -52,7 +52,13 @@ class FakeDeepSeek:
 
     def __init__(self):
         self.calls = []
-        self.patch_code = "#include <bits/stdc++.h>\nint main(){return 0;}\n"
+        self.patch_code = (
+            "#include <bits/stdc++.h>\n"
+            "int main(){\n"
+            "  // 原代码错误：返回非零值会表示异常结束；改为 0 表示正常结束。\n"
+            "  return 0;\n"
+            "}\n"
+        )
 
     def chat(self, messages, **kwargs):
         self.calls.append(("chat", messages, kwargs))
@@ -214,7 +220,11 @@ class AiServiceTests(unittest.TestCase):
         self.assertIn(CHINESE_EXPLANATION_RULE, sent)
         self.assertIn("diagnosis 属于解释性内容", sent)
         self.assertIn("代码、算法名和复杂度表达无需翻译", sent)
+        self.assertIn("每个实质修复点附近加入简短的中文 C++ 注释", sent)
+        self.assertIn("原代码哪里错误以及该修改为何正确", sent)
         self.assertIn("proposal_id", preview)
+        self.assertEqual(preview["candidate_code"], self.client.patch_code)
+        self.assertIn("// 原代码错误", preview["candidate_code"])
         self.assertIn("--- a/", preview["diff"])
         applied = self.service.ai_patch_apply(preview["proposal_id"])
         self.assertFalse(applied["verify"]["passed"])

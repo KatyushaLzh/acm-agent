@@ -433,6 +433,65 @@ def validate_model_replacement(source: str, *, max_bytes: int = SOURCE_MAX_BYTES
     return source
 
 
+def _cpp_comment_bodies(source: str) -> list[str]:
+    """Extract C++ comments while ignoring comment markers in strings/chars."""
+    comments: list[str] = []
+    index = 0
+    length = len(source)
+    while index < length:
+        char = source[index]
+        if char in {'"', "'"}:
+            quote = char
+            index += 1
+            while index < length:
+                if source[index] == "\\":
+                    index += 2
+                    continue
+                if source[index] == quote:
+                    index += 1
+                    break
+                index += 1
+            continue
+        if source.startswith("//", index):
+            end = source.find("\n", index + 2)
+            if end < 0:
+                end = length
+            comments.append(source[index + 2 : end])
+            index = end
+            continue
+        if source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            if end < 0:
+                comments.append(source[index + 2 :])
+                break
+            comments.append(source[index + 2 : end])
+            index = end + 2
+            continue
+        index += 1
+    return comments
+
+
+def validate_patch_explanatory_comments(original: str, replacement: str) -> str:
+    """Require at least one meaningful new source comment in an AI replacement."""
+    original = validate_cpp_source(original)
+    replacement = validate_model_replacement(replacement)
+
+    def normalized_comments(source: str) -> set[str]:
+        return {
+            re.sub(r"\s+", " ", body).strip()
+            for body in _cpp_comment_bodies(source)
+            if len(re.sub(r"\s+", "", body)) >= 4
+        }
+
+    before = normalized_comments(original)
+    added = normalized_comments(replacement) - before
+    if not added:
+        raise SourceValidationError(
+            "replacement_code 必须在修改处加入新注释，说明原代码错误和修复原因"
+        )
+    return replacement
+
+
 def unified_source_diff(original: str, replacement: str, *, path: str = "solution.cpp") -> str:
     original = validate_cpp_source(original)
     replacement = validate_model_replacement(replacement)
@@ -594,4 +653,5 @@ __all__ = [
     "validate_managed_cpp",
     "validate_manual_context",
     "validate_model_replacement",
+    "validate_patch_explanatory_comments",
 ]

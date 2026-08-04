@@ -82,6 +82,86 @@ function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>'"]/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
 }
 
+const CPP_KEYWORDS = new Set([
+  "alignas", "alignof", "asm", "auto", "break", "case", "catch", "class", "concept", "const",
+  "consteval", "constexpr", "constinit", "const_cast", "continue", "co_await", "co_return", "co_yield",
+  "decltype", "default", "delete", "do", "dynamic_cast", "else", "enum", "explicit", "export", "extern",
+  "for", "friend", "goto", "if", "inline", "mutable", "namespace", "new", "noexcept", "operator",
+  "private", "protected", "public", "register", "reinterpret_cast", "requires", "return", "sizeof", "static",
+  "static_assert", "static_cast", "struct", "switch", "template", "this", "thread_local", "throw", "try",
+  "typedef", "typeid", "typename", "union", "using", "virtual", "volatile", "while",
+]);
+const CPP_TYPES = new Set([
+  "bool", "char", "char8_t", "char16_t", "char32_t", "double", "float", "int", "long", "short", "signed",
+  "unsigned", "void", "wchar_t", "size_t", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t",
+  "uint16_t", "uint32_t", "uint64_t", "string", "vector", "array", "map", "set", "queue", "deque",
+  "stack", "pair", "tuple",
+]);
+const CPP_LITERALS = new Set(["true", "false", "nullptr", "NULL"]);
+
+function cppSpan(kind, value) {
+  return `<span class="cpp-${kind}">${escapeHtml(value)}</span>`;
+}
+
+function highlightCpp(source) {
+  const value = String(source ?? "");
+  let output = ""; let index = 0; let lineStart = true;
+  while (index < value.length) {
+    const char = value[index]; const next = value[index + 1] || "";
+    if (char === "\n") { output += "\n"; index += 1; lineStart = true; continue; }
+    if (/\s/.test(char)) { output += escapeHtml(char); index += 1; continue; }
+    if (lineStart && char === "#") {
+      let end = index;
+      while (end < value.length && value[end] !== "\n") end += 1;
+      output += cppSpan("preprocessor", value.slice(index, end)); index = end; lineStart = false; continue;
+    }
+    lineStart = false;
+    if (char === "/" && next === "/") {
+      let end = index + 2;
+      while (end < value.length && value[end] !== "\n") end += 1;
+      output += cppSpan("comment", value.slice(index, end)); index = end; continue;
+    }
+    if (char === "/" && next === "*") {
+      let end = value.indexOf("*/", index + 2);
+      end = end < 0 ? value.length : end + 2;
+      output += cppSpan("comment", value.slice(index, end));
+      lineStart = value.slice(index, end).endsWith("\n"); index = end; continue;
+    }
+    if (char === '"' || char === "'") {
+      const quote = char; let end = index + 1;
+      while (end < value.length) {
+        if (value[end] === "\\") { end += 2; continue; }
+        if (value[end] === quote) { end += 1; break; }
+        end += 1;
+      }
+      output += cppSpan("string", value.slice(index, end)); index = end; continue;
+    }
+    if (/[A-Za-z_]/.test(char)) {
+      let end = index + 1;
+      while (end < value.length && /[A-Za-z0-9_]/.test(value[end])) end += 1;
+      const token = value.slice(index, end);
+      const kind = CPP_KEYWORDS.has(token) ? "keyword" : CPP_TYPES.has(token) ? "type" : CPP_LITERALS.has(token) ? "literal" : "identifier";
+      output += kind === "identifier" ? escapeHtml(token) : cppSpan(kind, token); index = end; continue;
+    }
+    if (/\d/.test(char) || (char === "." && /\d/.test(next))) {
+      let end = index + 1;
+      while (end < value.length && /[A-Za-z0-9_.'+-]/.test(value[end])) end += 1;
+      output += cppSpan("number", value.slice(index, end)); index = end; continue;
+    }
+    if (/[{}()[\];,.?:~!%^&*+\-/|<>=]/.test(char)) {
+      let end = index + 1;
+      while (end < value.length && end < index + 3 && /[~!%^&*+\-/|<>=]/.test(value[end])) end += 1;
+      output += cppSpan("operator", value.slice(index, end)); index = end; continue;
+    }
+    output += escapeHtml(char); index += 1;
+  }
+  return output;
+}
+
+function renderCppSource(node, source) {
+  node.innerHTML = highlightCpp(source);
+}
+
 function safeHref(value) {
   try {
     const url = new URL(String(value));
@@ -429,7 +509,7 @@ function resetAiWorkbenchUi(problem = "") {
   const messages = $("#ai-chat-messages");
   messages.className = "ai-chat-messages empty-state compact";
   messages.textContent = problem ? "正在读取本题的持久对话…" : "开始题目后可在这里请求分级提示或代码诊断。";
-  $("#ai-patch-diff").textContent = "";
+  $("#ai-patch-code").textContent = "";
   $("#ai-patch-box").classList.add("hidden");
 }
 
@@ -673,20 +753,21 @@ async function previewAiPatch(button) {
   try {
     const conversationId = state.aiConversationProblemKey === problemKey ? state.aiConversationId : null;
     const started = await api("/api/jobs/ai/patches/preview", { body: { problem, instruction, conversation_id: conversationId || null } });
-    const data = await waitForJob(started.job_id, "正在生成候选源码和安全 Diff…");
+    const data = await waitForJob(started.job_id, "正在生成带错误注释的候选源码…");
     if (!aiOperationIsCurrent(problemKey, epoch)) return;
+    if (typeof data.candidate_code !== "string" || !data.candidate_code.trim()) throw new Error("服务未返回修改后的 C++ 源码");
     state.aiPatchProposalId = data.proposal_id;
     state.aiPatchProblemKey = problemKey;
-    $("#ai-patch-diff").textContent = data.diff || "无变化";
+    renderCppSource($("#ai-patch-code"), data.candidate_code);
     $("#ai-patch-box").classList.remove("hidden");
   } catch (error) { if (aiOperationIsCurrent(problemKey, epoch)) toast("补丁预览失败", error.message, "error"); }
   finally { setBusy(button, false); }
 }
 
 async function runPatchAction(action, button) {
-  if (!state.aiPatchProposalId) return toast("没有补丁", "请先生成 Diff。", "error");
-  if (state.aiPatchProblemKey !== state.aiProblemKey) return toast("补丁已过期", "请为当前题目重新生成 Diff。", "error");
-  if (action === "apply" && !window.confirm("应用该 Diff、备份当前源码并运行本地验证？")) return;
+  if (!state.aiPatchProposalId) return toast("没有候选代码", "请先生成 AI 修改代码。", "error");
+  if (state.aiPatchProblemKey !== state.aiProblemKey) return toast("候选代码已过期", "请为当前题目重新生成修改代码。", "error");
+  if (action === "apply" && !window.confirm("应用当前修改后代码、备份原源码并运行本地验证？")) return;
   const problemKey = state.aiProblemKey; const epoch = state.aiEpoch;
   setBusy(button, true);
   try {

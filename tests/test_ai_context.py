@@ -24,6 +24,7 @@ from tools.acm_agent.ai_context import (
     validate_managed_cpp,
     validate_manual_context,
     validate_model_replacement,
+    validate_patch_explanatory_comments,
 )
 
 
@@ -204,6 +205,24 @@ class PatchSafetyTests(unittest.TestCase):
             )
             self.assertEqual(source.read_text(encoding="utf-8"), original)
             self.assertEqual(reverted.restored_sha256, baseline)
+
+    def test_ai_replacement_requires_a_meaningful_new_comment(self) -> None:
+        original = 'std::string url = "https://example.test"; // existing note\nint main(){return 1;}\n'
+        with self.assertRaises(SourceValidationError):
+            validate_patch_explanatory_comments(
+                original,
+                'std::string url = "https://changed.test"; // existing note\nint main(){return 0;}\n',
+            )
+        replacement = (
+            'std::string url = "https://changed.test"; // existing note\n'
+            'int main(){\n'
+            '  // 原代码错误：返回 1 会表示程序异常结束；改为 0 表示正常结束。\n'
+            '  return 0;\n'
+            '}\n'
+        )
+        self.assertEqual(
+            validate_patch_explanatory_comments(original, replacement), replacement
+        )
 
     def test_apply_and_revert_reject_stale_hashes_and_unsafe_backup(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
