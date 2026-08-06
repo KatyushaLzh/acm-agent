@@ -314,7 +314,7 @@ API endpoint 固定为 DeepSeek 官方 Chat Completions 地址，模型名有 al
 
 “结束与复盘”中的 Markdown 总结默认关闭。Session 会先独立关闭；只有用户勾选后才会调用 DeepSeek，并根据冻结标签、题面、最终源码、复盘字段和当前未清除的 AI 对话生成知识卡。用户曾点击“清除本题对话”的旧 conversation 仍保留审计，但不会再次发送给模型。总结失败不会回滚 attempt，也不会写入目标文件。
 
-目标可以是固定本地磁盘上的任意 `.md`。根目录已有的 `algorithms.md` 和 `tricks.md` 会分别按固定 Algorithms/Tricks schema 自动注册为已保存目标，因此 Dashboard 的 schema 选择器不再重复列出这两个 preset。其他文件首次注册分为“只读检查 schema”和“确认保存目标”两步；可从已有 H1/H2 与字段标签推断 `summary-schema-v1`、提供自定义 schema，或让 DeepSeek 同时判断 schema。schema 只是字段、标题层级、布局和间距的声明式 JSON，不执行模板脚本。
+目标可以是固定本地磁盘上的任意 `.md`。发行包根目录随附 `algorithms.md` 和 `tricks.md`；首次读取目标列表时，它们会分别按固定 Algorithms/Tricks schema 自动注册并启用为已保存目标，因此 Dashboard 的 schema 选择器不再重复列出这两个 preset。注册过程不会改写模板内容。其他文件首次注册分为“只读检查 schema”和“确认保存目标”两步；可从已有 H1/H2 与字段标签推断 `summary-schema-v1`、提供自定义 schema，或让 DeepSeek 同时判断 schema。schema 只是字段、标题层级、布局和间距的声明式 JSON，不执行模板脚本。
 
 写入流程固定为：`DeepSeek 结构化生成 → 本地确定性渲染 → 可编辑 Markdown 与安全预览 → 刷新预览 → 确认 apply`。Dashboard 不展示 unified diff；服务端仍保存基线 SHA-256、候选 bytes 和内部 diff 用于审计与安全应用。若目标中存在 `Source` 题号完全相同的唯一条目，只有该旧条目会与本次上下文一并发送给 DeepSeek，由模型语义合并后替换原条目；仅标题相同或模糊相似时按新条目处理，不再要求用户选择。apply 前再次检查路径、UTF-8/BOM、1 MiB 上限和基线，备份到 `.acm/markdown-backups/` 后同目录原子替换。目标被外部编辑时返回 HTTP 409；revert 仅在文件仍等于已应用版本时可用。本机路径、账号、API Key 和整份知识库不会发送给 DeepSeek。
 

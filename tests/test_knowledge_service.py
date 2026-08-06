@@ -159,12 +159,12 @@ class KnowledgeServiceTests(unittest.TestCase):
     def test_conventional_knowledge_files_are_automatically_saved_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "algorithms.md").write_text(
-                get_builtin_template("algorithms-v1"), encoding="utf-8"
-            )
-            (root / "tricks.md").write_text(
-                get_builtin_template("tricks-v1"), encoding="utf-8"
-            )
+            bundled = {}
+            for name in ("algorithms.md", "tricks.md"):
+                source = REPO_ROOT / name
+                self.assertTrue(source.is_file(), f"release target is missing: {name}")
+                shutil.copy2(source, root / name)
+                bundled[name] = (root / name).read_bytes()
             state_dir = root / ".acm"
             state_dir.mkdir()
             with Database(state_dir / "state.db"):
@@ -176,6 +176,10 @@ class KnowledgeServiceTests(unittest.TestCase):
             self.assertEqual(by_name["Tricks"]["preset"], "tricks-v1")
             self.assertEqual(Path(by_name["Algorithms"]["path"]), root / "algorithms.md")
             self.assertEqual(Path(by_name["Tricks"]["path"]), root / "tricks.md")
+            self.assertTrue(by_name["Algorithms"]["enabled"])
+            self.assertTrue(by_name["Tricks"]["enabled"])
+            self.assertEqual((root / "algorithms.md").read_bytes(), bundled["algorithms.md"])
+            self.assertEqual((root / "tricks.md").read_bytes(), bundled["tricks.md"])
 
     def test_exact_problem_source_is_sent_to_ai_and_semantically_merged(self) -> None:
         existing = """
