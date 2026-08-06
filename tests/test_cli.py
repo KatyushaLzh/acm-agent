@@ -337,6 +337,95 @@ class CliEndToEndTests(unittest.TestCase):
                 self.run_json(root, "patch", "revert", "p1")
             revert.assert_called_once_with("p1")
 
+    def test_ai_stress_cli_forwards_explicit_start_and_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            service_type = __import__("tools.acm_agent.service", fromlist=["AcmService"]).AcmService
+            with mock.patch.object(
+                service_type,
+                "ai_stress_start",
+                return_value={"ok": True, "run": {"id": "run-1", "status": "running"}},
+                create=True,
+            ) as start, mock.patch.object(
+                service_type,
+                "stress_run",
+                return_value={"ok": True, "run": {"id": "run-1", "status": "completed"}},
+                create=True,
+            ):
+                payload = self.run_json(
+                    root,
+                    "verify",
+                    "CF1A",
+                    "--ai-stress",
+                    "--exact",
+                    "--seed",
+                    "17",
+                    "--prepare-timeout",
+                    "600",
+                    "--force-regenerate",
+                    "--cache-mode",
+                    "cold",
+                    "--generation-mode",
+                    "full-thinking",
+                )
+            self.assertEqual(payload["run"]["id"], "run-1")
+            self.assertEqual(start.call_args.args, ("CF1A",))
+            self.assertEqual(start.call_args.kwargs["compare"], "exact")
+            self.assertTrue(start.call_args.kwargs["generate_generator"])
+            self.assertTrue(start.call_args.kwargs["generate_brute"])
+            self.assertTrue(start.call_args.kwargs["prepare_reference"])
+            self.assertTrue(start.call_args.kwargs["large_profile"])
+            self.assertEqual(start.call_args.kwargs["preparation_timeout_seconds"], 600)
+            self.assertTrue(start.call_args.kwargs["force_regenerate"])
+            self.assertEqual(start.call_args.kwargs["cache_mode"], "cold")
+            self.assertEqual(start.call_args.kwargs["generation_mode"], "full_thinking")
+
+            with mock.patch.object(
+                service_type,
+                "ai_stress_start",
+                return_value={"ok": True, "run": {"id": "run-2", "status": "completed"}},
+                create=True,
+            ) as start_without_large, mock.patch.object(
+                service_type,
+                "stress_run",
+                return_value={"ok": True, "run": {"id": "run-2", "status": "completed"}},
+                create=True,
+            ):
+                payload = self.run_json(
+                    root, "verify", "CF1A", "--ai-stress", "--no-large"
+                )
+            self.assertEqual(payload["run"]["id"], "run-2")
+            self.assertFalse(start_without_large.call_args.kwargs["large_profile"])
+            self.assertIsNone(
+                start_without_large.call_args.kwargs["preparation_timeout_seconds"]
+            )
+            self.assertFalse(start_without_large.call_args.kwargs["force_regenerate"])
+            self.assertIsNone(start_without_large.call_args.kwargs["cache_mode"])
+            self.assertIsNone(start_without_large.call_args.kwargs["generation_mode"])
+
+            calls = (
+                ("stress_run", ("stress", "status", "run-1")),
+                ("stress_stop", ("stress", "stop", "run-1")),
+                ("stress_resume", ("stress", "resume", "run-1")),
+                ("stress_bundle", ("stress", "artifacts", "bundle-1")),
+                ("stress_bundle_revert", ("stress", "revert", "bundle-1")),
+            )
+            with mock.patch.object(
+                service_type,
+                "stress_run",
+                return_value={"ok": True, "run": {"id": "run-1", "status": "completed"}},
+                create=True,
+            ):
+                for method, arguments in calls:
+                    with self.subTest(method=method), mock.patch.object(
+                        service_type,
+                        method,
+                        return_value={"ok": True, "method": method},
+                        create=True,
+                    ) as target:
+                        self.run_json(root, *arguments)
+                        target.assert_called_once_with(arguments[-1])
+
 
 if __name__ == "__main__":
     unittest.main()

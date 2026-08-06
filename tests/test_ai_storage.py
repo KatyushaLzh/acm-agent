@@ -42,10 +42,10 @@ class AiStorageMigrationTests(unittest.TestCase):
                 connection.close()
 
             with Database(path) as database:
-                self.assertEqual(SCHEMA_VERSION, 6)
+                self.assertEqual(SCHEMA_VERSION, 12)
                 self.assertEqual(
                     database.connection.execute("PRAGMA user_version").fetchone()[0],
-                    6,
+                    SCHEMA_VERSION,
                 )
                 tables = {
                     row[0]
@@ -125,7 +125,7 @@ class AiStorageMigrationTests(unittest.TestCase):
             with Database(path) as database:
                 self.assertEqual(
                     database.connection.execute("PRAGMA user_version").fetchone()[0],
-                    6,
+                    SCHEMA_VERSION,
                 )
 
 

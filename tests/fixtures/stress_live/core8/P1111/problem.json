@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "platform": "luogu",
+  "problem_id": "P1111",
+  "title": "Repairing Roads",
+  "statement_file": "statement.md",
+  "statement_sha256": "9f18fd608a25e2a34d4bd77f510720a4e9767afcbba16af20e3da1fd3d187e04",
+  "primary_source_file": "primary.cpp",
+  "primary_source_sha256": "2c19a27f3356abeabfc1f0c55290fb8f87f4ab21e609321b2f9538ecd46b72cb",
+  "samples": [{
+    "name": "benchmark-sample-1",
+    "input_file": "samples/1.in",
+    "input_sha256": "3b6969bcaa9d7c569eec7bc650eeb8fd7d5e23c07f58c7663096f583cd2ee8ec",
+    "output_file": "samples/1.out",
+    "output_sha256": "f0b5c2c2211c8d67ed15e75e656c7862d086e9245420892a7de62cd9ec582a06"
+  }]
+}

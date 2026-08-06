@@ -150,15 +150,63 @@
                 <label>对拍次数<input name="stress_iterations" type="number" min="1" max="10000" value="100"></label>
                 <label>随机种子（可选）<input name="seed" type="number"></label>
               </div>
-              <label class="check"><input name="debug" type="checkbox">探测并启用 ASan / UBSan</label>
+              <label class="check"><input name="debug" type="checkbox">探测并启用 ASan / UBSan（检测内存错误与未定义行为）</label>
               <button class="button secondary" type="submit">编译并验证</button>
             </form>
+            <details id="ai-stress-panel" class="ai-stress-panel">
+              <summary>AI 持续对拍（可选，默认关闭）</summary>
+              <p class="subtle">启用后会将公开题面发送给 DeepSeek，并按 Codeforces 官方题解 / 洛谷题解、博客园、CSDN 的顺序搜索对拍代码；不会发送账号、API Key、本机路径或你的主解源码。</p>
+              <form id="ai-stress-form" class="stack-form">
+                <label class="check"><input name="enabled" type="checkbox">我确认启用 AI 准备、自动备份并替换对拍 helper</label>
+                <fieldset id="ai-stress-options" class="ai-stress-options" disabled>
+                  <div class="ai-stress-checks">
+                    <label class="check"><input name="generate_generator" type="checkbox" checked>补全数据生成器</label>
+                    <label class="check"><input name="generate_brute" type="checkbox" checked>补全小规模暴力</label>
+                    <label class="check"><input name="prepare_reference" type="checkbox" checked>搜索 / 生成对拍代码</label>
+                    <label class="check"><input name="large_profile" type="checkbox" checked>启用极限大数据（不运行 brute）</label>
+                  </div>
+                  <span class="subtle">取消前三项时会复用对应的现有 helper；文件不存在则安全停止准备。</span>
+                  <div class="form-row">
+                    <label>模型<select name="model"><option value="">使用验证模型设置</option><option value="deepseek-v4-flash">DeepSeek Flash</option><option value="deepseek-v4-pro">DeepSeek Pro</option></select></label>
+                    <label>起始 seed（可选）<input name="seed" type="number" min="0"></label>
+                  </div>
+                  <div class="form-row">
+                    <label>对拍代码最长运行时间（秒）<input name="timeout" type="number" min="0.1" max="60" step="0.1" value="2"></label>
+                    <label>对拍暴力代码最长运行时间（秒）<input name="brute_timeout" type="number" min="0.1" max="60" step="0.1" value="5"></label>
+                  </div>
+                  <div class="form-row">
+                    <label>准备耗时上限（秒）<input name="preparation_timeout_seconds" type="number" min="60" max="1800" step="1" value="600"></label>
+                    <label>helper 生成模式<select name="generation_mode"><option value="fast">Fast（非 thinking）</option><option value="hybrid" selected>Hybrid（默认）</option><option value="full_thinking">Full thinking</option></select></label>
+                  </div>
+                  <label>缓存模式<select name="cache_mode"><option value="reuse" selected>Reuse（复用已认证结果）</option><option value="refresh_helpers">Refresh helpers（保留 contract/recipe）</option><option value="cold">Cold（不读取任何本地生成缓存）</option></select></label>
+                  <span id="ai-stress-generation-mode-hint" class="subtle">默认按 10 分钟预算设计；第 8 分钟硬停止 provider，为本地验证保留 110 秒、清理保留 10 秒。Hybrid 初次使用 Fast，仅在收到明确机器诊断后启用 thinking。</span>
+                  <div class="ai-stress-safety">
+                    <span>small：2 MiB 输入输出 · large：32 MiB 输入、16 MiB 输出 · 来源顺序：官方题解 → 博客园 → CSDN → AI 生成</span>
+                    <span id="ai-stress-isolation" class="badge neutral">正在检查隔离环境</span>
+                  </div>
+                  <button class="button primary" type="submit">AI 准备并开始持续对拍</button>
+                </fieldset>
+              </form>
+            </details>
           </article>
         </div>
 
         <article class="panel output-panel">
           <div class="panel-heading"><div><p class="eyebrow">OUTPUT</p><h2>验证输出</h2></div><span id="verify-state" class="badge neutral">尚未运行</span></div>
           <pre id="verify-output">编译信息、样例结果和对拍诊断会显示在这里。</pre>
+        </article>
+
+        <article id="ai-stress-run-panel" class="panel ai-stress-run-panel hidden">
+          <div class="panel-heading"><div><p class="eyebrow">AI STRESS</p><h2>持续对拍</h2></div><span id="ai-stress-run-state" class="badge neutral">未启动</span></div>
+          <div id="ai-stress-run-summary" class="ai-stress-progress"></div>
+          <div class="card-actions">
+            <button id="ai-stress-stop" class="button secondary" type="button">暂停</button>
+            <button id="ai-stress-resume" class="button secondary" type="button">继续</button>
+            <button id="ai-stress-finish" class="button danger" type="button">结束对拍</button>
+            <button id="ai-stress-artifacts" class="button secondary" type="button">查看 helper 来源</button>
+            <button id="ai-stress-revert" class="button secondary" type="button">回退 helper</button>
+          </div>
+          <pre id="ai-stress-detail" class="stress-detail hidden"></pre>
         </article>
 
         <article class="panel ai-workbench-panel">
@@ -180,7 +228,7 @@
         </article>
 
         <article class="panel close-panel">
-          <div class="panel-heading"><div><p class="eyebrow">RETROSPECT</p><h2>结束与复盘</h2></div><span class="subtle">只生成归档候选，不修改知识索引</span></div>
+          <div class="panel-heading"><div><p class="eyebrow">RETROSPECT</p><h2>结束与复盘</h2></div><span class="subtle">做题记录先保存，Markdown 仅在预览并确认后写入</span></div>
           <form id="close-form" class="form-grid close-form">
             <label>题号<input name="problem" required autocomplete="off" placeholder="CF1234A"></label>
             <label>结果<select name="result"><option>AC</option><option>WA</option><option>TLE</option><option>MLE</option><option>RE</option><option>ABANDONED</option></select></label>
@@ -188,9 +236,33 @@
             <label>提示等级<select name="hint_level"><option value="0">0 — 无提示</option><option value="1">1 — 反例提问</option><option value="2">2 — 性质提示</option><option value="3">3 — 核心转化 / 伪代码</option><option value="4">4 — 完整代码</option></select></label>
             <label>失败类型<select name="failure"><option value="none">无</option><option value="implementation">实现错误</option><option value="edge_case">边界条件</option><option value="selection">选型错误</option><option value="modeling">建模错误</option><option value="invariant">不变量错误</option><option value="complexity">复杂度错误</option><option value="editorial">看过题解</option></select></label>
             <label class="span-2">简短备注<textarea name="notes" rows="3" maxlength="1000" placeholder="关键错误、反例或下一次复做关注点"></textarea></label>
+            <label class="check span-2 knowledge-toggle"><input id="knowledge-enabled" name="knowledge_enabled" type="checkbox" disabled>结束后使用 DeepSeek 生成 Markdown 总结预览（默认关闭）</label>
+            <p id="knowledge-key-hint" class="subtle span-2">需要先在设置页保存并启用 DeepSeek API Key。</p>
+            <div id="knowledge-options" class="knowledge-options span-2 hidden">
+              <div class="knowledge-target-grid">
+                <label>已保存目标<select id="knowledge-target" name="knowledge_target"><option value="">请选择或注册目标文件</option></select></label>
+                <label>Schema 模式<select id="knowledge-schema-mode" name="knowledge_schema_mode"><option value="infer">自动推断</option><option value="stored">使用目标已保存 schema</option><option value="custom">自定义 schema</option><option value="ai">AI 判断</option></select></label>
+                <label class="span-2">新增本机 Markdown 绝对路径<input id="knowledge-path" name="knowledge_path" autocomplete="off" placeholder="D:\notes\algorithms.md"></label>
+                <label>目标名称<input id="knowledge-target-name" name="knowledge_target_name" maxlength="80" placeholder="例如：算法知识库"></label>
+                <div class="card-actions"><button id="knowledge-target-add" class="button secondary" type="button">检查并保存目标</button><button id="knowledge-target-remove" class="button danger" type="button">取消注册</button></div>
+                <label id="knowledge-custom-schema-wrap" class="span-2 hidden">summary-schema-v1<textarea id="knowledge-custom-schema" name="knowledge_custom_schema" rows="7" placeholder='{"version":"summary-schema-v1","name":"自定义总结","category_heading_level":1,"entry_heading_level":2,"toc":"preserve","fields":[{"key":"insight","label":"Insight","required":true,"layout":"bullet","instruction":"记录可复用启发"}]}'></textarea></label>
+              </div>
+              <p class="knowledge-outbound warning-text">生成总结会把本题题面、最终源码、冻结标签、复盘信息和未清除的本题对话发送到已配置的 DeepSeek API；若已有条目的 Source 题号完全相同，还会发送该单条旧知识卡用于 AI 合并。不会发送账号、API Key、本机路径或整份知识库。</p>
+            </div>
             <button class="button primary span-2" type="submit">结束 session</button>
           </form>
           <div id="close-result" class="result-box hidden"></div>
+          <section id="knowledge-preview-box" class="knowledge-preview hidden" aria-live="polite">
+            <div class="panel-heading"><div><p class="eyebrow">MARKDOWN PREVIEW</p><h3>知识总结预览</h3></div><span id="knowledge-proposal-state" class="badge neutral">尚未生成</span></div>
+            <div id="knowledge-schema-summary" class="knowledge-schema-summary"></div>
+            <div id="knowledge-warnings" class="result-box hidden"></div>
+            <label>可编辑 Markdown<textarea id="knowledge-markdown-editor" rows="15" spellcheck="false"></textarea></label>
+            <p class="subtle">编辑后必须先刷新预览；刷新只重新生成安全预览，不会再次调用 DeepSeek。</p>
+            <div class="knowledge-preview-grid">
+              <div><strong>安全预览</strong><div id="knowledge-rendered-preview" class="knowledge-rendered-preview assistant"></div></div>
+            </div>
+            <div class="card-actions knowledge-actions"><button id="knowledge-refresh" class="button secondary" type="button">刷新预览</button><button id="knowledge-apply" class="button primary" type="button">确认写入</button><button id="knowledge-revert" class="button secondary hidden" type="button">回退写入</button><button id="knowledge-cancel" class="button danger" type="button">取消</button></div>
+          </section>
         </article>
       </section>
 
@@ -244,8 +316,11 @@
             <form id="ai-settings-form" class="stack-form">
               <label>推荐模型<select name="recommendation_model"><option value="deepseek-v4-flash">DeepSeek V4 Flash</option><option value="deepseek-v4-pro">DeepSeek V4 Pro</option></select></label>
               <label>对话模型<select name="coaching_model"><option value="deepseek-v4-flash">DeepSeek V4 Flash</option><option value="deepseek-v4-pro">DeepSeek V4 Pro</option></select></label>
+              <label>Markdown 总结模型<select name="summary_model"><option value="deepseek-v4-flash">DeepSeek V4 Flash</option><option value="deepseek-v4-pro">DeepSeek V4 Pro</option></select></label>
               <label class="check"><input name="coaching_thinking" type="checkbox">对话和补丁启用 thinking</label>
               <label>推理强度<select name="reasoning_effort"><option value="high">high</option><option value="max">max</option></select></label>
+              <label class="check"><input name="summary_thinking" type="checkbox">Markdown 总结启用 thinking</label>
+              <label>总结推理强度<select name="summary_reasoning_effort"><option value="high">high</option><option value="max">max</option></select></label>
               <div class="card-actions"><button class="button primary" type="submit">保存 AI 设置</button><button id="ai-test-button" class="button secondary" type="button">测试连接</button></div>
             </form>
           </article>

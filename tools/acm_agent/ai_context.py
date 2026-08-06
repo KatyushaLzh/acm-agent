@@ -301,6 +301,48 @@ def _sample_blocks(samples: Any) -> list[str]:
     return result
 
 
+_FENCED_SAMPLE_RE = re.compile(
+    r"(?ms)^#{2,4}\s*(?:样例|sample)\s*(?:输入|input)\s*(\d*)\s*$"
+    r"\s*```(?:text)?\s*\n(.*?)\n```\s*"
+    r"^#{2,4}\s*(?:样例|sample)\s*(?:输出|output)\s*(\d*)\s*$"
+    r"\s*```(?:text)?\s*\n(.*?)\n```\s*",
+    re.IGNORECASE,
+)
+
+
+def extract_statement_samples(statement: str) -> list[dict[str, str]]:
+    """Extract paired fenced samples already admitted into statement text.
+
+    The public parsers deliberately flatten remote payloads into a narrow
+    Markdown statement.  This second deterministic pass recovers only explicit
+    input/output fenced pairs; it never guesses from prose or example code.
+    """
+
+    if not isinstance(statement, str) or not statement.strip():
+        return []
+    samples: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for ordinal, match in enumerate(_FENCED_SAMPLE_RE.finditer(statement), 1):
+        left_index, sample_input, right_index, sample_output = match.groups()
+        if left_index and right_index and left_index != right_index:
+            continue
+        pair = (
+            sample_input.replace("\r\n", "\n").replace("\r", "\n").strip("\n"),
+            sample_output.replace("\r\n", "\n").replace("\r", "\n").strip("\n"),
+        )
+        if pair in seen:
+            continue
+        seen.add(pair)
+        samples.append(
+            {
+                "name": f"sample{left_index or right_index or ordinal}",
+                "input": pair[0] + "\n",
+                "output": pair[1] + "\n",
+            }
+        )
+    return samples
+
+
 def extract_luogu_statement(payload: Any) -> str:
     """Extract only whitelisted statement fields from a Luogu public payload."""
     decoded = _decode_luogu_payload(payload)
@@ -315,7 +357,25 @@ def extract_luogu_statement(payload: Any) -> str:
             if (value := _first_text(candidate, keys)) is not None
         )
 
-    content = max(candidates, key=score)
+    content = dict(max(candidates, key=score))
+    # Translated statements can be more complete than the root locale while
+    # Luogu keeps official samples only on the parent problem object.  Preserve
+    # the highest-scoring prose, then attach samples from another whitelisted
+    # statement candidate instead of silently dropping them.
+    if not (content.get("samples") or content.get("sample")):
+        sample_source = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate.get("samples") or candidate.get("sample")
+            ),
+            None,
+        )
+        if sample_source is not None:
+            for key in ("samples", "sample"):
+                if sample_source.get(key):
+                    content[key] = sample_source[key]
+                    break
     blocks: list[str] = []
     for keys, heading in _LUOGU_SECTION_FIELDS:
         value = _first_text(content, keys)

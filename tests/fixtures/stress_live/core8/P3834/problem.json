@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "platform": "luogu",
+  "problem_id": "P3834",
+  "title": "Static Range K-th Smallest",
+  "statement_file": "statement.md",
+  "statement_sha256": "cdabbec89a65afc582c6dd3d0fcc03324d39e0a4cb12c7fba11e8e0bf350eed9",
+  "primary_source_file": "primary.cpp",
+  "primary_source_sha256": "b2f2411e50fa5bfe2b3453152bc75ac9545beecb3025ab74bbc8d1d984380673",
+  "samples": [{
+    "name": "benchmark-sample-1",
+    "input_file": "samples/1.in",
+    "input_sha256": "c69569770428d58fb89f937a966d3ab9ddfe837861579af8d539547b448a9256",
+    "output_file": "samples/1.out",
+    "output_sha256": "be95d8d95441a6247d4ba28d7d1d51cfaaacd18ed455325906ac25ad2ae15cea"
+  }]
+}

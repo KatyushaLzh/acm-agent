@@ -1,0 +1,17 @@
+{
+  "version": "summary-schema-v1",
+  "name": "Algorithms",
+  "category_heading_level": 1,
+  "entry_heading_level": 2,
+  "toc": "typora",
+  "blank_lines_between_fields": 0,
+  "blank_lines_between_entries": 1,
+  "fields": [
+    {"key": "source", "label": "Source", "required": false, "layout": "bullet", "instruction": "题号或题目链接；没有可靠来源时留空。"},
+    {"key": "model", "label": "Model", "required": true, "layout": "bullet", "instruction": "抽象问题模型和核心转化。"},
+    {"key": "correctness", "label": "Invariant / correctness", "required": true, "layout": "bullet", "instruction": "给出关键不变量或正确性理由。"},
+    {"key": "implementation", "label": "Implementation", "required": true, "layout": "bullet", "instruction": "记录实现骨架和关键状态。"},
+    {"key": "complexity", "label": "Complexity", "required": true, "layout": "bullet", "instruction": "记录时间与空间复杂度。"},
+    {"key": "pitfalls", "label": "Pitfalls", "required": true, "layout": "bullet", "instruction": "记录易错点、边界和适用限制。"}
+  ]
+}

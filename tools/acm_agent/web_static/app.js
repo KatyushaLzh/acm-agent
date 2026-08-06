@@ -29,6 +29,16 @@ const state = {
   aiContextHash: null,
   aiPatchProposalId: "",
   aiPatchProblemKey: "",
+  knowledgeTargets: [],
+  knowledgeEpoch: 0,
+  knowledgeProposalId: "",
+  knowledgeProposalRevision: null,
+  knowledgeProposalDirty: false,
+  knowledgeTargetInspection: null,
+  stressRunId: "",
+  stressBundleId: "",
+  stressReferenceUrl: "",
+  stressPollTimer: null,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -380,17 +390,418 @@ async function requestRecommendations() {
   finally { setBusy(button, false); }
 }
 
-async function waitForJob(jobId, label = "AI 任务处理中…") {
+function jobProgressLabel(progress, fallback) {
+  const current = asObject(progress);
+  const label = String(current.label || fallback || "后台任务处理中…");
+  const step = Number(current.step);
+  const total = Number(current.total);
+  const preparation = {
+    ...asObject(current.budget),
+    ...asObject(current.preparation),
+    ...asObject(current.generation),
+    ...current,
+  };
+  const firstFinite = (...values) => values.map(Number).find(Number.isFinite);
+  const remaining = firstFinite(preparation.remaining_seconds, preparation.absolute_remaining_seconds);
+  const elapsed = firstFinite(preparation.elapsed_seconds, preparation.total_elapsed_seconds);
+  const stageElapsed = firstFinite(preparation.stage_elapsed_seconds, preparation.current_stage_elapsed_seconds);
+  const softBudget = firstFinite(preparation.soft_budget_seconds, preparation.stage_soft_budget_seconds);
+  const usableRemaining = firstFinite(preparation.usable_remaining_seconds, preparation.usable_seconds);
+  const reservedValidation = firstFinite(preparation.reserved_validation_seconds, preparation.validation_reserve_seconds);
+  const reasoningTokens = firstFinite(
+    preparation.reasoning_tokens,
+    preparation.usage?.reasoning_tokens,
+    preparation.usage?.completion_tokens_details?.reasoning_tokens,
+  );
+  const attempt = firstFinite(preparation.attempt, preparation.generation_attempt);
+  const generationMode = preparation.generation_mode || preparation.mode;
+  const hasFastFallback = Object.hasOwn(preparation, "fast_fallback")
+    || Object.hasOwn(preparation, "fast_fallback_used")
+    || Object.hasOwn(preparation, "fallback_to_fast");
+  const fastFallback = preparation.fast_fallback
+    ?? preparation.fast_fallback_used
+    ?? preparation.fallback_to_fast;
+  const deadline = preparation.deadline_at || preparation.absolute_deadline;
+  const timing = [];
+  if (generationMode) timing.push(`模式 ${generationMode}`);
+  if (hasFastFallback) timing.push(`Fast 降级 ${fastFallback ? "是" : "否"}`);
+  if (Number.isFinite(attempt)) timing.push(`尝试 ${Math.max(0, attempt).toFixed(0)}`);
+  if (Number.isFinite(reasoningTokens)) timing.push(`推理 token ${Math.max(0, reasoningTokens).toFixed(0)}`);
+  if (Number.isFinite(usableRemaining)) timing.push(`可用剩余 ${Math.max(0, usableRemaining).toFixed(1)}s`);
+  if (Number.isFinite(reservedValidation)) timing.push(`验证预留 ${Math.max(0, reservedValidation).toFixed(1)}s`);
+  if (Number.isFinite(remaining)) timing.push(`剩余 ${Math.max(0, remaining).toFixed(1)}s`);
+  if (Number.isFinite(elapsed)) timing.push(`总耗时 ${Math.max(0, elapsed).toFixed(1)}s`);
+  if (Number.isFinite(stageElapsed)) timing.push(`阶段耗时 ${Math.max(0, stageElapsed).toFixed(1)}s`);
+  if (Number.isFinite(softBudget)) timing.push(`软预算 ${Math.max(0, softBudget).toFixed(1)}s`);
+  if (deadline) timing.push(`截止 ${formatTime(deadline)}`);
+  const suffix = timing.length ? ` · ${timing.join(" · ")}` : "";
+  if (Number.isInteger(step) && step > 0 && Number.isInteger(total) && total > 0 && !label.includes(`${step}/${total}`)) {
+    return `${step}/${total} ${label}${suffix}`;
+  }
+  return `${label}${suffix}`;
+}
+
+function jobFailureDetails(error) {
+  const current = asObject(error);
+  const labels = {
+    artifact: "产物",
+    profile: "profile",
+    case_kind: "case",
+    seed: "seed",
+  };
+  return Object.entries(labels)
+    .filter(([key]) => current[key] !== undefined && current[key] !== null && String(current[key]).trim())
+    .map(([key, label]) => `${label}：${String(current[key]).trim()}`)
+    .join(" · ");
+}
+
+async function waitForJob(jobId, label = "AI 任务处理中…", onProgress = null) {
   showJobProgress(label);
   try {
     for (;;) {
       const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
       const status = String(job.status || "running").toLowerCase();
-      if (["failed", "error", "cancelled"].includes(status)) throw new Error(job.error?.message || job.error || "后台任务失败");
+      const progress = asObject(job.progress);
+      const currentLabel = jobProgressLabel(progress, label);
+      showJobProgress(currentLabel);
+      if (typeof onProgress === "function") onProgress(progress, job, currentLabel);
+      if (["failed", "error", "cancelled"].includes(status)) {
+        const error = asObject(job.error);
+        const stageLabel = String(error.stage_label || progress.label || "").trim();
+        const message = String(error.message || job.error || "后台任务失败");
+        const rootCauseLabel = String(error.root_cause_label || "").trim();
+        const rootCauseMessage = String(error.root_cause_message || "").trim();
+        const summary = rootCauseMessage
+          ? `根因${rootCauseLabel ? `（${rootCauseLabel}）` : ""}：${rootCauseMessage}`
+          : stageLabel ? `阶段“${stageLabel}”失败：${message}` : message;
+        const details = jobFailureDetails(error);
+        const unchanged = error.helpers_unchanged === true && error.run_created === false
+          ? "旧 helper 未修改，run 未创建。"
+          : job.kind === "ai_stress_start" ? "旧 helper 未修改，run 未创建。" : "";
+        throw new Error([summary, details, unchanged].filter(Boolean).join("\n"));
+      }
       if (["done", "success", "succeeded", "finished", "complete", "completed"].includes(status) || job.done === true) return jobResult(job) || job;
       await new Promise(resolve => window.setTimeout(resolve, 600));
     }
   } finally { $("#job-progress").classList.add("hidden"); }
+}
+
+function knowledgeSchemaSelection() {
+  const selected = $("#knowledge-schema-mode").value;
+  let schema = null;
+  if (selected === "custom") {
+    const raw = $("#knowledge-custom-schema").value.trim();
+    if (!raw) throw new Error("自定义 schema 不能为空");
+    try { schema = JSON.parse(raw); }
+    catch { throw new Error("自定义 schema 必须是合法 JSON"); }
+  }
+  return {
+    schema_mode: selected === "infer" ? "auto" : selected,
+    preset: selected === "custom" ? "custom" : null,
+    schema,
+  };
+}
+
+function knowledgeTargetRows(payload) {
+  if (Array.isArray(payload)) return payload;
+  return payload?.targets || payload?.items || [];
+}
+
+async function loadKnowledgeTargets(preferredId = "") {
+  const select = $("#knowledge-target");
+  const current = preferredId || select.value;
+  try {
+    const payload = await api("/api/knowledge/targets");
+    state.knowledgeTargets = knowledgeTargetRows(payload).filter(item => item.enabled !== false);
+    select.innerHTML = '<option value="">请选择或注册目标文件</option>' + state.knowledgeTargets.map(item => {
+      const id = item.target_id || item.id;
+      const label = item.name || item.display_name || item.path || id;
+      return `<option value="${escapeHtml(id)}">${escapeHtml(label)}</option>`;
+    }).join("");
+    if (state.knowledgeTargets.some(item => String(item.target_id || item.id) === String(current))) select.value = current;
+  } catch (error) {
+    state.knowledgeTargets = [];
+    select.innerHTML = '<option value="">知识归档服务暂不可用</option>';
+    if ($("#knowledge-enabled").checked) toast("目标列表读取失败", error.message, "error");
+  }
+}
+
+async function registerKnowledgeTarget(button) {
+  const path = $("#knowledge-path").value.trim();
+  if (!path) throw new Error("请输入 Markdown 文件的绝对路径");
+  const selection = knowledgeSchemaSelection();
+  const inspectionKey = JSON.stringify({ path, preset: selection.preset, schema_mode: selection.schema_mode });
+  let inspectionReady = false;
+  setBusy(button, true, "检查中…");
+  try {
+    if (button.dataset.inspectPhase !== "confirm" || state.knowledgeTargetInspection?.key !== inspectionKey) {
+      const inspected = await api("/api/knowledge/targets/inspect", { body: {
+        path,
+        allow_create: true,
+        preset: selection.preset,
+        schema_mode: selection.schema_mode,
+        schema: selection.schema,
+      } });
+      state.knowledgeTargetInspection = { key: inspectionKey, inspected };
+      if (inspected.schema) {
+        $("#knowledge-custom-schema").value = JSON.stringify(inspected.schema, null, 2);
+        $("#knowledge-custom-schema-wrap").classList.remove("hidden");
+      }
+      inspectionReady = true;
+      toast("路径与 schema 检查通过", "请检查下方 schema，再次点击确认保存；目标文件尚未修改。", "success");
+      return;
+    }
+    const inspected = state.knowledgeTargetInspection.inspected;
+    let confirmedSchema = selection.schema || inspected.schema || null;
+    if (!$("#knowledge-custom-schema-wrap").classList.contains("hidden") && $("#knowledge-custom-schema").value.trim()) {
+      try { confirmedSchema = JSON.parse($("#knowledge-custom-schema").value); }
+      catch { throw new Error("待保存 schema 必须是合法 JSON"); }
+    }
+    const target = await api("/api/knowledge/targets", { body: {
+      path: inspected.normalized_path || inspected.path || path,
+      name: $("#knowledge-target-name").value.trim() || null,
+      allow_create: true,
+      preset: selection.preset,
+      schema_mode: selection.schema_mode,
+      schema: confirmedSchema,
+      expected_inspection_sha256: inspected.sha256 || inspected.baseline_sha256 || null,
+      expected_existed: Boolean(inspected.exists),
+    } });
+    const targetId = target.target_id || target.id;
+    await loadKnowledgeTargets(targetId);
+    $("#knowledge-schema-mode").value = "stored";
+    $("#knowledge-custom-schema-wrap").classList.add("hidden");
+    state.knowledgeTargetInspection = null;
+    delete button.dataset.inspectPhase;
+    toast("目标已保存", target.path || inspected.normalized_path || path);
+  } finally {
+    setBusy(button, false);
+    if (inspectionReady) {
+      button.dataset.inspectPhase = "confirm";
+      button.textContent = "确认保存目标";
+    } else if (!button.dataset.inspectPhase) button.textContent = "检查并保存目标";
+  }
+}
+
+async function removeKnowledgeTarget(button) {
+  const targetId = $("#knowledge-target").value;
+  const target = state.knowledgeTargets.find(item => String(item.target_id || item.id) === targetId);
+  if (!target) throw new Error("请先选择一个已保存目标");
+  if (!window.confirm("只取消注册此目标？Markdown 文件本身不会被删除。")) return;
+  setBusy(button, true, "取消中…");
+  try {
+    await api(`/api/knowledge/targets/${encodeURIComponent(targetId)}`, {
+      method: "DELETE",
+      body: { expected_revision: target.revision },
+    });
+    $("#knowledge-path").value = "";
+    $("#knowledge-target-name").value = "";
+    await loadKnowledgeTargets();
+    toast("已取消注册", "Markdown 文件未删除。", "success");
+  } finally { setBusy(button, false); }
+}
+
+function knowledgeMarkdown(proposal) {
+  return proposal.entry_markdown ?? proposal.rendered_entry ?? proposal.rendered_markdown ?? proposal.markdown ?? proposal.entry?.markdown ?? "";
+}
+
+function renderSafeKnowledgeMarkdown(container, markdown) {
+  container.replaceChildren();
+  const lines = String(markdown || "").replace(/\r\n?/g, "\n").split("\n");
+  let list = null;
+  let fence = null;
+  let codeLines = [];
+  const appendTextNode = (tag, text, className = "") => {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    node.textContent = text;
+    container.appendChild(node);
+    return node;
+  };
+  const closeList = () => { list = null; };
+  const closeFence = () => {
+    if (fence === null) return;
+    const pre = document.createElement("pre");
+    const code = document.createElement("code");
+    code.textContent = codeLines.join("\n");
+    pre.appendChild(code);
+    container.appendChild(pre);
+    fence = null;
+    codeLines = [];
+  };
+  for (const line of lines) {
+    const fenceMatch = line.match(/^\s*(```|~~~)/);
+    if (fenceMatch) {
+      closeList();
+      if (fence === null) fence = fenceMatch[1][0];
+      else if (fence === fenceMatch[1][0]) closeFence();
+      else codeLines.push(line);
+      continue;
+    }
+    if (fence !== null) { codeLines.push(line); continue; }
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      closeList();
+      appendTextNode(`h${heading[1].length}`, heading[2]);
+      continue;
+    }
+    const bullet = line.match(/^\s*[-*+]\s+(.+)$/);
+    if (bullet) {
+      if (!list) {
+        list = document.createElement("ul");
+        container.appendChild(list);
+      }
+      const item = document.createElement("li");
+      item.textContent = bullet[1];
+      list.appendChild(item);
+      continue;
+    }
+    closeList();
+    if (!line.trim()) continue;
+    appendTextNode("p", line);
+  }
+  closeFence();
+  renderAssistantMath(container);
+}
+
+function knowledgeWarningItems(proposal) {
+  const warnings = Array.isArray(proposal.warnings) ? [...proposal.warnings] : [];
+  const duplicate = proposal.duplicate_diagnosis;
+  const duplicateKind = String(duplicate?.kind || duplicate?.status || "none").toLowerCase();
+  if (duplicateKind === "exact_source") warnings.push(duplicate?.message || "检测到题号完全相同的条目，已由 AI 合并内容。");
+  else if (duplicateKind === "similar") warnings.push(duplicate?.message || "检测到相似条目；因题号不同，将按新条目处理。");
+  else if (duplicate?.message) warnings.push(duplicate.message);
+  else if (duplicateKind !== "none") warnings.push(`重复检测：${duplicateKind}`);
+  if (proposal.apply_blocked_reason) warnings.push(proposal.apply_blocked_reason);
+  return warnings.map(String);
+}
+
+function knowledgeProposalPayload(payload) {
+  return payload?.proposal && typeof payload.proposal === "object" ? payload.proposal : payload;
+}
+
+function renderKnowledgeProposal(proposal, epoch = state.knowledgeEpoch) {
+  proposal = knowledgeProposalPayload(proposal || {});
+  if (epoch !== state.knowledgeEpoch) return;
+  state.knowledgeProposalId = proposal.proposal_id || proposal.id || state.knowledgeProposalId;
+  state.knowledgeProposalRevision = Number(proposal.revision ?? proposal.proposal_revision ?? 0);
+  state.knowledgeProposalDirty = false;
+  const box = $("#knowledge-preview-box");
+  box.classList.remove("hidden");
+  const status = String(proposal.status || "preview");
+  const stateBadge = $("#knowledge-proposal-state");
+  stateBadge.className = `badge ${status === "applied" ? "good" : status === "conflict" ? "bad" : "warn"}`;
+  stateBadge.textContent = ({ preview: "等待确认", applied: "已写入", reverted: "已回退", conflict: "目标已变化" })[status] || status;
+  const schema = proposal.schema || proposal.schema_snapshot || {};
+  const fields = Array.isArray(schema.fields) ? schema.fields : [];
+  $("#knowledge-schema-summary").innerHTML = [
+    schema.version || "summary-schema-v1",
+    proposal.topic || proposal.entry?.topic,
+    ...fields.map(item => item.label || item.key).filter(Boolean),
+  ].filter(Boolean).map(item => `<span class="tag">${escapeHtml(item)}</span>`).join("");
+  const warnings = knowledgeWarningItems(proposal);
+  const warningBox = $("#knowledge-warnings");
+  const warningIsBlocking = Boolean(proposal.can_apply === false || proposal.apply_allowed === false || proposal.apply_blocked || proposal.apply_blocked_reason);
+  warningBox.className = `result-box ${warnings.length ? (warningIsBlocking ? "error" : "") : "hidden"}`;
+  warningBox.textContent = warnings.join("；");
+  const markdown = knowledgeMarkdown(proposal);
+  $("#knowledge-markdown-editor").value = markdown;
+  const preview = $("#knowledge-rendered-preview");
+  renderSafeKnowledgeMarkdown(preview, markdown);
+  const blocked = Boolean(proposal.can_apply === false || proposal.apply_allowed === false || proposal.apply_blocked || proposal.apply_blocked_reason || Number(proposal.confidence ?? proposal.entry?.confidence ?? 1) < 0.75);
+  $("#knowledge-refresh").disabled = status !== "preview";
+  $("#knowledge-apply").disabled = status !== "preview" || blocked;
+  $("#knowledge-revert").classList.toggle("hidden", status !== "applied");
+}
+
+async function waitForKnowledgeJob(jobId, epoch, label) {
+  showJobProgress(label);
+  try {
+    for (;;) {
+      if (epoch !== state.knowledgeEpoch) return null;
+      const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
+      if (epoch !== state.knowledgeEpoch) return null;
+      const status = String(job.status || "running").toLowerCase();
+      if (["failed", "error", "cancelled"].includes(status)) throw new Error(job.error?.message || job.error || "Markdown 总结任务失败");
+      if (["done", "success", "succeeded", "finished", "complete", "completed"].includes(status) || job.done === true) return jobResult(job) || job;
+      await new Promise(resolve => window.setTimeout(resolve, 600));
+    }
+  } finally {
+    if (epoch === state.knowledgeEpoch) $("#job-progress").classList.add("hidden");
+  }
+}
+
+async function previewKnowledgeSummary(attemptId, epoch) {
+  if (!state.aiStatus?.api_key_detected) throw new Error("尚未配置 DeepSeek API Key；session 已结束，但未生成总结");
+  const targetId = $("#knowledge-target").value;
+  if (!targetId) throw new Error("请先选择或保存一个 Markdown 目标");
+  const selection = knowledgeSchemaSelection();
+  const started = await api("/api/jobs/ai/knowledge/preview", { body: {
+    attempt_id: attemptId,
+    target_id: targetId,
+    schema_mode: selection.schema_mode,
+    preset: selection.preset,
+    schema: selection.schema,
+  } });
+  const result = started.job_id
+    ? await waitForKnowledgeJob(started.job_id, epoch, "正在生成 Markdown 总结预览…")
+    : started;
+  if (result && epoch === state.knowledgeEpoch) {
+    renderKnowledgeProposal(knowledgeProposalPayload(result), epoch);
+    toast("总结预览已生成", "目标文件尚未修改，请检查可编辑内容与安全预览。", "success");
+  }
+}
+
+async function refreshKnowledgeProposal(button) {
+  if (!state.knowledgeProposalId) return;
+  setBusy(button, true, "刷新中…");
+  try {
+    const proposal = await api(`/api/knowledge/proposals/${encodeURIComponent(state.knowledgeProposalId)}/refresh`, { body: {
+      entry_markdown: $("#knowledge-markdown-editor").value,
+      expected_revision: state.knowledgeProposalRevision,
+    } });
+    renderKnowledgeProposal(knowledgeProposalPayload(proposal));
+  } finally { setBusy(button, false); }
+}
+
+async function applyKnowledgeProposal(button) {
+  if (!state.knowledgeProposalId || state.knowledgeProposalDirty) return;
+  setBusy(button, true, "写入中…");
+  try {
+    const epoch = state.knowledgeEpoch;
+    const started = await api(`/api/jobs/knowledge/proposals/${encodeURIComponent(state.knowledgeProposalId)}/apply`, { body: { expected_revision: state.knowledgeProposalRevision } });
+    let proposal = started.job_id ? await waitForKnowledgeJob(started.job_id, epoch, "正在备份并原子写入 Markdown…") : started;
+    if (proposal) {
+      proposal = await api(`/api/knowledge/proposals/${encodeURIComponent(state.knowledgeProposalId)}`);
+      renderKnowledgeProposal(knowledgeProposalPayload(proposal), epoch);
+      toast("Markdown 已写入", "已创建备份；只有文件仍是应用版本时才可回退。", "success");
+    }
+  } finally { setBusy(button, false); }
+}
+
+async function revertKnowledgeProposal(button) {
+  if (!state.knowledgeProposalId) return;
+  setBusy(button, true, "回退中…");
+  try {
+    const epoch = state.knowledgeEpoch;
+    const started = await api(`/api/jobs/knowledge/proposals/${encodeURIComponent(state.knowledgeProposalId)}/revert`, { body: { expected_revision: state.knowledgeProposalRevision } });
+    let proposal = started.job_id ? await waitForKnowledgeJob(started.job_id, epoch, "正在校验并恢复 Markdown 备份…") : started;
+    if (proposal) {
+      proposal = await api(`/api/knowledge/proposals/${encodeURIComponent(state.knowledgeProposalId)}`);
+      renderKnowledgeProposal(knowledgeProposalPayload(proposal), epoch);
+      toast("Markdown 已回退", "目标已恢复到写入前版本。", "success");
+    }
+  } finally { setBusy(button, false); }
+}
+
+function cancelKnowledgeProposal() {
+  state.knowledgeEpoch += 1;
+  state.knowledgeProposalId = "";
+  state.knowledgeProposalRevision = null;
+  state.knowledgeProposalDirty = false;
+  $("#knowledge-preview-box").classList.add("hidden");
+  $("#job-progress").classList.add("hidden");
+  toast("已取消总结", "没有写入 Markdown 文件。", "success");
 }
 
 async function requestAiRecommendations(button) {
@@ -432,6 +843,16 @@ async function loadAiStatus() {
     badge.textContent = status.api_key_detected ? sourceLabel : "未配置";
     $("#ai-chat-state").className = `badge ${status.api_key_detected ? "good" : "warn"}`;
     $("#ai-chat-state").textContent = status.api_key_detected ? "可用" : "未配置";
+    const knowledgeToggle = $("#knowledge-enabled");
+    knowledgeToggle.disabled = !status.api_key_detected;
+    knowledgeToggle.title = status.api_key_detected ? "" : "请先在设置页保存并启用 DeepSeek API Key";
+    $("#knowledge-key-hint").textContent = status.api_key_detected
+      ? "仅在勾选后调用 DeepSeek；关闭 session 本身不会产生 AI 费用。"
+      : "需要先在设置页保存并启用 DeepSeek API Key。";
+    if (!status.api_key_detected) {
+      knowledgeToggle.checked = false;
+      $("#knowledge-options").classList.add("hidden");
+    }
     const detail = $("#ai-key-detail");
     detail.className = `credential-detail${status.credential_error ? " error" : ""}`;
     detail.textContent = status.credential_error
@@ -446,8 +867,11 @@ async function loadAiStatus() {
     const form = $("#ai-settings-form");
     form.elements.recommendation_model.value = status.settings?.recommendation_model || "deepseek-v4-flash";
     form.elements.coaching_model.value = status.settings?.coaching_model || "deepseek-v4-flash";
+    form.elements.summary_model.value = status.settings?.summary_model || status.settings?.coaching_model || "deepseek-v4-flash";
     form.elements.coaching_thinking.checked = Boolean(status.settings?.coaching_thinking);
     form.elements.reasoning_effort.value = status.settings?.reasoning_effort || "high";
+    form.elements.summary_thinking.checked = Boolean(status.settings?.summary_thinking);
+    form.elements.summary_reasoning_effort.value = status.settings?.summary_reasoning_effort || status.settings?.reasoning_effort || "high";
   } catch (error) { toast("AI 状态读取失败", error.message, "error"); }
 }
 
@@ -485,8 +909,11 @@ async function saveAiSettings(form) {
     state.aiStatus = await api("/api/ai/settings", { body: {
       recommendation_model: form.elements.recommendation_model.value,
       coaching_model: form.elements.coaching_model.value,
+      summary_model: form.elements.summary_model.value,
       coaching_thinking: form.elements.coaching_thinking.checked,
       reasoning_effort: form.elements.reasoning_effort.value,
+      summary_thinking: form.elements.summary_thinking.checked,
+      summary_reasoning_effort: form.elements.summary_reasoning_effort.value,
     } });
     toast("AI 设置已保存", "模型与 thinking 设置已更新。凭据由独立的 DPAPI 存储管理。");
     await loadAiStatus();
@@ -870,6 +1297,297 @@ function renderVerify(result) {
   if (!lines.length) lines.push(JSON.stringify(result, null, 2));
   $("#verify-output").textContent = lines.join("\n");
   navigate("workbench");
+}
+
+function stressRows(payload) {
+  if (Array.isArray(payload)) return payload;
+  return payload?.runs || payload?.items || [];
+}
+
+function stressRunOf(payload) {
+  return asObject(payload?.run || payload);
+}
+
+function stressRunId(run) {
+  return String(run.id || run.run_id || "");
+}
+
+function stressBundleId(payload, run = stressRunOf(payload)) {
+  const bundle = asObject(payload?.bundle);
+  return String(run.bundle_id || bundle.id || bundle.bundle_id || "");
+}
+
+function stressBundleOf(payload) {
+  const nested = asObject(payload?.bundle);
+  return Object.keys(nested).length ? nested : asObject(payload);
+}
+
+function stressTerminal(status) {
+  return ["mismatch", "oracle_conflict", "reference_mismatch_unconfirmed", "stopped", "interrupted", "fault", "error", "failed", "completed", "limit_reached"].includes(String(status || "").toLowerCase());
+}
+
+function stressResumable(status) {
+  return ["interrupted", "stopped", "mismatch", "oracle_conflict", "reference_mismatch_unconfirmed", "fault"].includes(String(status || "").toLowerCase());
+}
+
+function stressFinishable(status) {
+  return ["pending", "preparing", "running", "stop_requested", "stopped", "interrupted"].includes(String(status || "").toLowerCase());
+}
+
+function stressSourceLink(url) {
+  const value = String(url || "").trim();
+  return value
+    ? `<a href="${escapeHtml(value)}" target="_blank" rel="noopener noreferrer">${escapeHtml(value)}</a>`
+    : "无外部来源链接";
+}
+
+function rememberStressReferenceLink(artifacts) {
+  const reference = (Array.isArray(artifacts) ? artifacts : []).find(item => item.kind === "reference");
+  state.stressReferenceUrl = String(reference?.source_url || "").trim();
+}
+
+function renderStressPreparationFailure(message) {
+  const panel = $("#ai-stress-run-panel");
+  panel.classList.remove("hidden");
+  const badge = $("#ai-stress-run-state");
+  badge.className = "badge bad";
+  badge.textContent = "准备失败";
+  if (!state.stressRunId) {
+    $("#ai-stress-run-summary").innerHTML = "";
+    for (const selector of ["#ai-stress-stop", "#ai-stress-resume", "#ai-stress-finish", "#ai-stress-artifacts", "#ai-stress-revert"]) {
+      $(selector).disabled = true;
+    }
+  }
+  const detail = $("#ai-stress-detail");
+  detail.dataset.pinned = "true";
+  detail.classList.remove("hidden");
+  detail.textContent = String(message || "AI 持续对拍准备失败");
+}
+
+function renderStressRun(payload) {
+  const run = stressRunOf(payload);
+  const id = stressRunId(run);
+  if (!id) return;
+  if (state.stressRunId && state.stressRunId !== id) {
+    state.stressReferenceUrl = "";
+    delete $("#ai-stress-detail").dataset.pinned;
+  }
+  state.stressRunId = id;
+  state.stressBundleId = stressBundleId(payload, run) || state.stressBundleId;
+  const artifacts = Array.isArray(payload?.bundle?.artifacts) ? payload.bundle.artifacts : [];
+  if (artifacts.length) rememberStressReferenceLink(artifacts);
+  const status = String(run.status || "running").toLowerCase();
+  const finishing = status === "stop_requested" && run.stop_reason === "user_finished";
+  const retiredProfile = Number(run.profile_version ?? run.config?.profile_version ?? 1) < 2;
+  const panel = $("#ai-stress-run-panel");
+  panel.classList.remove("hidden");
+  const badge = $("#ai-stress-run-state");
+  const bad = ["mismatch", "oracle_conflict", "reference_mismatch_unconfirmed", "fault", "error", "failed"].includes(status);
+  badge.className = `badge ${bad ? "bad" : stressTerminal(status) ? "neutral" : "good"}`;
+  badge.textContent = finishing ? "正在结束" : status || "running";
+  const elapsedEnd = run.completed_at ? Date.parse(run.completed_at) : Date.now();
+  const elapsedSeconds = run.started_at ? Math.max(0, (elapsedEnd - Date.parse(run.started_at)) / 1000) : 0;
+  const total = Number(run.total_count ?? run.total_cases ?? 0);
+  const rateBaseTotal = Number(run.config?.rate_base_total ?? 0);
+  const segmentTotal = Math.max(0, total - rateBaseTotal);
+  const metrics = [
+    ["阶段", run.phase || "—"],
+    ["下一 seed", run.next_seed ?? "—"],
+    ["small", run.small_count ?? run.small_cases ?? 0],
+    ["large", run.large_count ?? run.large_cases ?? 0],
+    ["累计", total],
+    ["本轮 / 速度", `${segmentTotal} / ${elapsedSeconds > 0 ? (segmentTotal / elapsedSeconds).toFixed(1) : "0.0"} case/s`],
+    ["helper 来源", stressSourceLink(state.stressReferenceUrl), true],
+  ];
+  const preparationRoot = asObject(run.preparation || run.preparation_meta || run.config?.preparation);
+  const preparation = { ...preparationRoot, ...asObject(preparationRoot.generation) };
+  const preparationUsage = asObject(preparation.usage || run.usage);
+  const completionDetails = asObject(preparationUsage.completion_tokens_details);
+  const generationMode = run.generation_mode || preparation.generation_mode || run.config?.generation_mode;
+  const fastFallback = preparation.fast_fallback
+    ?? preparation.fast_fallback_used
+    ?? preparation.fallback_to_fast;
+  const generationAttempt = preparation.attempt ?? preparation.generation_attempt;
+  const reasoningTokens = preparation.reasoning_tokens
+    ?? preparationUsage.reasoning_tokens
+    ?? completionDetails.reasoning_tokens;
+  const usableRemaining = preparation.usable_remaining_seconds ?? preparation.usable_seconds;
+  const reservedValidation = preparation.reserved_validation_seconds ?? preparation.validation_reserve_seconds;
+  if (generationMode) metrics.push(["生成模式", generationMode]);
+  if (fastFallback !== undefined) metrics.push(["Fast 降级", fastFallback ? "是" : "否"]);
+  if (generationAttempt !== undefined) metrics.push(["生成尝试", generationAttempt]);
+  if (reasoningTokens !== undefined) metrics.push(["推理 token", reasoningTokens]);
+  if (usableRemaining !== undefined) metrics.push(["可用剩余", `${Number(usableRemaining).toFixed(1)}s`]);
+  if (reservedValidation !== undefined) metrics.push(["验证预留", `${Number(reservedValidation).toFixed(1)}s`]);
+  $("#ai-stress-run-summary").innerHTML = metrics.map(([label, value, html]) => `<div class="ai-stress-metric"><span>${escapeHtml(label)}</span><strong>${html ? value : escapeHtml(value)}</strong></div>`).join("");
+  $("#ai-stress-stop").disabled = stressTerminal(status) || ["stopping", "stop_requested"].includes(status);
+  $("#ai-stress-resume").disabled = retiredProfile || !stressResumable(status);
+  $("#ai-stress-finish").disabled = retiredProfile || !stressFinishable(status) || finishing;
+  $("#ai-stress-artifacts").disabled = !state.stressBundleId;
+  $("#ai-stress-revert").disabled = !state.stressBundleId || !stressTerminal(status);
+  const detail = $("#ai-stress-detail");
+  const failure = run.failure_path || run.failure_dir;
+  if (failure) {
+    detail.classList.remove("hidden");
+    const sourcePath = String(run.user_source_path || "").trim();
+    const sourceDirectory = sourcePath.replace(/[\\/][^\\/]*$/, "") || sourcePath;
+    detail.textContent = `相关数据已经保存到: ${sourceDirectory || failure}\n状态：${status}\nseed：${run.next_seed ?? "—"}${retiredProfile ? "\n该运行协议已停用，不能继续。" : ""}`;
+  } else if (retiredProfile) {
+    detail.classList.remove("hidden");
+    detail.textContent = "该运行协议已停用，历史状态仅供查看，不能继续。";
+  } else if (!detail.dataset.pinned) {
+    detail.classList.add("hidden");
+    detail.textContent = "";
+  }
+  if (!stressTerminal(status)) scheduleStressPoll(id);
+  else if (state.stressPollTimer) { clearTimeout(state.stressPollTimer); state.stressPollTimer = null; }
+}
+
+function scheduleStressPoll(runId) {
+  if (state.stressPollTimer) clearTimeout(state.stressPollTimer);
+  state.stressPollTimer = window.setTimeout(async () => {
+    state.stressPollTimer = null;
+    if (runId !== state.stressRunId) return;
+    try { renderStressRun(await api(`/api/stress/runs/${encodeURIComponent(runId)}`)); }
+    catch (error) { toast("持续对拍状态读取失败", error.message, "error"); }
+  }, 1200);
+}
+
+async function loadAiStressStatus() {
+  const badge = $("#ai-stress-isolation");
+  try {
+    const status = await api("/api/ai/stress/status");
+    const capability = asObject(status.sandbox || status.isolation || status.capability);
+    const available = capability.available ?? status.sandbox_available ?? status.available;
+    badge.className = `badge ${available ? "good" : "bad"}`;
+    badge.textContent = available ? `隔离可用${capability.backend ? ` · ${capability.backend}` : ""}` : `隔离不可用${capability.reason ? ` · ${capability.reason}` : ""}`;
+    const model = status.model || status.validation_model || status.settings?.validation_model;
+    if (model && !$("#ai-stress-form").elements.model.value) $("#ai-stress-form").elements.model.value = model;
+    const settings = asObject(status.settings);
+    const aiSettings = asObject(status.ai || settings.ai);
+    const prepareTimeout = Number(
+      status.stress_prepare_timeout_seconds
+      ?? settings.stress_prepare_timeout_seconds
+      ?? aiSettings.stress_prepare_timeout_seconds,
+    );
+    if (Number.isInteger(prepareTimeout) && prepareTimeout >= 60 && prepareTimeout <= 1800) {
+      $("#ai-stress-form").elements.preparation_timeout_seconds.value = String(prepareTimeout);
+    }
+    const generationMode = String(
+      status.stress_generation_mode
+      ?? settings.stress_generation_mode
+      ?? aiSettings.stress_generation_mode
+      ?? "",
+    );
+    if (["fast", "hybrid", "full_thinking"].includes(generationMode)) {
+      $("#ai-stress-form").elements.generation_mode.value = generationMode;
+    }
+  } catch (error) {
+    badge.className = "badge bad";
+    badge.textContent = `状态不可用 · ${error.message}`;
+  }
+  try {
+    const recent = stressRows(await api("/api/stress/runs"));
+    const selected = recent.find(item => !stressTerminal(item.status)) || recent[0];
+    if (selected) {
+      renderStressRun(selected);
+      const bundleId = stressBundleId(selected);
+      if (bundleId) {
+        try {
+          const bundle = stressBundleOf(await api(`/api/stress/bundles/${encodeURIComponent(bundleId)}`));
+          renderStressRun({ run: selected, bundle });
+        } catch { /* Run state remains usable even if source metadata is unavailable. */ }
+      }
+    }
+  } catch { /* Older service builds may not expose stress history yet. */ }
+}
+
+async function startAiStress(form, button) {
+  if (!form.elements.enabled.checked) throw new Error("请先勾选显式启用 AI 持续对拍");
+  const problem = $("#verify-form").elements.problem.value.trim();
+  if (!problem) throw new Error("请输入题号，或先开始一个 active session");
+  const seed = form.elements.seed.value;
+  const preparationTimeout = Number(form.elements.preparation_timeout_seconds.value);
+  if (!Number.isInteger(preparationTimeout) || preparationTimeout < 60 || preparationTimeout > 1800) {
+    throw new Error("准备耗时上限必须是 60–1800 秒之间的整数");
+  }
+  const payload = {
+    problem,
+    generate_generator: form.elements.generate_generator.checked,
+    generate_brute: form.elements.generate_brute.checked,
+    prepare_reference: form.elements.prepare_reference.checked,
+    large_profile: form.elements.large_profile.checked,
+    model: form.elements.model.value || null,
+    seed: seed ? Number(seed) : null,
+    timeout: Number(form.elements.timeout.value),
+    brute_timeout: Number(form.elements.brute_timeout.value),
+    compare: $("#verify-form").elements.compare.value,
+    preparation_timeout_seconds: preparationTimeout,
+    cache_mode: form.elements.cache_mode.value,
+    generation_mode: form.elements.generation_mode.value,
+  };
+  const preparationDetail = $("#ai-stress-detail");
+  delete preparationDetail.dataset.pinned;
+  if (!state.stressRunId) {
+    preparationDetail.classList.add("hidden");
+    preparationDetail.textContent = "";
+  }
+  setBusy(button, true, "AI 准备中…");
+  try {
+    const started = await api("/api/jobs/ai/stress/start", { body: payload });
+    const result = await waitForJob(
+      started.job_id,
+      "AI 准备任务正在排队…",
+      (_progress, _job, currentLabel) => setBusy(button, true, currentLabel),
+    );
+    renderStressRun(result);
+    toast("持续对拍已启动", "刷新或切换题目不会终止运行。");
+  } catch (error) {
+    renderStressPreparationFailure(error.message);
+    throw error;
+  } finally { setBusy(button, false); }
+}
+
+async function controlStress(action, button) {
+  if (!state.stressRunId) return;
+  if (action === "finish" && !window.confirm("结束后该 run 将不能继续；helper 与历史记录会保留。确认结束对拍？")) return;
+  const busyLabel = action === "stop" ? "暂停中…" : action === "finish" ? "结束中…" : "继续中…";
+  setBusy(button, true, busyLabel);
+  let result;
+  try {
+    result = await api(`/api/stress/runs/${encodeURIComponent(state.stressRunId)}/${action}`, { body: {} });
+  } finally { setBusy(button, false); }
+  renderStressRun(result);
+  if (action === "stop") toast("暂停请求已发送", "当前隔离进程树将安全退出，稍后可继续。");
+  else if (action === "finish") toast("结束请求已发送", "进程树退出后将释放持续对拍运行锁，helper 与历史记录会保留。");
+  else toast("持续对拍已继续", "复用现有 helper，从保存的 next seed 继续；速度从本轮重新计算。");
+}
+
+async function showStressArtifacts(button) {
+  if (!state.stressBundleId) return;
+  setBusy(button, true, "读取中…");
+  try {
+    const bundle = stressBundleOf(await api(`/api/stress/bundles/${encodeURIComponent(state.stressBundleId)}`));
+    const artifacts = Array.isArray(bundle.artifacts) ? bundle.artifacts : [];
+    rememberStressReferenceLink(artifacts);
+    const links = [...new Set(artifacts.map(item => String(item.source_url || "").trim()).filter(Boolean))];
+    const detail = $("#ai-stress-detail");
+    detail.classList.remove("hidden");
+    detail.dataset.pinned = "true";
+    detail.innerHTML = links.length
+      ? links.map(url => stressSourceLink(url)).join("\n")
+      : "无外部来源链接";
+  } finally { setBusy(button, false); }
+}
+
+async function revertStressBundle(button) {
+  if (!state.stressBundleId || !window.confirm("回退本次 AI 写入的 generator、brute 和对拍代码？如果文件已被你修改，服务会拒绝覆盖。")) return;
+  setBusy(button, true, "回退中…");
+  try {
+    const started = await api(`/api/jobs/stress/bundles/${encodeURIComponent(state.stressBundleId)}/revert`, { body: {} });
+    await waitForJob(started.job_id, "正在进行 hash 校验并回退 helper…");
+    toast("helper 已回退", "用户后续修改未被覆盖。");
+  } finally { setBusy(button, false); }
 }
 
 function renderStart(data) {
@@ -1854,6 +2572,21 @@ function setupEvents() {
     catch (error) { renderVerify({ ok: false, error: error.message }); toast("无法启动验证", error.message, "error"); }
     finally { setBusy(button, false); }
   });
+  $("#ai-stress-form").elements.enabled.addEventListener("change", event => {
+    $("#ai-stress-options").disabled = !event.currentTarget.checked;
+  });
+  $("#ai-stress-form").addEventListener("submit", async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const button = $("button[type=submit]", form);
+    try { await startAiStress(form, button); }
+    catch (error) { toast("无法启动 AI 持续对拍", error.message, "error"); }
+  });
+  $("#ai-stress-stop").addEventListener("click", event => controlStress("stop", event.currentTarget).catch(error => toast("停止失败", error.message, "error")));
+  $("#ai-stress-resume").addEventListener("click", event => controlStress("resume", event.currentTarget).catch(error => toast("继续失败", error.message, "error")));
+  $("#ai-stress-finish").addEventListener("click", event => controlStress("finish", event.currentTarget).catch(error => toast("结束失败", error.message, "error")));
+  $("#ai-stress-artifacts").addEventListener("click", event => showStressArtifacts(event.currentTarget).catch(error => toast("读取 helper 失败", error.message, "error")));
+  $("#ai-stress-revert").addEventListener("click", event => revertStressBundle(event.currentTarget).catch(error => toast("回退失败", error.message, "error")));
   $("#ai-context-button").addEventListener("click", async event => {
     const button = event.currentTarget;
     setBusy(button, true, "抓取中…");
@@ -1885,13 +2618,60 @@ function setupEvents() {
   $("#ai-patch-preview").addEventListener("click", event => previewAiPatch(event.currentTarget));
   $("#ai-patch-apply").addEventListener("click", event => runPatchAction("apply", event.currentTarget));
   $("#ai-patch-revert").addEventListener("click", event => runPatchAction("revert", event.currentTarget));
+  $("#knowledge-enabled").addEventListener("change", event => {
+    $("#knowledge-options").classList.toggle("hidden", !event.currentTarget.checked);
+    if (event.currentTarget.checked && !state.knowledgeTargets.length) loadKnowledgeTargets();
+  });
+  $("#knowledge-schema-mode").addEventListener("change", event => {
+    $("#knowledge-custom-schema-wrap").classList.toggle("hidden", event.currentTarget.value !== "custom");
+  });
+  $("#knowledge-target").addEventListener("change", event => {
+    const target = state.knowledgeTargets.find(item => String(item.target_id || item.id) === event.currentTarget.value);
+    if (!target) return;
+    $("#knowledge-path").value = target.path || "";
+    $("#knowledge-target-name").value = target.name || target.display_name || "";
+    $("#knowledge-schema-mode").value = "stored";
+    $("#knowledge-custom-schema-wrap").classList.add("hidden");
+  });
+  $("#knowledge-target-add").addEventListener("click", event => {
+    const button = event.currentTarget;
+    registerKnowledgeTarget(button).catch(error => toast("目标保存失败", error.message, "error"));
+  });
+  $("#knowledge-target-remove").addEventListener("click", event => {
+    const button = event.currentTarget;
+    removeKnowledgeTarget(button).catch(error => toast("取消注册失败", error.message, "error"));
+  });
+  $("#knowledge-markdown-editor").addEventListener("input", () => {
+    if (!state.knowledgeProposalId) return;
+    state.knowledgeProposalDirty = true;
+    $("#knowledge-proposal-state").className = "badge warn";
+    $("#knowledge-proposal-state").textContent = "内容已编辑，需刷新";
+    $("#knowledge-apply").disabled = true;
+    const preview = $("#knowledge-rendered-preview");
+    renderSafeKnowledgeMarkdown(preview, $("#knowledge-markdown-editor").value);
+  });
+  $("#knowledge-refresh").addEventListener("click", event => refreshKnowledgeProposal(event.currentTarget).catch(error => toast("预览刷新失败", error.message, "error")));
+  $("#knowledge-apply").addEventListener("click", event => applyKnowledgeProposal(event.currentTarget).catch(error => toast("Markdown 写入失败", error.message, "error")));
+  $("#knowledge-revert").addEventListener("click", event => revertKnowledgeProposal(event.currentTarget).catch(error => toast("Markdown 回退失败", error.message, "error")));
+  $("#knowledge-cancel").addEventListener("click", cancelKnowledgeProposal);
   $("#close-form").addEventListener("submit", async event => {
-    event.preventDefault(); const form = event.currentTarget; const button = $("button[type=submit]", form); setBusy(button, true);
+    event.preventDefault(); const form = event.currentTarget; const button = $("button[type=submit]", form);
+    const summarize = form.elements.knowledge_enabled.checked;
+    const knowledgeEpoch = ++state.knowledgeEpoch;
+    setBusy(button, true, "记录中…");
     try {
       const data = await api("/api/sessions/close", { body: { problem: form.elements.problem.value.trim(), result: form.elements.result.value, minutes: Number(form.elements.minutes.value), hint_level: Number(form.elements.hint_level.value), failure: form.elements.failure.value, notes: form.elements.notes.value.trim() || null } });
       const box = $("#close-result"); box.className = "result-box success";
-      box.innerHTML = `<strong>Session 已结束</strong><p>状态：${escapeHtml(data.status || data.close?.result || "已记录")}${data.review_due ? ` · 复做日期：${escapeHtml(data.review_due)}` : ""}</p><p>归档候选已保存，但尚未修改 <code>algorithms.md</code> 或 <code>tricks.md</code>。</p>`;
+      box.innerHTML = `<strong>Session 已结束</strong><p>状态：${escapeHtml(data.status || data.close?.result || "已记录")}${data.review_due ? ` · 复做日期：${escapeHtml(data.review_due)}` : ""}</p><p>${summarize ? "正在生成可确认的 Markdown 预览；目标文件尚未修改。" : "归档候选已保存，未请求 Markdown 总结。"}</p>`;
       renderActive(null); switchAiProblem("", { force: true }); toast("复盘已记录", data.review_due ? `已加入 ${data.review_due} 复做队列。` : "本次结果已影响后续推荐。");
+      if (summarize) {
+        setBusy(button, true, "生成总结中…");
+        try { await previewKnowledgeSummary(data.attempt_id, knowledgeEpoch); }
+        catch (error) {
+          box.innerHTML += `<p class="warning-text">总结未生成：${escapeHtml(error.message)}</p>`;
+          toast("Session 已结束，但总结未生成", error.message, "error");
+        }
+      }
       await loadBootstrap();
       if (currentAiProblem()) await loadAiProblemState(currentAiProblem());
       await requestRecommendations();
@@ -2004,6 +2784,8 @@ async function boot() {
   if (["today", "workbench", "plans", "review", "settings"].includes(initial)) navigate(initial);
   await loadBootstrap();
   await loadAiStatus();
+  await loadAiStressStatus();
+  await loadKnowledgeTargets();
   if (currentAiProblem()) await loadAiProblemState(currentAiProblem(), { force: true });
   if (state.bootstrap?.configured !== false) {
     await loadPlans();

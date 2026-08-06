@@ -19,6 +19,7 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import re
 import secrets
 import stat
 import subprocess
@@ -26,7 +27,7 @@ import tempfile
 import threading
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
 from . import __version__
@@ -67,6 +68,135 @@ class ApiProblem(Exception):
     message: str
 
 
+_FAILURE_IDENTIFIER_RE = re.compile(r"^[a-z0-9_-]{1,32}$", re.IGNORECASE)
+_FAILURE_PATH_RE = re.compile(
+    r"^\$?(?:[A-Za-z_][A-Za-z0-9_-]*)(?:(?:\[[0-9]{1,4}\])|(?:\.[A-Za-z_][A-Za-z0-9_-]*))*$"
+)
+_SENSITIVE_FAILURE_RE = re.compile(
+    r"api[-_ ]?key|authorization|bearer\s+|access[-_ ]?token|secret|password|"
+    r"raw[-_ ]?reasoning|reasoning[-_ ]?content|思维链|推理原文",
+    re.IGNORECASE,
+)
+
+
+def _safe_failure_identifier(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized if _FAILURE_IDENTIFIER_RE.fullmatch(normalized) else None
+
+
+def _safe_failure_path(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized if _FAILURE_PATH_RE.fullmatch(normalized) else None
+
+
+def _safe_failure_attempts(value: Any) -> int | dict[str, int] | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and 0 <= value <= 100:
+        return value
+    if not isinstance(value, Mapping):
+        return None
+    result: dict[str, int] = {}
+    for role, count in list(value.items())[:3]:
+        safe_role = _safe_failure_identifier(role)
+        if safe_role is None or isinstance(count, bool) or not isinstance(count, int):
+            continue
+        if 0 <= count <= 100:
+            result[safe_role] = count
+    return result or None
+
+
+def _safe_failure_message(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split())
+    if not normalized:
+        return None
+    if _SENSITIVE_FAILURE_RE.search(normalized):
+        return "结构化诊断包含敏感内容，已隐藏"
+    # Messages may name the failed blueprint field, but never expose a raw
+    # blueprint, prompt, reasoning trace, local path or credential material.
+    fence = normalized.find("```")
+    if fence >= 0:
+        normalized = normalized[:fence].rstrip() + " [结构化内容已隐藏]"
+    brace = normalized.find("{")
+    if brace >= 0:
+        normalized = normalized[:brace].rstrip(" :=") + " [结构化内容已隐藏]"
+    if normalized.lstrip().startswith("["):
+        return "结构化诊断已隐藏"
+    normalized = re.sub(r"\b[A-Za-z]:[\\/]\S+", "[路径已隐藏]", normalized)
+    normalized = re.sub(
+        r"(?<!\w)/(?:home|Users|tmp|var|etc)/\S+",
+        "[路径已隐藏]",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    return normalized[:300] or None
+
+
+def _safe_role_failure(role_key: Any, value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    role = _safe_failure_identifier(value.get("role"))
+    if role is None:
+        role = _safe_failure_identifier(role_key)
+    result: dict[str, Any] = {}
+    for key, safe_value in (
+        ("role", role),
+        ("substage", _safe_failure_identifier(value.get("substage"))),
+        ("path", _safe_failure_path(value.get("path"))),
+        ("attempts", _safe_failure_attempts(value.get("attempts"))),
+        ("message", _safe_failure_message(value.get("message"))),
+    ):
+        if safe_value is not None:
+            result[key] = safe_value
+    stage = _safe_failure_identifier(value.get("stage"))
+    if stage is not None:
+        result["stage"] = stage
+    code = _safe_failure_identifier(value.get("code"))
+    if code is not None:
+        result["code"] = code
+    elapsed = value.get("elapsed")
+    if not isinstance(elapsed, bool) and isinstance(elapsed, (int, float)):
+        result["elapsed"] = max(0.0, min(float(elapsed), 86400.0))
+    return result or None
+
+
+def _root_cause_from_details(
+    details: Mapping[str, Any], safe_roles: Mapping[str, Mapping[str, Any]]
+) -> tuple[str, str] | None:
+    primary = details.get("primary_failure")
+    selected = _safe_role_failure(None, primary) if isinstance(primary, Mapping) else None
+    if selected is None and safe_roles:
+        role_order = {"generator": 0, "brute": 1, "reference": 2}
+        selected = min(
+            safe_roles.values(),
+            key=lambda item: role_order.get(str(item.get("role") or ""), 99),
+        )
+    if selected is None:
+        return None
+    label_parts = [
+        str(selected[key])
+        for key in ("role", "substage", "path")
+        if selected.get(key)
+    ]
+    attempts = selected.get("attempts")
+    if isinstance(attempts, int):
+        label_parts.append(f"attempt {attempts}")
+    elif isinstance(attempts, Mapping):
+        counts = ", ".join(f"{role}={count}" for role, count in attempts.items())
+        if counts:
+            label_parts.append(f"attempts {counts}")
+    role = str(selected.get("role") or "helper")
+    substage = str(selected.get("substage") or selected.get("stage") or "prepare")
+    message = str(selected.get("message") or f"{role} 的 {substage} 阶段失败")
+    return " · ".join(label_parts) or role, message
+
+
 class JobManager:
     """A bounded, single-worker in-memory background job registry."""
 
@@ -77,7 +207,13 @@ class JobManager:
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="acm-web-job")
 
-    def submit(self, kind: str, function: Callable[[], Mapping[str, Any]]) -> dict[str, Any]:
+    def submit(
+        self,
+        kind: str,
+        function: Callable[..., Mapping[str, Any]],
+        *,
+        with_progress: bool = False,
+    ) -> dict[str, Any]:
         job_id = secrets.token_urlsafe(12)
         record: dict[str, Any] = {
             "job_id": job_id,
@@ -88,25 +224,89 @@ class JobManager:
             "finished_at": None,
             "result": None,
             "error": None,
+            "progress": None,
         }
         with self._lock:
             self._jobs[job_id] = record
             self._trim_locked()
-        self._executor.submit(self._run, job_id, function)
+        self._executor.submit(self._run, job_id, function, with_progress)
         return self.get(job_id) or record.copy()
 
-    def _run(self, job_id: str, function: Callable[[], Mapping[str, Any]]) -> None:
+    def _run(
+        self,
+        job_id: str,
+        function: Callable[..., Mapping[str, Any]],
+        with_progress: bool,
+    ) -> None:
         self._update(job_id, status="running", started_at=_utc_now())
         try:
             with self._service_lock:
-                result = function()
+                if with_progress:
+                    result = function(self._progress_callback(job_id))
+                else:
+                    result = function()
         except Exception as exc:  # Job failures are data, not server failures.
             problem = _problem_from_exception(exc)
+            current = self.get(job_id) or {}
+            progress = current.get("progress")
+            error: dict[str, Any] = {
+                "code": problem.code,
+                "message": _safe_failure_message(problem.message) or "后台任务失败",
+            }
+            if current.get("kind") == "ai_stress_start":
+                error["helpers_unchanged"] = True
+                error["run_created"] = False
+            details = getattr(exc, "details", None)
+            if not isinstance(details, Mapping):
+                details = getattr(exc, "context", None)
+            if not isinstance(details, Mapping):
+                details = {}
+            # Stress preflight failures deliberately expose only bounded,
+            # non-sensitive coordinates.  They are enough to reproduce the
+            # rejected case without leaking source, paths, or model prompts.
+            for key in ("artifact", "profile", "case_kind", "seed"):
+                value = getattr(exc, key, None)
+                if value is None:
+                    value = details.get(key)
+                if value is None or isinstance(value, bool):
+                    continue
+                if key == "seed":
+                    try:
+                        error[key] = int(value)
+                    except (TypeError, ValueError, OverflowError):
+                        error[key] = str(value).strip()[:128]
+                else:
+                    error[key] = str(value).strip()[:128]
+            for key in (
+                "configured_timeout_seconds",
+                "elapsed_seconds",
+                "last_stage",
+                "active_run_id",
+            ):
+                value = details.get(key)
+                if value is not None and not isinstance(value, bool):
+                    error[key] = value if isinstance(value, (int, float)) else str(value)[:128]
+            roles = details.get("roles")
+            safe_roles: dict[str, dict[str, Any]] = {}
+            if isinstance(roles, Mapping):
+                for role, item in list(roles.items())[:3]:
+                    safe_item = _safe_role_failure(role, item)
+                    safe_role = _safe_failure_identifier(role)
+                    if safe_item is not None and safe_role is not None:
+                        safe_roles[safe_role] = safe_item
+                if safe_roles:
+                    error["roles"] = safe_roles
+            root_cause = _root_cause_from_details(details, safe_roles)
+            if root_cause is not None:
+                error["root_cause_label"], error["root_cause_message"] = root_cause
+            if isinstance(progress, Mapping):
+                error["stage"] = progress.get("stage")
+                error["stage_label"] = progress.get("label")
             self._update(
                 job_id,
                 status="failed",
                 finished_at=_utc_now(),
-                error={"code": problem.code, "message": problem.message},
+                error=error,
             )
         else:
             self._update(
@@ -115,6 +315,53 @@ class JobManager:
                 finished_at=_utc_now(),
                 result=_json_safe(result),
             )
+
+    def _progress_callback(
+        self, job_id: str
+    ) -> Callable[[str, str, int, int], None]:
+        def report(
+            stage: str,
+            label: str,
+            step: int,
+            total: int,
+            preparation: Mapping[str, Any] | None = None,
+        ) -> None:
+            # Progress reporting must never be able to fail the actual job.  It
+            # is also normalized before crossing the HTTP boundary so a model
+            # or provider error cannot inject an unbounded label into the UI.
+            try:
+                safe_stage = str(stage).strip()[:64] or "working"
+                safe_label = str(label).strip()[:200] or safe_stage
+                safe_total = max(1, min(int(total), 10_000))
+                safe_step = max(0, min(int(step), safe_total))
+            except (TypeError, ValueError, OverflowError):
+                return
+            progress = {
+                "stage": safe_stage,
+                "label": safe_label,
+                "step": safe_step,
+                "total": safe_total,
+                "updated_at": _utc_now(),
+            }
+            if isinstance(preparation, Mapping):
+                for key in (
+                    "configured_timeout_seconds",
+                    "elapsed_seconds",
+                    "remaining_seconds",
+                    "stage_elapsed_seconds",
+                    "soft_budget_seconds",
+                    "deadline_at",
+                    "absolute_deadline",
+                ):
+                    value = preparation.get(key)
+                    if isinstance(value, (int, float, str)) and not isinstance(value, bool):
+                        progress[key] = value
+            self._update(
+                job_id,
+                progress=progress,
+            )
+
+        return report
 
     def _update(self, job_id: str, **changes: Any) -> None:
         with self._lock:
@@ -156,8 +403,44 @@ def _problem_from_exception(exc: Exception) -> ApiProblem:
         "TagOverrideRevisionConflict",
         "ProblemContextConflict",
         "PatchConflictError",
+        "MarkdownSummaryTargetRevisionConflict",
+        "MarkdownSummaryProposalRevisionConflict",
+        "MarkdownWriteConflict",
+        "StressArtifactBundleRevisionConflict",
+        "StressRunRevisionConflict",
+        "BundleConflictError",
     }:
         return ApiProblem(HTTPStatus.CONFLICT, "revision_conflict", str(exc))
+    if exc.__class__.__name__ in {"SandboxUnavailableError"}:
+        return ApiProblem(HTTPStatus.CONFLICT, "sandbox_unavailable", str(exc))
+    if exc.__class__.__name__ in {
+        "SourceSafetyError",
+        "StressPreparationError",
+        "PreparationBudgetExhausted",
+    }:
+        code = str(getattr(exc, "code", "invalid_stress_artifact"))
+        return ApiProblem(
+            HTTPStatus.GATEWAY_TIMEOUT
+            if code == "stress_prepare_budget_exhausted"
+            else HTTPStatus.BAD_REQUEST,
+            code,
+            str(exc),
+        )
+    if exc.__class__.__name__ == "StressRuntimeError":
+        code = str(getattr(exc, "code", "stress_error"))
+        status = (
+            HTTPStatus.GATEWAY_TIMEOUT
+            if code == "stress_prepare_budget_exhausted"
+            else HTTPStatus.CONFLICT
+            if code in {
+                "stress_run_active",
+                "stress_source_changed",
+                "stress_bundle_active",
+                "stress_setup_active",
+            }
+            else HTTPStatus.BAD_REQUEST
+        )
+        return ApiProblem(status, code, str(exc))
     if exc.__class__.__name__.startswith("DeepSeek"):
         code = str(getattr(exc, "code", "deepseek_error"))
         if code in {"missing_api_key", "invalid_model", "invalid_messages", "invalid_reasoning_effort"}:
@@ -226,6 +509,9 @@ class AcmHTTPServer(ThreadingHTTPServer):
 
     def cleanup(self) -> None:
         self.jobs.close(wait=True)
+        shutdown = getattr(self.service, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
         _remove_runtime_if_owned(self.runtime_path, os.getpid(), self.token)
 
 
@@ -253,6 +539,8 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
         "/api/ai/settings": "ai_settings",
         "/api/ai/credential": "ai_credential",
         "/api/ai/conversations": "ai_conversation_start",
+        "/api/knowledge/targets": "knowledge_target_create",
+        "/api/knowledge/targets/inspect": "knowledge_target_inspect",
     }
     _job_routes = {
         "/api/jobs/sync": "sync",
@@ -264,6 +552,8 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
         "/api/jobs/ai/patches/preview": "ai_patch_preview",
         "/api/jobs/ai/patches/apply": "ai_patch_apply",
         "/api/jobs/ai/patches/revert": "ai_patch_revert",
+        "/api/jobs/ai/knowledge/preview": "knowledge_preview",
+        "/api/jobs/ai/stress/start": "ai_stress_start",
     }
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -290,11 +580,73 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
             return
         if not self._authorize():
             return
-        if path == "/api/bootstrap" or path.startswith("/api/jobs/") and path not in self._job_routes:
+        knowledge_job = path.startswith("/api/jobs/knowledge/proposals/") and path.endswith(("/apply", "/revert"))
+        stress_bundle_job = path.startswith("/api/jobs/stress/bundles/") and path.endswith("/revert")
+        if path == "/api/bootstrap" or path.startswith("/api/jobs/") and path not in self._job_routes and not knowledge_job and not stress_bundle_job:
             self._send_error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed", "Method not allowed")
             return
         try:
             payload = self._read_json_object()
+            knowledge_proposal_prefix = "/api/knowledge/proposals/"
+            if path.startswith(knowledge_proposal_prefix) and path.endswith("/refresh"):
+                proposal_id = unquote(path[len(knowledge_proposal_prefix) : -len("/refresh")])
+                if not proposal_id or "/" in proposal_id:
+                    raise ApiProblem(HTTPStatus.NOT_FOUND, "not_found", "Markdown proposal not found")
+                with self.server.service_lock:
+                    result = self._invoke(
+                        "knowledge_refresh", {"proposal_id": proposal_id, **payload}
+                    )
+                self._send_success(result)
+                return
+            knowledge_job_prefix = "/api/jobs/knowledge/proposals/"
+            if path.startswith(knowledge_job_prefix) and path.endswith(("/apply", "/revert")):
+                action = "apply" if path.endswith("/apply") else "revert"
+                suffix = f"/{action}"
+                proposal_id = unquote(path[len(knowledge_job_prefix) : -len(suffix)])
+                if not proposal_id or "/" in proposal_id:
+                    raise ApiProblem(HTTPStatus.NOT_FOUND, "not_found", "Markdown proposal not found")
+                method_name = f"knowledge_{action}"
+                record = self.server.jobs.submit(
+                    method_name,
+                    lambda method_name=method_name, proposal_id=proposal_id, payload=payload: self._invoke(
+                        method_name, {"proposal_id": proposal_id, **payload}
+                    ),
+                )
+                self._send_success(
+                    {"job_id": record["job_id"], "job": record},
+                    status=HTTPStatus.ACCEPTED,
+                )
+                return
+            stress_bundle_job_prefix = "/api/jobs/stress/bundles/"
+            if path.startswith(stress_bundle_job_prefix) and path.endswith("/revert"):
+                bundle_id = unquote(path[len(stress_bundle_job_prefix) : -len("/revert")])
+                if not bundle_id or "/" in bundle_id:
+                    raise ApiProblem(HTTPStatus.NOT_FOUND, "not_found", "Stress bundle not found")
+                record = self.server.jobs.submit(
+                    "stress_bundle_revert",
+                    lambda bundle_id=bundle_id: self._invoke(
+                        "stress_bundle_revert", {"bundle_id": bundle_id}
+                    ),
+                )
+                self._send_success(
+                    {"job_id": record["job_id"], "job": record},
+                    status=HTTPStatus.ACCEPTED,
+                )
+                return
+            stress_run_prefix = "/api/stress/runs/"
+            if path.startswith(stress_run_prefix) and path.endswith(("/stop", "/resume", "/finish")):
+                action = next(
+                    item for item in ("stop", "resume", "finish")
+                    if path.endswith(f"/{item}")
+                )
+                suffix = f"/{action}"
+                run_id = unquote(path[len(stress_run_prefix) : -len(suffix)])
+                if not run_id or "/" in run_id:
+                    raise ApiProblem(HTTPStatus.NOT_FOUND, "not_found", "Stress run not found")
+                with self.server.service_lock:
+                    result = self._invoke(f"stress_{action}", {"run_id": run_id})
+                self._send_success(result)
+                return
             conversation_prefix = "/api/ai/conversations/"
             if path.startswith(conversation_prefix) and path.endswith("/clear"):
                 conversation_id = unquote(
@@ -330,10 +682,26 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
                 payload.setdefault("source", "web")
             if path in self._job_routes:
                 method_name = self._job_routes[path]
-                record = self.server.jobs.submit(
-                    method_name,
-                    lambda method_name=method_name, payload=payload: self._invoke(method_name, payload),
-                )
+                if path == "/api/jobs/ai/stress/start":
+                    if "medium_profile" in payload:
+                        raise ApiProblem(
+                            HTTPStatus.BAD_REQUEST,
+                            "invalid_request",
+                            "Unknown request field: medium_profile",
+                        )
+                    record = self.server.jobs.submit(
+                        method_name,
+                        lambda progress_callback, method_name=method_name, payload=payload: self._invoke(
+                            method_name,
+                            {**payload, "progress_callback": progress_callback},
+                        ),
+                        with_progress=True,
+                    )
+                else:
+                    record = self.server.jobs.submit(
+                        method_name,
+                        lambda method_name=method_name, payload=payload: self._invoke(method_name, payload),
+                    )
                 self._send_success({"job_id": record["job_id"], "job": record}, status=HTTPStatus.ACCEPTED)
                 return
             if path == "/api/server/shutdown":
@@ -346,6 +714,46 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
                 return
             with self.server.service_lock:
                 result = self._invoke(method_name, payload)
+            self._send_success(result)
+        except Exception as exc:
+            self._send_problem(_problem_from_exception(exc))
+
+    def do_PATCH(self) -> None:  # noqa: N802 - stdlib handler API
+        path = urlsplit(self.path).path
+        if not self._authorize():
+            return
+        try:
+            prefix = "/api/knowledge/targets/"
+            if not path.startswith(prefix):
+                raise ApiProblem(HTTPStatus.NOT_FOUND, "not_found", "API endpoint not found")
+            target_id = unquote(path[len(prefix) :])
+            if not target_id or "/" in target_id:
+                raise ApiProblem(HTTPStatus.NOT_FOUND, "not_found", "Markdown target not found")
+            payload = self._read_json_object()
+            with self.server.service_lock:
+                result = self._invoke(
+                    "knowledge_target_update", {"target_id": target_id, **payload}
+                )
+            self._send_success(result)
+        except Exception as exc:
+            self._send_problem(_problem_from_exception(exc))
+
+    def do_DELETE(self) -> None:  # noqa: N802 - stdlib handler API
+        path = urlsplit(self.path).path
+        if not self._authorize():
+            return
+        try:
+            prefix = "/api/knowledge/targets/"
+            if not path.startswith(prefix):
+                raise ApiProblem(HTTPStatus.NOT_FOUND, "not_found", "API endpoint not found")
+            target_id = unquote(path[len(prefix) :])
+            if not target_id or "/" in target_id:
+                raise ApiProblem(HTTPStatus.NOT_FOUND, "not_found", "Markdown target not found")
+            payload = self._read_json_object()
+            with self.server.service_lock:
+                result = self._invoke(
+                    "knowledge_target_delete", {"target_id": target_id, **payload}
+                )
             self._send_success(result)
         except Exception as exc:
             self._send_problem(_problem_from_exception(exc))
@@ -386,6 +794,66 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/ai/status":
                 with self.server.service_lock:
                     result = self._invoke("ai_status", {})
+                self._send_success(result)
+                return
+            if path == "/api/ai/stress/status":
+                with self.server.service_lock:
+                    result = self._invoke("ai_stress_status", {})
+                self._send_success(result)
+                return
+            if path == "/api/stress/runs":
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=False)
+                problem = query.get("problem", [None])[-1]
+                with self.server.service_lock:
+                    result = self._invoke("stress_runs", {"problem": problem})
+                self._send_success(result)
+                return
+            stress_run_prefix = "/api/stress/runs/"
+            if path.startswith(stress_run_prefix):
+                run_id = unquote(path[len(stress_run_prefix) :])
+                if not run_id or "/" in run_id:
+                    raise ApiProblem(HTTPStatus.NOT_FOUND, "not_found", "Stress run not found")
+                with self.server.service_lock:
+                    result = self._invoke("stress_run", {"run_id": run_id})
+                self._send_success(result)
+                return
+            stress_bundle_prefix = "/api/stress/bundles/"
+            if path.startswith(stress_bundle_prefix):
+                bundle_id = unquote(path[len(stress_bundle_prefix) :])
+                if not bundle_id or "/" in bundle_id:
+                    raise ApiProblem(HTTPStatus.NOT_FOUND, "not_found", "Stress bundle not found")
+                with self.server.service_lock:
+                    result = self._invoke("stress_bundle", {"bundle_id": bundle_id})
+                self._send_success(result)
+                return
+            if path == "/api/knowledge/templates":
+                with self.server.service_lock:
+                    result = self._invoke("knowledge_templates", {})
+                self._send_success(result)
+                return
+            if path == "/api/knowledge/targets":
+                with self.server.service_lock:
+                    result = self._invoke("knowledge_targets", {})
+                self._send_success(result)
+                return
+            proposal_prefix = "/api/knowledge/proposals/"
+            if path.startswith(proposal_prefix):
+                proposal_id = unquote(path[len(proposal_prefix) :])
+                if not proposal_id or "/" in proposal_id:
+                    raise ApiProblem(HTTPStatus.NOT_FOUND, "not_found", "Markdown proposal not found")
+                with self.server.service_lock:
+                    result = self._invoke("knowledge_proposal", {"proposal_id": proposal_id})
+                self._send_success(result)
+                return
+            attempt_prefix = "/api/attempts/"
+            if path.startswith(attempt_prefix) and path.endswith("/knowledge"):
+                attempt_id = unquote(path[len(attempt_prefix) : -len("/knowledge")])
+                if not attempt_id.isdigit():
+                    raise ApiProblem(HTTPStatus.NOT_FOUND, "not_found", "Attempt not found")
+                with self.server.service_lock:
+                    result = self._invoke(
+                        "knowledge_attempt_proposals", {"attempt_id": int(attempt_id)}
+                    )
                 self._send_success(result)
                 return
             context_prefix = "/api/problems/"

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "platform": "codeforces",
+  "problem_id": "CF380C",
+  "title": "Sereja and Brackets",
+  "statement_file": "statement.md",
+  "statement_sha256": "b9c4654146857af4e2f14e6a722a76e6a7c2664c756dd92ac377658545f574db",
+  "primary_source_file": "primary.cpp",
+  "primary_source_sha256": "cc8d0b9de367fa5c22a4ee4bc6d6284f1991ee6f578d1df04988dfa53a2caa7b",
+  "samples": [{
+    "name": "benchmark-sample-1",
+    "input_file": "samples/1.in",
+    "input_sha256": "97a2c6b3f5c8bf2675afb2e61bf0a3d0bfb525da3059d2f2c8da3e890892fe44",
+    "output_file": "samples/1.out",
+    "output_sha256": "2572f8d9d8c8d31cdc279d471bf369cf7dcc2e188173dc91d62a519c50d94455"
+  }]
+}

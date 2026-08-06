@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "platform": "luogu",
+  "problem_id": "P2596",
+  "title": "Bookshelf",
+  "statement_file": "statement.md",
+  "statement_sha256": "1fdbabdeb55b36b63119aa50438b4d443a7ad90b78570a8690a27bb0cb418717",
+  "primary_source_file": "primary.cpp",
+  "primary_source_sha256": "bc5f170b902149596f59440520ddb964a143aaeaf4d58a721e15f94e84847916",
+  "samples": [{
+    "name": "benchmark-sample-1",
+    "input_file": "samples/1.in",
+    "input_sha256": "b08ad897a66ef10d1c95e692f60e57390d79a467da5e4b884fd80cafb55de530",
+    "output_file": "samples/1.out",
+    "output_sha256": "04ed82dae8b902d411accf765f4ded9af83a46b71ffb1fce5f02c611908e6bcd"
+  }]
+}

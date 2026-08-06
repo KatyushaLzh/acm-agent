@@ -142,6 +142,12 @@ class AiServiceTests(unittest.TestCase):
                 "recommendation_thinking",
                 "coaching_thinking",
                 "reasoning_effort",
+                "summary_model",
+                "summary_thinking",
+                "summary_reasoning_effort",
+                "validation_model",
+                "validation_thinking",
+                "validation_reasoning_effort",
             },
         )
 
@@ -360,6 +366,26 @@ class AiServiceTests(unittest.TestCase):
         fetched = service.problem_context_fetch("P1000", force=True)
         self.assertTrue(fetched["available"])
         self.assertIn("计算答案", fetched["content"])
+
+    def test_problem_context_persists_structured_samples(self):
+        statement = """## 题目描述
+求和。
+
+### 样例输入 1
+```text
+1 2
+```
+### 样例输出 1
+```text
+3
+```
+"""
+        self.service.problem_context_save("P1000", content=statement)
+        with Database(self.service.paths.database) as db:
+            rows = db.problem_samples("luogu", "P1000")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(bytes(rows[0]["input_data"]), b"1 2\n")
+        self.assertEqual(bytes(rows[0]["expected_output"]), b"3\n")
 
 
 class AiCredentialServiceTests(unittest.TestCase):

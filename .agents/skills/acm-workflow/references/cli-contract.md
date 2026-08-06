@@ -48,6 +48,16 @@ Status precedence is `accepted > skipped > attempted > local_only > not_started 
 - `review` and every patch proposal count as hint level 4. `close` stores the maximum of explicit input and persisted AI assistant history.
 - A patch proposal is a complete replacement guarded by a baseline hash. `apply` and `revert` conflicts are HTTP 409 and must never overwrite a newer local edit.
 
+## AI Stress Rules
+
+- AI stress is explicit opt-in. The preparation payload contains statement/title/problem ID and a deterministic stress contract, but never account fields, API keys, local paths, conversation history, notes, or the user's solution source.
+- Source tiers are fixed: Codeforces official editorial or Luogu public solution page, then CNBlogs, CSDN, then AI generation. The local allowlisted crawler filters exact problem IDs deterministically; selecting a fetched candidate does not require a model tool call. Ordinary Codeforces submissions and authenticated/challenge content are out of scope.
+- Bundle artifact kinds are `generator`, `brute`, and `reference`. Existing helpers are recorded as `local_existing`; remote provenance records URL, title, content hash, and license when known. A complete exact-ID Luogu article solution is recorded as `luogu_solution` only after source safety, a 3-second static compilation, and a compact semantic audit pass. The Luogu audit phase has one shared 28-second budget, thinking/retries disabled, 512 output-token cap, and bounded statement/source context; the structured audit is stored in artifact metadata. It then takes precedence over `ai_generated`. `validated` means the sample checks and 200-case small three-way warmup completed, not merely that the source compiled or passed static audit.
+- Helper application is gated by a separate bounded AI audit plus local debug preflight. Preflight order is capability/determinism, samples, lower-bound small, 16 random small, upper-bound large, and one random large. A failure returns structured `artifact`, `profile`, `case_kind`, and `seed` when available, leaves previous helper hashes unchanged, and creates neither an applied bundle nor a stress run.
+- Run status is `pending`, `preparing`, `running`, `stop_requested`, `stopped`, `mismatch`, `oracle_conflict`, `fault`, `interrupted`, or `completed`. A restart changes only runs whose owner process is no longer alive to `interrupted`; resume accepts stopped/interrupted/mismatch/oracle-conflict/fault states, reuses and recompiles the applied helpers without an AI call, and continues from persisted `next_seed` with accumulated counters.
+- Profile-v2 runs samples, an exact lower-bound small case, an optional exact upper-bound large case, then a persistent 4:1 small/large cycle. Small cases execute solution/brute/reference under the normal 2 MiB limits; only `brute == reference != solution` is a confirmed small mismatch and other three-way disagreements are `oracle_conflict`. Large cases use 32 MiB input and 16 MiB output limits, never execute brute, and a solution/reference disagreement is a direct `mismatch`. The latest disagreement is atomically exported beside the solution as `<problem>_input.in`, `<problem>_current.out`, `<problem>_brute.out`, and `<problem>_reference.out`; for large cases the brute output is `BRUTE_NOT_RUN_FOR_LARGE_PROFILE`. History remains under `.acm/failures/`.
+- HTTP endpoints are `GET /api/ai/stress/status`, `POST /api/jobs/ai/stress/start`, `GET /api/stress/runs[/{id}]`, `POST /api/stress/runs/{id}/stop|resume|finish`, `GET /api/stress/bundles/{id}`, and `POST /api/jobs/stress/bundles/{id}/revert`. `stop` is a resumable pause; `finish` waits for the active process tree to stop, then permanently completes the run and releases the single-active-run lock. The start payload uses `large_profile` (default true); removed profile fields are rejected rather than translated. CLI equivalents are `verify --ai-stress [--no-large]` and `stress status/stop/resume/artifacts/revert`.
+
 ## Plan and Recommendation Rules
 
 - `source_mode` is `balanced`, `catalog_only`, or `plan_only`. Balanced mode caps plan tasks at `ceil(2 * count / 3)` and does not silently exceed the cap when the catalog is short.
@@ -59,6 +69,15 @@ Status precedence is `accepted > skipped > attempted > local_only > not_started 
 - Plan detail returns runtime `task_statuses` keyed by stable `task_key`; these fields are API metadata and must not be copied into `plan.json` on edit or export.
 - Each task status keeps `judge_result`, `workflow_status`, and `skipped` distinct. An accepted verdict has permanent result priority; otherwise the latest known Codeforces submission or local closed session supplies the result. An active session may report `ACTIVE`.
 - Luogu anonymous synchronization proves public AC only. Non-AC Luogu results exist in task status only when recorded by a local session.
+
+## Markdown Knowledge Rules
+
+- Closing an attempt and generating a Markdown summary are separate operations. A summary failure never changes the closed attempt.
+- A target is one registered absolute local `.md` path plus a revisioned `summary-schema-v1`. Existing root `algorithms.md` and `tricks.md` are automatically registered with their fixed schemas; unregistering any target never deletes the file.
+- Preview sends only the closed attempt context and necessary schema shape to DeepSeek. Cleared conversations, accounts, API keys, local paths, reasoning content, and the full target file are excluded. One old card may additionally be sent only when its normalized `Source` problem ID exactly matches, so the model can merge it with the new evidence.
+- Proposal status is `preview`, `applying`, `applied`, `conflict`, `failed`, `reverting`, or `reverted`. Only the latest `preview` revision with confidence at least 0.75 is applyable. Exact Source matches are AI-merged automatically; title-only or fuzzy similarity creates a new card without a choice step.
+- Editing `entry_markdown` requires `knowledge refresh`; apply never accepts replacement candidate bytes from the client.
+- Apply and revert are guarded by target/schema/proposal revisions and SHA-256. HTTP 409 means reload or preview again; never overwrite the external edit.
 
 ## Plan Tag Rules
 

@@ -1,4 +1,4 @@
 interface:
   display_name: "ACM Workflow"
   short_description: "Operate ACM practice, plans, tags, Skip, and review"
-  default_prompt: "Use $acm-workflow to query this repository's local dashboard, sync status, recommend practice, and record training outcomes."
+  default_prompt: "Use $acm-workflow to query my local dashboard, sync status, recommend practice, and explicitly record a mastered-without-code Skip when I request it."

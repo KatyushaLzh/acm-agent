@@ -35,6 +35,7 @@ Python 3.13 标准库驱动的本地训练系统。网页是主要入口，CLI �
 .\acm.ps1 next --count 3 --mode mixed
 .\acm.ps1 start CF1234A --with-stress
 .\acm.ps1 verify CF1234A
+.\acm.ps1 verify CF1234A --ai-stress
 .\acm.ps1 close CF1234A
 .\acm.ps1 review week
 ```
@@ -43,7 +44,7 @@ Python 3.13 标准库驱动的本地训练系统。网页是主要入口，CLI �
 
 所有读取状态的命令都支持 `--json`。推荐输出包含数据新鲜度、位置、总分、每项分数和选择原因；平台同步失败不会删除最后一次成功快照。
 
-网页与 CLI 直接调用同一业务服务层，不通过子进程互相调用。旧版 `.acm/state.db` 会自动升级；从 schema v4/v5 升级前会分别通过 SQLite backup API 保存一次数据库备份。
+网页与 CLI 直接调用同一业务服务层，不通过子进程互相调用。旧版 `.acm/state.db` 会自动升级；v4→v5、v5→v6、v6→v7、v7→v8、v8→v9 和 v9→v10 前会分别通过 SQLite backup API 保存一次数据库备份。
 
 ## DeepSeek BYOK 与 AI 工作台
 
@@ -63,6 +64,10 @@ $env:DEEPSEEK_API_KEY = "你的密钥"
 做题工作台支持按题目持久化的流式对话、1–3 级提示、4 级代码诊断，以及“生成带错误说明注释的完整候选源码 → C++ 语法高亮预览 → 用户确认 → 备份并验证”的补丁流程。预览区只显示修改后的完整代码，不展示 unified diff；diff 仍由服务端生成并保留用于审计和安全应用。切换题号时会恢复该 active attempt 对应的会话，不会把另一道题的消息混入当前面板。“清除本题对话”会归档旧会话并创建新的空会话；旧消息不再参与后续模型上下文，但仍保留提示等级、token 用量和补丁审计。题面自动抓取仅读取 Codeforces 的 `.problem-statement` 或洛谷公开题面字段，不读取题解；失败时可粘贴人工题面，人工版本优先并可显式恢复自动版本。补丁应用前校验受管 `.cpp` 路径与基线 SHA-256，冲突不会覆盖新修改，验证失败也不会自动回滚。
 
 首次发送前，Dashboard 会提示数据出站范围。AI 推荐只发送最多 90 天/50 次尝试的结构化结果与冻结标签，不发送账号、notes、聊天、源码或本地路径；工作台对话会发送当前题面、有效标签、源码、attempt 和最近对话，但不会发送账号、文件路径或 API Key。`reasoning_content` 不展示也不保存。
+
+“本地验证”的 AI 持续对拍同样默认关闭。准备总 deadline 默认 600 秒，可配置为 60–1800 秒；默认档在 480 秒关闭 provider、590 秒结束本地门禁，最后 10 秒 shutdown/清理。单次 non-thinking、thinking、audit 上限为 120/180/50 秒，本地门禁预算不可借用；累计 provider usage 超过 100000 tokens 的 setup 必须 fail-closed，且不再启动后续请求。默认 `hybrid` fast-first，仅在明确机器诊断后使用 thinking；`fast` 全部 non-thinking，`full_thinking` 保留更高推理预算，900 秒可作为显式慢速档。generator 最多修复两次，validator/brute/reference 最多一次。DeepSeek 连接、读取、keep-alive、网络重试和 JSON 恢复共享绝对 deadline。可信 generator harness、独立 validator、来源白名单、安全审查、AppContainer、官方样例、16 个 small、边界和 large 门禁均保留；任何失败或超时都保留旧 helper 且不创建 run。
+
+contract schema v3 与 generator blueprint 在源码生成前本地验证证据、seed、覆盖闭合和 large 复杂度。profile-v2 manifest 的 stdout SHA、维度、coverage tags、records 和复杂度会在并行 small 集合及串行 large 门禁中验证。schema v12 保存角色 candidate/proof、联合 certification、cache alias 和结构化样例，并拆分 generation/certification identity。`cache_mode` 支持 `reuse`、`refresh_helpers`、`cold`，旧强制重生成映射为 cold；warm setup 保持 0 provider requests、0 tokens。
 
 常用 CLI：
 
@@ -105,7 +110,7 @@ Agent 在网页服务未运行时可使用同一事务流程：
 
 preview JSON 会携带题单和全局覆盖两个修订号，CLI apply 会自动读取并校验。平台没有公开标签且用户明确要求补充时，仓库 `acm-workflow` skill 允许 Agent 只读取题面和元数据来生成专题标签，再通过上述 apply/API 写回托管题单；不得直接修改内置题单源文件。标签只描述题目专题，不代表 AC。
 
-`close` 只在 `.acm/reports/` 生成归档候选。只有明确要求“总结/归档”时，仓库 skill 才会调用现有 `xcpc-summarize`，不会自行修改 `algorithms.md` 或 `tricks.md`。
+`close` 始终先独立保存 attempt，不会自动修改知识库。“结束与复盘”可显式启用 DeepSeek Markdown 总结：根目录已有的 `algorithms.md`、`tricks.md` 会以固定 schema 自动成为已保存目标，其他 `.md` 可推断或自定义 schema。Dashboard 只显示可编辑 Markdown 与安全渲染预览，不展示 unified diff；确认 apply 前目标保持零修改。若 `Source` 题号完全相同，服务只把对应旧条目发送给 DeepSeek，与本次知识语义合并；标题相似但题号不同则新增条目。服务端继续以 proposal revision、基线哈希、备份、原子替换和 hash-guarded revert 保护写入。
 
 ## 开发验证
 

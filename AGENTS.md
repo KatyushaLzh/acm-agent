@@ -1,12 +1,11 @@
-# ACM Agent Repository Guide
+﻿## Self-Improvement
 
-- Keep the runtime dependency-free: production code uses Python 3.13 standard library only.
-- Treat `.acm/state.db` as the sole local state source; never infer AC from filenames or chat text.
-- Platform AC is authoritative. `skipped` means mastered without implementation and is not AC.
-- Preserve existing dated solution files and never expose arbitrary filesystem read/write APIs.
-- Keep the HTTP server loopback-only and retain token, Host, Origin and request-size checks.
-- Plan edits must remain transactional and revision-protected.
-- Built-in plan sources are immutable; edits create managed overrides under `.acm/plans/`.
-- Run `python -m unittest discover -s tests -v` after behavior changes.
-- Run `python -m compileall -q tools tests` and `python -m tools.acm_agent plan check --json` before release.
-- Do not commit `.acm/`, account identifiers, tokens, platform snapshots, solution history or generated reports.
+- Use the two-layer self-improvement workflow for this workspace.
+- Project-local learnings live in `D:\code\acm\.learnings`.
+- Cross-project learnings live in `C:\Users\Lenovo\.codex\.learnings`.
+- Before major or similar tasks, search both locations for relevant `Pattern-Key`, error, and workflow entries.
+- Record non-obvious errors, user corrections, recurring patterns, tool/API gotchas, and missing capabilities.
+- Store project-specific build, command, schema, API, or convention lessons here; store reusable Codex/Meyo/tool/workflow lessons globally.
+- If a lesson applies to both layers, write project details locally and a sanitized abstract rule globally, linking with `See Also`.
+- Never log secrets, API keys, tokens, private file contents, full environment variables, full transcripts, or identifiable personal information.
+- Use stable `Pattern-Key` values for recurring issues. Promote a short prevention rule into `AGENTS.md` when a pattern recurs at least 3 times across at least 2 tasks within 30 days.

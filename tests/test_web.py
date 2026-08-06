@@ -19,6 +19,13 @@ class RevisionConflict(Exception):
     pass
 
 
+class StressPreparationError(RuntimeError):
+    def __init__(self, code: str, message: str, **details: object) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details
+
+
 class FakeService:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, object]]] = []
@@ -169,6 +176,96 @@ class FakeService:
 
     def verify(self, **values: object) -> dict[str, object]:
         return self._return("verify", values)
+
+    def ai_stress_status(self, **values: object) -> dict[str, object]:
+        return {"available": True, "sandbox": {"available": True, "backend": "fixture"}}
+
+    def ai_stress_start(self, **values: object) -> dict[str, object]:
+        progress_callback = values.pop("progress_callback", None)
+        if not callable(progress_callback):
+            raise AssertionError("stress progress callback was not injected")
+        if values.get("fail_parallel_generator"):
+            for step, (stage, label) in enumerate(
+                (
+                    ("contract", "提取 contract"),
+                    ("generator", "并行准备 generator"),
+                    ("brute", "并行准备 brute"),
+                    ("reference", "并行准备 reference"),
+                ),
+                start=1,
+            ):
+                progress_callback(stage, label, step, 4)
+            raise StressPreparationError(
+                "stress_artifact_stage_failed",
+                '一个或多个 helper 准备失败: {"secret":"RAW_TOP_LEVEL_MUST_NOT_LEAK"}',
+                primary_failure={
+                    "role": "generator",
+                    "substage": "blueprint",
+                    "path": "cases[2].coverage_tags",
+                    "attempts": 2,
+                    "message": "generator blueprint coverage 未闭合",
+                    "blueprint": {"raw": "RAW_BLUEPRINT_MUST_NOT_LEAK"},
+                    "reasoning": "RAW_REASONING_MUST_NOT_LEAK",
+                    "secret": "TOP_SECRET_MUST_NOT_LEAK",
+                },
+                roles={
+                    "generator": {
+                        "stage": "prepare_generator",
+                        "role": "generator",
+                        "substage": "blueprint",
+                        "path": "cases[2].coverage_tags",
+                        "attempts": 2,
+                        "message": "generator blueprint coverage 未闭合",
+                    }
+                },
+            )
+        for step, (stage, label) in enumerate(
+            (
+                ("sandbox", "检查隔离环境"),
+                ("contract", "让 DeepSeek 提取对拍契约"),
+                ("generator", "生成 generator"),
+                ("brute", "生成 brute"),
+                ("reference", "搜索或生成对拍代码"),
+                ("audit", "AI 静态复核"),
+                ("preflight", "small 随机预验 16/16"),
+                ("helpers", "安全替换三个 helper"),
+                ("run", "创建持续对拍 run"),
+            ),
+            start=1,
+        ):
+            progress_callback(stage, label, step, 9)
+            if values.get("fail_preflight") and stage == "preflight":
+                raise StressPreparationError(
+                    "stress_preflight_failed",
+                    "brute 调试版本触发越界断言",
+                    artifact="brute",
+                    profile="small",
+                    case_kind="random",
+                    seed=2596,
+                )
+        values["progress_callback_injected"] = True
+        return self._return("ai_stress_start", values)
+
+    def stress_runs(self, **values: object) -> dict[str, object]:
+        return {"runs": [{"id": "run-1", "status": "running"}], **self._return("stress_runs", values)}
+
+    def stress_run(self, **values: object) -> dict[str, object]:
+        return {"id": values["run_id"], "status": "running", **self._return("stress_run", values)}
+
+    def stress_stop(self, **values: object) -> dict[str, object]:
+        return {"id": values["run_id"], "status": "stopped", **self._return("stress_stop", values)}
+
+    def stress_resume(self, **values: object) -> dict[str, object]:
+        return {"id": values["run_id"], "status": "running", **self._return("stress_resume", values)}
+
+    def stress_finish(self, **values: object) -> dict[str, object]:
+        return {"id": values["run_id"], "status": "completed", **self._return("stress_finish", values)}
+
+    def stress_bundle(self, **values: object) -> dict[str, object]:
+        return {"id": values["bundle_id"], **self._return("stress_bundle", values)}
+
+    def stress_bundle_revert(self, **values: object) -> dict[str, object]:
+        return self._return("stress_bundle_revert", values)
 
 
 class WebServerTest(unittest.TestCase):
@@ -355,6 +452,141 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(status, 202)
         job = self.wait_for_job(payload["data"]["job_id"])
         self.assertEqual(job["result"]["operation"], "ai_recommendations")
+
+    def test_ai_stress_routes_and_dynamic_controls(self) -> None:
+        status, payload, _ = self.request("GET", "/api/ai/stress/status")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["data"]["sandbox"]["available"])
+
+        status, payload, _ = self.request("GET", "/api/stress/runs?problem=CF1A")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["problem"], "CF1A")
+
+        status, payload, _ = self.request("GET", "/api/stress/runs/run-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["run_id"], "run-1")
+
+        status, payload, _ = self.request("GET", "/api/stress/bundles/bundle-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["bundle_id"], "bundle-1")
+
+        stress_payload = {
+            "problem": "CF1A",
+            "generate_generator": True,
+            "generate_brute": True,
+            "prepare_reference": True,
+            "large_profile": True,
+            "compare": "token",
+            "generation_mode": "full_thinking",
+            "progress_callback": "client-must-not-control-callback",
+        }
+        status, payload, _ = self.request("POST", "/api/jobs/ai/stress/start", payload=stress_payload)
+        self.assertEqual(status, 202)
+        job = self.wait_for_job(payload["data"]["job_id"])
+        self.assertEqual(job["result"]["operation"], "ai_stress_start")
+        self.assertEqual(job["result"]["problem"], "CF1A")
+        self.assertTrue(job["result"]["large_profile"])
+        self.assertEqual(job["result"]["generation_mode"], "full_thinking")
+        self.assertTrue(job["result"]["progress_callback_injected"])
+        self.assertEqual(
+            job["progress"],
+            {
+                "stage": "run",
+                "label": "创建持续对拍 run",
+                "step": 9,
+                "total": 9,
+                "updated_at": job["progress"]["updated_at"],
+            },
+        )
+
+        failed_payload = {**stress_payload, "fail_preflight": True}
+        status, payload, _ = self.request(
+            "POST", "/api/jobs/ai/stress/start", payload=failed_payload
+        )
+        self.assertEqual(status, 202)
+        failed = self.wait_for_job(payload["data"]["job_id"])
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(
+            {
+                key: failed["error"][key]
+                for key in ("artifact", "profile", "case_kind", "seed")
+            },
+            {
+                "artifact": "brute",
+                "profile": "small",
+                "case_kind": "random",
+                "seed": 2596,
+            },
+        )
+        self.assertEqual(failed["error"]["stage"], "preflight")
+        self.assertEqual(failed["error"]["stage_label"], "small 随机预验 16/16")
+        self.assertTrue(failed["error"]["helpers_unchanged"])
+        self.assertFalse(failed["error"]["run_created"])
+
+        parallel_payload = {**stress_payload, "fail_parallel_generator": True}
+        status, payload, _ = self.request(
+            "POST", "/api/jobs/ai/stress/start", payload=parallel_payload
+        )
+        self.assertEqual(status, 202)
+        parallel_failed = self.wait_for_job(payload["data"]["job_id"])
+        self.assertEqual(parallel_failed["status"], "failed")
+        # The last parallel progress belongs to reference, but the provider's
+        # structured primary failure identifies generator blueprint as root.
+        self.assertEqual(parallel_failed["progress"]["stage"], "reference")
+        self.assertEqual(parallel_failed["progress"]["step"], 4)
+        self.assertEqual(parallel_failed["progress"]["total"], 4)
+        root_error = parallel_failed["error"]
+        self.assertEqual(root_error["stage_label"], "并行准备 reference")
+        self.assertEqual(
+            root_error["root_cause_label"],
+            "generator · blueprint · cases[2].coverage_tags · attempt 2",
+        )
+        self.assertEqual(
+            root_error["root_cause_message"],
+            "generator blueprint coverage 未闭合",
+        )
+        serialized_error = json.dumps(root_error, ensure_ascii=False)
+        self.assertNotIn("RAW_BLUEPRINT_MUST_NOT_LEAK", serialized_error)
+        self.assertNotIn("RAW_REASONING_MUST_NOT_LEAK", serialized_error)
+        self.assertNotIn("TOP_SECRET_MUST_NOT_LEAK", serialized_error)
+        self.assertNotIn("RAW_TOP_LEVEL_MUST_NOT_LEAK", serialized_error)
+        self.assertTrue(root_error["helpers_unchanged"])
+        self.assertFalse(root_error["run_created"])
+
+        for action, expected in (
+            ("stop", "stress_stop"),
+            ("resume", "stress_resume"),
+            ("finish", "stress_finish"),
+        ):
+            status, payload, _ = self.request("POST", f"/api/stress/runs/run-1/{action}", payload={})
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["data"]["operation"], expected)
+
+        status, payload, _ = self.request("POST", "/api/jobs/stress/bundles/bundle-1/revert", payload={})
+        self.assertEqual(status, 202)
+        job = self.wait_for_job(payload["data"]["job_id"])
+        self.assertEqual(job["result"]["operation"], "stress_bundle_revert")
+
+        status, payload, _ = self.request(
+            "POST",
+            "/api/jobs/ai/stress/start",
+            payload={"problem": "CF1A", "medium_profile": False},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "invalid_request")
+        self.assertIn("medium_profile", payload["error"]["message"])
+
+        status, payload, _ = self.request(
+            "POST",
+            "/api/jobs/ai/stress/start",
+            payload={
+                "problem": "CF1A",
+                "large_profile": True,
+                "medium_profile": False,
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "invalid_request")
 
     def test_synchronous_routes_forward_json_objects(self) -> None:
         routes = {
@@ -551,6 +783,34 @@ class JobManagerTest(unittest.TestCase):
             # close() is idempotent for ThreadPoolExecutor.
             manager.close(wait=True)
 
+    def test_progress_is_normalized_and_failure_keeps_stage(self) -> None:
+        manager = JobManager(threading.RLock(), capacity=10)
+
+        def work(progress_callback):
+            progress_callback(" contract ", " 提取对拍契约 ", 2, 7)
+            raise ValueError("fixture contract failure")
+
+        try:
+            submitted = manager.submit("stress", work, with_progress=True)
+            manager.close(wait=True)
+            job = manager.get(submitted["job_id"])
+            self.assertEqual(job["status"], "failed")
+            self.assertEqual(
+                job["progress"],
+                {
+                    "stage": "contract",
+                    "label": "提取对拍契约",
+                    "step": 2,
+                    "total": 7,
+                    "updated_at": job["progress"]["updated_at"],
+                },
+            )
+            self.assertEqual(job["error"]["stage"], "contract")
+            self.assertEqual(job["error"]["stage_label"], "提取对拍契约")
+            self.assertEqual(job["error"]["message"], "fixture contract failure")
+        finally:
+            manager.close(wait=True)
+
 
 class StaticPlanEditorTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -559,6 +819,9 @@ class StaticPlanEditorTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.html = (
             REPO_ROOT / "tools/acm_agent/web_static/index.html"
+        ).read_text(encoding="utf-8")
+        self.styles = (
+            REPO_ROOT / "tools/acm_agent/web_static/styles.css"
         ).read_text(encoding="utf-8")
 
     def test_plan_and_stage_editing_are_opt_in(self) -> None:
@@ -664,6 +927,90 @@ class StaticPlanEditorTest(unittest.TestCase):
         self.assertIn("await ensureAiConversation()", self.script)
         self.assertIn('event === "delta"', self.script)
         self.assertIn("window.confirm", self.script)
+
+    def test_ai_stress_ui_is_explicit_and_exposes_persistent_controls(self) -> None:
+        self.assertIn('id="ai-stress-panel"', self.html)
+        self.assertIn('name="enabled" type="checkbox"', self.html)
+        for option in (
+            "generate_generator",
+            "generate_brute",
+            "prepare_reference",
+            "large_profile",
+        ):
+            self.assertIn(f'name="{option}" type="checkbox" checked', self.html)
+        for identifier in (
+            'id="ai-stress-stop"',
+            'id="ai-stress-resume"',
+            'id="ai-stress-finish"',
+            'id="ai-stress-artifacts"',
+            'id="ai-stress-revert"',
+        ):
+            self.assertIn(identifier, self.html)
+        self.assertIn('api("/api/ai/stress/status")', self.script)
+        self.assertIn('api("/api/stress/runs")', self.script)
+        self.assertIn('"/api/jobs/ai/stress/start"', self.script)
+        self.assertIn("scheduleStressPoll(id)", self.script)
+        self.assertIn("function stressResumable(status)", self.script)
+        self.assertIn('"mismatch", "oracle_conflict"', self.script)
+        self.assertIn("function stressBundleOf(payload)", self.script)
+        self.assertIn("stressBundleOf(await api(`/api/stress/bundles/", self.script)
+        self.assertIn("function stressSourceLink(url)", self.script)
+        self.assertIn("相关数据已经保存到: ${sourceDirectory || failure}", self.script)
+        self.assertIn("run.user_source_path", self.script)
+        self.assertIn('target="_blank" rel="noopener noreferrer"', self.script)
+        self.assertNotIn("textContent = JSON.stringify(bundle, null, 2)", self.script)
+        self.assertIn("查看 helper 来源", self.html)
+        self.assertIn("#ai-stress-stop:disabled, #ai-stress-resume:disabled, #ai-stress-finish:disabled { cursor: default; }", self.styles)
+        self.assertIn("复用现有 helper，从保存的 next seed 继续", self.script)
+        self.assertIn("function stressFinishable(status)", self.script)
+        self.assertIn('controlStress("finish", event.currentTarget)', self.script)
+        self.assertIn("run.config?.rate_base_total ?? 0", self.script)
+        self.assertIn("total - rateBaseTotal", self.script)
+        self.assertIn('["累计", total]', self.script)
+        self.assertIn('["本轮 / 速度"', self.script)
+        self.assertIn('["large", run.large_count ?? run.large_cases ?? 0]', self.script)
+        self.assertNotIn("medium_count", self.script)
+        self.assertNotIn("medium_cases", self.script)
+        self.assertNotIn("medium（旧版）", self.script)
+        self.assertIn("retiredProfile || !stressResumable(status)", self.script)
+        self.assertIn("该运行协议已停用，历史状态仅供查看，不能继续。", self.script)
+        self.assertIn("32 MiB 输入、16 MiB 输出", self.html)
+        self.assertIn("function jobProgressLabel(progress, fallback)", self.script)
+        self.assertIn("function jobFailureDetails(error)", self.script)
+        self.assertIn("function renderStressPreparationFailure(message)", self.script)
+        self.assertIn("renderStressPreparationFailure(error.message)", self.script)
+        self.assertIn("(_progress, _job, currentLabel) => setBusy(button, true, currentLabel)", self.script)
+        self.assertIn('`阶段“${stageLabel}”失败：${message}`', self.script)
+        self.assertIn("const rootCauseLabel = String(error.root_cause_label", self.script)
+        self.assertIn("const rootCauseMessage = String(error.root_cause_message", self.script)
+        self.assertIn("根因${rootCauseLabel ?", self.script)
+        self.assertIn("const summary = rootCauseMessage", self.script)
+        self.assertIn("error.helpers_unchanged === true", self.script)
+        self.assertIn("error.run_created === false", self.script)
+        self.assertIn("旧 helper 未修改，run 未创建。", self.script)
+        self.assertIn('artifact: "产物"', self.script)
+        self.assertIn('case_kind: "case"', self.script)
+        self.assertIn(
+            'name="preparation_timeout_seconds" type="number" min="60" max="1800" step="1" value="600"',
+            self.html,
+        )
+        self.assertIn('name="cache_mode"', self.html)
+        self.assertIn('<option value="cold">Cold', self.html)
+        self.assertNotIn("固定使用非 thinking 模式", self.html)
+        self.assertIn('name="generation_mode"', self.html)
+        self.assertIn('<option value="hybrid" selected>', self.html)
+        self.assertIn("第 8 分钟硬停止 provider", self.html)
+        self.assertIn("preparation_timeout_seconds: preparationTimeout", self.script)
+        self.assertIn("cache_mode: form.elements.cache_mode.value", self.script)
+        self.assertIn("generation_mode: form.elements.generation_mode.value", self.script)
+        self.assertIn("preparationTimeout < 60 || preparationTimeout > 1800", self.script)
+        self.assertIn("Fast 降级 ${fastFallback ?", self.script)
+        self.assertIn("推理 token ${Math.max(0, reasoningTokens).toFixed(0)}", self.script)
+        self.assertIn("可用剩余 ${Math.max(0, usableRemaining).toFixed(1)}s", self.script)
+        self.assertIn("验证预留 ${Math.max(0, reservedValidation).toFixed(1)}s", self.script)
+        self.assertIn("剩余 ${Math.max(0, remaining).toFixed(1)}s", self.script)
+        self.assertIn("阶段耗时 ${Math.max(0, stageElapsed).toFixed(1)}s", self.script)
+        self.assertIn("软预算 ${Math.max(0, softBudget).toFixed(1)}s", self.script)
 
     def test_patch_preview_shows_only_highlighted_candidate_source(self) -> None:
         self.assertIn('id="ai-patch-code"', self.html)

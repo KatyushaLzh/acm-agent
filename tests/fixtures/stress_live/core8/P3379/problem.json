@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "platform": "luogu",
+  "problem_id": "P3379",
+  "title": "Lowest Common Ancestor",
+  "statement_file": "statement.md",
+  "statement_sha256": "42641d573d96a2a36eca0c20da0719d4d8aa41ffc3723fed14710ae7ccb61557",
+  "primary_source_file": "primary.cpp",
+  "primary_source_sha256": "c6319f04715034bf67f36d0d9251f93eb0731591d4206ba3ba4dc91cc47e3bd0",
+  "samples": [{
+    "name": "benchmark-sample-1",
+    "input_file": "samples/1.in",
+    "input_sha256": "7e2b537dc1c8ad90e10fc5521a4827267279d87c6cf9e98fc2e12c3116896271",
+    "output_file": "samples/1.out",
+    "output_sha256": "57e50702eb22b4b06cac50993a5cb61dd3823023a76c735fd6925fa62fee0122"
+  }]
+}

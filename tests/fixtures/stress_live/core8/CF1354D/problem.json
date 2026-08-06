@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "platform": "codeforces",
+  "problem_id": "CF1354D",
+  "title": "Multiset",
+  "statement_file": "statement.md",
+  "statement_sha256": "415b1cbc85c4fd950a3f5e0b0d42563156fa343feb464d13d08a407497cec182",
+  "primary_source_file": "primary.cpp",
+  "primary_source_sha256": "238b20a5ca63d09a0d146f063fa132f4ecab22aa7cf445d2a5177dd4dc6d8994",
+  "samples": [{
+    "name": "benchmark-sample-1",
+    "input_file": "samples/1.in",
+    "input_sha256": "cb5812f08e1c6a1e88cb10398ec5a0b8a2ec2611120c65751ab791c5f40129c8",
+    "output_file": "samples/1.out",
+    "output_sha256": "1121cfccd5913f0a63fec40a6ffd44ea64f9dc135c66634ba001d10bcf4302a2"
+  }]
+}

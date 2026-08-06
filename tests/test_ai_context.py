@@ -17,6 +17,7 @@ from tools.acm_agent.ai_context import (
     content_sha256,
     extract_codeforces_statement,
     extract_luogu_statement,
+    extract_statement_samples,
     is_context_fresh,
     parse_problem_statement,
     revert_source_patch,
@@ -91,6 +92,57 @@ class ProblemStatementParsingTests(unittest.TestCase):
         self.assertIn("### 样例输入 1", statement)
         self.assertIn("1 2", statement)
         self.assertNotIn("DO NOT LEAK", statement)
+        self.assertEqual(
+            extract_statement_samples(statement),
+            [{"name": "sample1", "input": "1 2\n", "output": "3\n"}],
+        )
+
+    def test_luogu_keeps_parent_samples_with_longer_translation(self) -> None:
+        payload = {
+            "problem": {
+                "content": {
+                    "description": "短题面",
+                    "formatI": "输入",
+                    "formatO": "输出",
+                },
+                "samples": [["1 2\n", "3\n"]],
+            },
+            "translations": {
+                "en": {
+                    "description": "A substantially longer translated statement.",
+                    "formatI": "Read two integers from standard input.",
+                    "formatO": "Print their sum to standard output.",
+                }
+            },
+        }
+        statement = extract_luogu_statement(payload)
+        self.assertIn("substantially longer", statement)
+        self.assertEqual(
+            extract_statement_samples(statement),
+            [{"name": "sample1", "input": "1 2\n", "output": "3\n"}],
+        )
+
+    def test_structured_samples_require_explicit_paired_fences(self) -> None:
+        statement = """## Samples
+
+### Sample Input 2
+```text
+4 5
+```
+### Sample Output 2
+```text
+9
+```
+
+### Sample Input 3
+```cpp
+int main() {}
+```
+"""
+        self.assertEqual(
+            extract_statement_samples(statement),
+            [{"name": "sample2", "input": "4 5\n", "output": "9\n"}],
+        )
 
     def test_luogu_accepts_json_and_lentille_html_with_standard_fields(self) -> None:
         context = {

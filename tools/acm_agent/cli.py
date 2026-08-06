@@ -4,12 +4,20 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import time
 from typing import Any, Mapping, Sequence
 
 # Re-exported dependencies keep existing CLI monkey-patch integrations stable.
 from .platforms import CodeforcesClient, LuoguClient, sync_codeforces, sync_luogu
 from .service import AcmService, FAILURE_MODES, RESULTS
 from .verify import verify_problem
+
+
+def _stress_prepare_timeout(value: str) -> int:
+    seconds = int(value)
+    if not 60 <= seconds <= 1800:
+        raise argparse.ArgumentTypeError("准备耗时上限必须在 60..1800 秒之间")
+    return seconds
 
 
 def _service(paths: Any) -> AcmService:
@@ -175,8 +183,14 @@ def command_ai_settings(args: argparse.Namespace, paths: Any) -> int:
     payload = _service(paths).ai_settings(
         recommendation_model=args.recommend_model,
         coaching_model=args.coach_model,
+        summary_model=args.summary_model,
+        validation_model=args.validation_model,
         coaching_thinking=args.thinking,
         reasoning_effort=args.reasoning_effort,
+        summary_thinking=args.summary_thinking,
+        summary_reasoning_effort=args.summary_reasoning_effort,
+        validation_thinking=args.validation_thinking,
+        validation_reasoning_effort=args.validation_reasoning_effort,
     )
     _emit(payload, as_json=args.json, human="AI 设置已保存（API Key 未写入配置）。")
     return 0
@@ -243,6 +257,139 @@ def command_patch_revert(args: argparse.Namespace, paths: Any) -> int:
     return 0
 
 
+def _schema_file(path: Path | None) -> Mapping[str, Any] | None:
+    if path is None:
+        return None
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, Mapping):
+        raise ValueError("schema 文件必须是 JSON 对象")
+    return value
+
+
+def command_knowledge_templates(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).knowledge_templates()
+    rows = payload.get("templates", []) if isinstance(payload, Mapping) else payload
+    lines = [
+        f"{row.get('preset') or row.get('id')}  {row.get('name') or row.get('title') or ''}".rstrip()
+        for row in rows
+    ]
+    _emit(payload, as_json=args.json, human="\n".join(lines) or "暂无 Markdown 模板。")
+    return 0
+
+
+def command_knowledge_targets_list(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).knowledge_targets()
+    rows = payload.get("targets", []) if isinstance(payload, Mapping) else payload
+    lines = [
+        f"{row.get('target_id') or row.get('id')}  {row.get('name') or row.get('display_name') or ''}  {row.get('path') or ''}".rstrip()
+        for row in rows
+    ]
+    _emit(payload, as_json=args.json, human="\n".join(lines) or "尚未注册 Markdown 目标。")
+    return 0
+
+
+def command_knowledge_target_add(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).knowledge_target_create(
+        path=str(args.path),
+        name=args.name,
+        preset=args.preset,
+        schema_mode=args.schema_mode,
+        schema=_schema_file(args.schema_file),
+        allow_create=args.allow_create,
+    )
+    _emit(
+        payload,
+        as_json=args.json,
+        human=f"Markdown 目标已保存：{payload.get('name') or payload.get('target_id')}（未写入文件）",
+    )
+    return 0
+
+
+def command_knowledge_target_update(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).knowledge_target_update(
+        args.target_id,
+        name=args.name,
+        preset=args.preset,
+        schema_mode=args.schema_mode,
+        schema=_schema_file(args.schema_file),
+        enabled=args.enabled,
+        expected_revision=args.expected_revision,
+    )
+    _emit(payload, as_json=args.json, human=f"Markdown 目标已更新：{args.target_id}")
+    return 0
+
+
+def command_knowledge_target_remove(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).knowledge_target_delete(
+        args.target_id,
+        expected_revision=args.expected_revision,
+    )
+    _emit(payload, as_json=args.json, human=f"已取消注册 {args.target_id}；Markdown 文件未删除。")
+    return 0
+
+
+def command_knowledge_inspect(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).knowledge_target_inspect(
+        path=str(args.path),
+        allow_create=args.allow_create,
+        preset=args.preset,
+        schema_mode=args.schema_mode,
+        schema=_schema_file(args.schema_file),
+    )
+    _emit(
+        payload,
+        as_json=args.json,
+        human=(
+            f"路径检查通过：{payload.get('normalized_path') or payload.get('path')}\n"
+            f"Schema：{payload.get('schema_source') or payload.get('preset') or '已推断'}"
+        ),
+    )
+    return 0
+
+
+def command_knowledge_preview(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).knowledge_preview(
+        attempt_id=args.attempt_id,
+        target_id=args.target_id,
+        schema_mode=args.schema_mode,
+        preset=args.preset,
+        schema=_schema_file(args.schema_file),
+        model=args.model,
+    )
+    proposal = payload.get("proposal") if isinstance(payload.get("proposal"), dict) else payload
+    _emit(payload, as_json=args.json, human=proposal.get("entry_markdown") or "预览已生成；目标文件尚未修改。")
+    return 0
+
+
+def command_knowledge_refresh(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).knowledge_refresh(
+        args.proposal_id,
+        entry_markdown=args.entry_file.read_text(encoding="utf-8"),
+        expected_revision=args.expected_revision,
+    )
+    proposal = payload.get("proposal") if isinstance(payload.get("proposal"), dict) else payload
+    _emit(payload, as_json=args.json, human=proposal.get("entry_markdown") or "预览已刷新。")
+    return 0
+
+
+def command_knowledge_apply(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).knowledge_apply(
+        args.proposal_id,
+        expected_revision=args.expected_revision,
+    )
+    _emit(payload, as_json=args.json, human=f"Markdown 总结已写入：{args.proposal_id}")
+    return 0
+
+
+def command_knowledge_revert(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).knowledge_revert(
+        args.proposal_id,
+        expected_revision=args.expected_revision,
+    )
+    _emit(payload, as_json=args.json, human=f"Markdown 写入已回退：{args.proposal_id}")
+    return 0
+
+
 def command_start(args: argparse.Namespace, paths: Any) -> int:
     payload = _service(paths).start(args.problem, with_stress=args.with_stress)
     human = f"已开始 {payload['problem_id']}：{payload['source']}"
@@ -252,7 +399,70 @@ def command_start(args: argparse.Namespace, paths: Any) -> int:
     return 0
 
 
+def _wait_for_stress_cli(
+    service: AcmService,
+    run_id: str,
+    initial: Mapping[str, Any],
+    *,
+    as_json: bool,
+) -> int:
+    terminal = {
+        "stopped", "mismatch", "oracle_conflict", "fault",
+        "interrupted", "completed",
+    }
+    try:
+        while True:
+            current = service.stress_run(run_id)["run"]
+            if str(current.get("status") or "").casefold() in terminal:
+                break
+            time.sleep(0.25)
+    except KeyboardInterrupt:
+        service.stress_stop(run_id)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            current = service.stress_run(run_id)["run"]
+            if str(current.get("status") or "").casefold() in terminal:
+                break
+            time.sleep(0.1)
+        else:
+            service.shutdown()
+            current = service.stress_run(run_id)["run"]
+    final_payload = {**dict(initial), "run": current}
+    _emit(
+        final_payload,
+        as_json=as_json,
+        human=f"AI 持续对拍结束：{run_id} · {current.get('status', 'unknown')}",
+    )
+    return 3 if current.get("status") in {"mismatch", "oracle_conflict", "fault"} else 0
+
+
 def command_verify(args: argparse.Namespace, paths: Any) -> int:
+    if args.ai_stress:
+        service = _service(paths)
+        payload = service.ai_stress_start(
+            args.problem,
+            generate_generator=True,
+            generate_brute=True,
+            prepare_reference=True,
+            large_profile=not args.no_large,
+            compare="exact" if args.exact else "token",
+            timeout=args.timeout,
+            brute_timeout=5.0,
+            seed=args.seed,
+            preparation_timeout_seconds=args.prepare_timeout,
+            force_regenerate=args.force_regenerate,
+            cache_mode=args.cache_mode,
+            generation_mode=(
+                args.generation_mode.replace("-", "_")
+                if args.generation_mode is not None
+                else None
+            ),
+        )
+        run = payload.get("run", payload)
+        run_id = run.get("id") or run.get("run_id") or payload.get("run_id") or "unknown"
+        if not args.json:
+            print(f"AI 持续对拍已启动：{run_id}（Ctrl+C 安全停止）")
+        return _wait_for_stress_cli(service, run_id, payload, as_json=args.json)
     payload = _service(paths).verify(
         args.problem,
         exact=args.exact,
@@ -268,6 +478,39 @@ def command_verify(args: argparse.Namespace, paths: Any) -> int:
         human += f"；对拍资产：{payload['failure_dir']}"
     _emit(payload, as_json=args.json, human=human)
     return 0 if payload["passed"] else 3
+
+
+def command_stress_status(args: argparse.Namespace, paths: Any) -> int:
+    service = _service(paths)
+    payload = service.stress_run(args.run_id) if args.run_id else service.stress_runs()
+    _emit(payload, as_json=args.json, human=json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def command_stress_stop(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).stress_stop(args.run_id)
+    _emit(payload, as_json=args.json, human=f"已请求停止持续对拍：{args.run_id}")
+    return 0
+
+
+def command_stress_resume(args: argparse.Namespace, paths: Any) -> int:
+    service = _service(paths)
+    payload = service.stress_resume(args.run_id)
+    if not args.json:
+        print(f"已从保存的 seed 继续持续对拍：{args.run_id}（Ctrl+C 安全停止）")
+    return _wait_for_stress_cli(service, args.run_id, payload, as_json=args.json)
+
+
+def command_stress_artifacts(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).stress_bundle(args.bundle_id)
+    _emit(payload, as_json=args.json, human=json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def command_stress_revert(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).stress_bundle_revert(args.bundle_id)
+    _emit(payload, as_json=args.json, human=f"AI 对拍 helper 已回退：{args.bundle_id}")
+    return 0
 
 
 def _prompt_if_missing(value: Any, prompt: str, cast=lambda value: value) -> Any:
@@ -568,8 +811,14 @@ def build_parser() -> argparse.ArgumentParser:
     ai_settings = ai_sub.add_parser("settings")
     ai_settings.add_argument("--recommend-model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
     ai_settings.add_argument("--coach-model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
+    ai_settings.add_argument("--summary-model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
+    ai_settings.add_argument("--validation-model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
     ai_settings.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=None)
     ai_settings.add_argument("--reasoning-effort", choices=("high", "max"))
+    ai_settings.add_argument("--summary-thinking", action=argparse.BooleanOptionalAction, default=None)
+    ai_settings.add_argument("--summary-reasoning-effort", choices=("high", "max"))
+    ai_settings.add_argument("--validation-thinking", action=argparse.BooleanOptionalAction, default=None)
+    ai_settings.add_argument("--validation-reasoning-effort", choices=("high", "max"))
     ai_settings.add_argument("--json", action="store_true")
     ai_settings.set_defaults(handler=command_ai_settings)
 
@@ -619,6 +868,79 @@ def build_parser() -> argparse.ArgumentParser:
     patch_revert.add_argument("--json", action="store_true")
     patch_revert.set_defaults(handler=command_patch_revert)
 
+    knowledge = sub.add_parser("knowledge", help="预览并确认写入 Markdown 知识总结")
+    knowledge_sub = knowledge.add_subparsers(dest="knowledge_command", required=True)
+    knowledge_templates = knowledge_sub.add_parser("templates", help="列出内置脱敏模板")
+    knowledge_templates.add_argument("--json", action="store_true")
+    knowledge_templates.set_defaults(handler=command_knowledge_templates)
+
+    knowledge_targets = knowledge_sub.add_parser("targets", help="管理本机 Markdown 目标")
+    knowledge_targets.add_argument("--json", action="store_true")
+    knowledge_targets.set_defaults(handler=command_knowledge_targets_list)
+    knowledge_targets_sub = knowledge_targets.add_subparsers(dest="knowledge_targets_command")
+    knowledge_targets_list = knowledge_targets_sub.add_parser("list")
+    knowledge_targets_list.add_argument("--json", action="store_true")
+    knowledge_targets_list.set_defaults(handler=command_knowledge_targets_list)
+    knowledge_target_add = knowledge_targets_sub.add_parser("add")
+    knowledge_target_add.add_argument("path", type=Path)
+    knowledge_target_add.add_argument("--name")
+    knowledge_target_add.add_argument("--preset", choices=("algorithms-v1", "tricks-v1", "custom"))
+    knowledge_target_add.add_argument("--schema-mode", choices=("auto", "stored", "ai"), default="auto")
+    knowledge_target_add.add_argument("--schema-file", type=Path)
+    knowledge_target_add.add_argument("--allow-create", action="store_true", help="允许注册尚不存在的 .md；此命令不会创建文件")
+    knowledge_target_add.add_argument("--json", action="store_true")
+    knowledge_target_add.set_defaults(handler=command_knowledge_target_add)
+    knowledge_target_update = knowledge_targets_sub.add_parser("update")
+    knowledge_target_update.add_argument("target_id")
+    knowledge_target_update.add_argument("--name")
+    knowledge_target_update.add_argument("--preset", choices=("algorithms-v1", "tricks-v1", "custom"))
+    knowledge_target_update.add_argument("--schema-mode", choices=("auto", "stored", "ai"))
+    knowledge_target_update.add_argument("--schema-file", type=Path)
+    knowledge_target_update.add_argument("--enabled", action=argparse.BooleanOptionalAction, default=None)
+    knowledge_target_update.add_argument("--expected-revision", type=int, required=True)
+    knowledge_target_update.add_argument("--json", action="store_true")
+    knowledge_target_update.set_defaults(handler=command_knowledge_target_update)
+    knowledge_target_remove = knowledge_targets_sub.add_parser("remove")
+    knowledge_target_remove.add_argument("target_id")
+    knowledge_target_remove.add_argument("--expected-revision", type=int, required=True)
+    knowledge_target_remove.add_argument("--json", action="store_true")
+    knowledge_target_remove.set_defaults(handler=command_knowledge_target_remove)
+
+    knowledge_inspect = knowledge_sub.add_parser("inspect", help="只读检查 Markdown 路径与 schema")
+    knowledge_inspect.add_argument("path", type=Path)
+    knowledge_inspect.add_argument("--allow-create", action="store_true")
+    knowledge_inspect.add_argument("--preset", choices=("algorithms-v1", "tricks-v1", "custom"))
+    knowledge_inspect.add_argument("--schema-mode", choices=("auto", "stored", "ai"), default="auto")
+    knowledge_inspect.add_argument("--schema-file", type=Path)
+    knowledge_inspect.add_argument("--json", action="store_true")
+    knowledge_inspect.set_defaults(handler=command_knowledge_inspect)
+
+    knowledge_preview = knowledge_sub.add_parser("preview", help="调用 DeepSeek 生成持久化预览，不写文件")
+    knowledge_preview.add_argument("attempt_id", type=int)
+    knowledge_preview.add_argument("target_id")
+    knowledge_preview.add_argument("--schema-mode", choices=("auto", "stored", "ai"), default="stored")
+    knowledge_preview.add_argument("--preset", choices=("algorithms-v1", "tricks-v1", "custom"))
+    knowledge_preview.add_argument("--schema-file", type=Path)
+    knowledge_preview.add_argument("--model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
+    knowledge_preview.add_argument("--json", action="store_true")
+    knowledge_preview.set_defaults(handler=command_knowledge_preview)
+    knowledge_refresh = knowledge_sub.add_parser("refresh", help="用编辑后的条目刷新安全预览，不调用模型")
+    knowledge_refresh.add_argument("proposal_id")
+    knowledge_refresh.add_argument("--entry-file", type=Path, required=True)
+    knowledge_refresh.add_argument("--expected-revision", type=int, required=True)
+    knowledge_refresh.add_argument("--json", action="store_true")
+    knowledge_refresh.set_defaults(handler=command_knowledge_refresh)
+    knowledge_apply = knowledge_sub.add_parser("apply", help="确认写入最新预览")
+    knowledge_apply.add_argument("proposal_id")
+    knowledge_apply.add_argument("--expected-revision", type=int, required=True)
+    knowledge_apply.add_argument("--json", action="store_true")
+    knowledge_apply.set_defaults(handler=command_knowledge_apply)
+    knowledge_revert = knowledge_sub.add_parser("revert", help="在 hash 校验后回退写入")
+    knowledge_revert.add_argument("proposal_id")
+    knowledge_revert.add_argument("--expected-revision", type=int, required=True)
+    knowledge_revert.add_argument("--json", action="store_true")
+    knowledge_revert.set_defaults(handler=command_knowledge_revert)
+
     start = sub.add_parser("start", help="创建/复用今日代码并开启 session")
     start.add_argument("problem")
     start.add_argument("--with-stress", action="store_true")
@@ -632,8 +954,62 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--timeout", type=float, default=2.0)
     verify.add_argument("--stress-iterations", type=int, default=100)
     verify.add_argument("--seed", type=int)
+    verify.add_argument(
+        "--ai-stress",
+        action="store_true",
+        help="显式调用 DeepSeek 准备 helper，并启动持续分层对拍",
+    )
+    verify.add_argument(
+        "--no-large",
+        action="store_true",
+        help="AI 持续对拍只运行可人工验证的小数据，不运行极限大数据",
+    )
+    verify.add_argument(
+        "--prepare-timeout",
+        type=_stress_prepare_timeout,
+        metavar="SECONDS",
+        help="AI helper 准备总耗时上限（60..1800 秒，默认读取配置）",
+    )
+    verify.add_argument(
+        "--force-regenerate",
+        action="store_true",
+        help="兼容选项：等价于 --cache-mode cold",
+    )
+    verify.add_argument(
+        "--cache-mode",
+        choices=("reuse", "refresh_helpers", "cold"),
+        help="准备缓存策略（默认 reuse；cold 绕过所有本地读取）",
+    )
+    verify.add_argument(
+        "--generation-mode",
+        choices=("fast", "hybrid", "full-thinking"),
+        help="helper 生成策略（默认读取配置；full-thinking 映射为 full_thinking）",
+    )
     verify.add_argument("--json", action="store_true")
     verify.set_defaults(handler=command_verify)
+
+    stress = sub.add_parser("stress", help="查看和控制 AI 持续对拍")
+    stress_sub = stress.add_subparsers(dest="stress_command", required=True)
+    stress_status = stress_sub.add_parser("status", help="查看全部或指定持续对拍")
+    stress_status.add_argument("run_id", nargs="?")
+    stress_status.add_argument("--json", action="store_true")
+    stress_status.set_defaults(handler=command_stress_status)
+    stress_stop = stress_sub.add_parser("stop", help="停止持续对拍")
+    stress_stop.add_argument("run_id")
+    stress_stop.add_argument("--json", action="store_true")
+    stress_stop.set_defaults(handler=command_stress_stop)
+    stress_resume = stress_sub.add_parser("resume", help="从保存的 seed 继续对拍")
+    stress_resume.add_argument("run_id")
+    stress_resume.add_argument("--json", action="store_true")
+    stress_resume.set_defaults(handler=command_stress_resume)
+    stress_artifacts = stress_sub.add_parser("artifacts", help="查看 helper 与来源")
+    stress_artifacts.add_argument("bundle_id")
+    stress_artifacts.add_argument("--json", action="store_true")
+    stress_artifacts.set_defaults(handler=command_stress_artifacts)
+    stress_revert = stress_sub.add_parser("revert", help="按 hash 校验回退 helper bundle")
+    stress_revert.add_argument("bundle_id")
+    stress_revert.add_argument("--json", action="store_true")
+    stress_revert.set_defaults(handler=command_stress_revert)
 
     close = sub.add_parser("close", help="结束 session 并记录复盘")
     close.add_argument("problem")
