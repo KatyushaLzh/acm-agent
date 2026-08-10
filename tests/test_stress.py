@@ -88,6 +88,12 @@ def generator_manifest(
 SMALL_INPUT_LADDER = [str(SMALL_INPUT_INITIAL_BYTES), str(SMALL_INPUT_CEILING_BYTES)]
 
 
+def executable_label(path: str | Path) -> str:
+    """Keep role suffixes such as ``.audit`` on every host platform."""
+    name = Path(path).name
+    return name[:-4] if name.casefold().endswith(".exe") else name
+
+
 class SmallInputSizingRecorder:
     """Sandbox handler that records the small-input byte budget per run.
 
@@ -652,7 +658,7 @@ class HelperBundleTests(unittest.TestCase):
         observed: list[tuple[str, str, int]] = []
 
         def handler(argv, input_data, env, limits):
-            stem = Path(argv[0]).stem
+            stem = executable_label(argv[0])
             if stem == "sanitizer-probe":
                 return SandboxProcessResult(argv, 127, stderr=b"sanitizer unavailable")
             if stem.startswith("generator"):
@@ -720,7 +726,7 @@ class HelperBundleTests(unittest.TestCase):
 
     def test_official_sample_reference_mismatch_carries_only_role_witness(self) -> None:
         def handler(argv, input_data, env, limits):
-            stem = Path(argv[0]).stem
+            stem = executable_label(argv[0])
             if stem == "sanitizer-probe":
                 return SandboxProcessResult(argv, 127, stderr=b"sanitizer unavailable")
             if stem.startswith("generator") and argv[1:] == ["--capabilities"]:
@@ -768,7 +774,7 @@ class HelperBundleTests(unittest.TestCase):
 
     def test_official_sample_reference_timeout_carries_repair_witness(self) -> None:
         def handler(argv, input_data, env, limits):
-            stem = Path(argv[0]).stem
+            stem = executable_label(argv[0])
             if stem == "sanitizer-probe":
                 return SandboxProcessResult(argv, 127, stderr=b"unavailable")
             if stem == "reference_primary.audit":
@@ -1198,7 +1204,7 @@ class HelperBundleTests(unittest.TestCase):
 
     def test_preflight_rejects_generator_that_ignores_random_seed(self) -> None:
         def handler(argv, input_data, env, limits):
-            stem = Path(argv[0]).stem
+            stem = executable_label(argv[0])
             if stem == "sanitizer-probe":
                 return SandboxProcessResult(argv, 127, stderr=b"sanitizer unavailable")
             if stem.startswith("generator"):
@@ -1235,7 +1241,7 @@ class HelperBundleTests(unittest.TestCase):
         first_random_seed: list[int] = []
 
         def handler(argv, input_data, env, limits):
-            stem = Path(argv[0]).stem
+            stem = executable_label(argv[0])
             if stem == "sanitizer-probe":
                 return SandboxProcessResult(argv, 127, stderr=b"unavailable")
             if stem.startswith("generator"):
@@ -1620,7 +1626,7 @@ int main(int argc,char**argv){
 }'''
 
         def handler(argv, input_data, env, limits):
-            stem = Path(argv[0]).stem
+            stem = executable_label(argv[0])
             if stem == "sanitizer-probe":
                 return SandboxProcessResult(argv, 127, stderr=b"sanitizer unavailable")
             if stem.startswith("generator") and argv[1:] == ["--capabilities"]:
@@ -1660,7 +1666,7 @@ int main(int argc,char**argv){
 
     def test_illegal_insert_is_rejected_when_debug_brute_aborts(self) -> None:
         def handler(argv, input_data, env, limits):
-            stem = Path(argv[0]).stem
+            stem = executable_label(argv[0])
             if stem == "sanitizer-probe":
                 return SandboxProcessResult(argv, 127, stderr=b"sanitizer unavailable")
             if stem.startswith("generator") and argv[1:] == ["--capabilities"]:

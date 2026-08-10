@@ -1215,15 +1215,44 @@ def _is_link_or_reparse(path: Path) -> bool:
     return path.is_symlink() or bool(attributes & reparse_flag)
 
 
+def _canonical_path_text(path: str | Path) -> str:
+    """Return a comparison key that also normalizes Windows 8.3 aliases."""
+    return os.path.normcase(os.path.realpath(os.fspath(path)))
+
+
+def _path_is_within(path: str | Path, root: str | Path) -> bool:
+    candidate = _canonical_path_text(path)
+    boundary = _canonical_path_text(root)
+    try:
+        return os.path.commonpath((candidate, boundary)) == boundary
+    except ValueError:
+        return False
+
+
 def _reject_link_components(path: Path, root: Path) -> None:
     """Reject symlinks and Windows junctions below the trusted workspace root."""
     absolute = path.absolute()
     root_absolute = root.absolute()
+    boundary = root_absolute
     try:
-        relative = absolute.relative_to(root_absolute)
-    except ValueError as exc:
-        raise ValueError("path escapes workspace") from exc
-    current = root_absolute
+        relative = absolute.relative_to(boundary)
+    except ValueError:
+        boundary = next(
+            (
+                ancestor
+                for ancestor in (absolute, *absolute.parents)
+                if not _is_link_or_reparse(ancestor)
+                and ancestor.exists()
+                and root_absolute.exists()
+                and ancestor.samefile(root_absolute)
+            ),
+            None,
+        )
+        if boundary is None:
+            raise ValueError("path escapes workspace")
+        relative = absolute.relative_to(boundary)
+
+    current = boundary
     for part in relative.parts:
         current /= part
         if _is_link_or_reparse(current):
@@ -1667,7 +1696,7 @@ class HelperBundleManager:
         primary = requested_primary.resolve()
         if not primary.is_file() or primary.suffix.lower() != ".cpp":
             raise ValueError("primary source must be an existing .cpp file")
-        if not primary.is_relative_to(self.root) or primary.is_symlink():
+        if not _path_is_within(primary, self.root) or primary.is_symlink():
             raise ValueError("primary source must be a non-symlink inside workspace")
         if primary.stem.endswith((".gen", ".bf", ".ref", ".ref1", ".ref2")):
             raise ValueError("primary source cannot be a stress helper")

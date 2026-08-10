@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -193,7 +194,11 @@ class VerifyTests(unittest.TestCase):
             token_result = verify_problem(root, "CF1A")
             self.assertTrue(token_result.passed, token_result.to_dict())
             self.assertTrue(token_result.cases[0].passed)
-            self.assertTrue(Path(token_result.compile_command[-1]).is_relative_to(root / ".acm" / "build"))
+            build = os.path.normcase(os.path.realpath(root / ".acm" / "build"))
+            executable = os.path.normcase(
+                os.path.realpath(token_result.compile_command[-1])
+            )
+            self.assertEqual(os.path.commonpath((executable, build)), build)
 
             exact_result = verify_problem(root, "CF1A", exact=True)
             self.assertFalse(exact_result.passed)
@@ -228,7 +233,9 @@ class VerifyTests(unittest.TestCase):
             self.assertEqual(result.stress_iterations, 1)
             self.assertIsNotNone(result.failure_dir)
             failure = Path(result.failure_dir or "")
-            self.assertTrue(failure.is_relative_to(root / ".acm" / "failures"))
+            failures = os.path.normcase(os.path.realpath(root / ".acm" / "failures"))
+            failure_path = os.path.normcase(os.path.realpath(failure))
+            self.assertEqual(os.path.commonpath((failure_path, failures)), failures)
             self.assertEqual((failure / "input.txt").read_text(), "1\n")
             self.assertEqual((failure / "actual.txt").read_text().strip(), "0")
             self.assertEqual((failure / "expected.txt").read_text().strip(), "1")

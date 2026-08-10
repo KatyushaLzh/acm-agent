@@ -1796,6 +1796,7 @@ class StressRuntimeTests(unittest.TestCase):
                 model_settings=model_settings,
                 include_validator=False,
                 seed=201,
+                run_max_cases=0,
             )
             self.assertFalse(ordinary["run"]["validator_requested"])
             self.assertFalse(ordinary["run"]["validator_certified"])
@@ -1803,6 +1804,15 @@ class StressRuntimeTests(unittest.TestCase):
                 "validator",
                 {item["kind"] for item in ordinary["bundle"]["artifacts"]},
             )
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                current = coordinator.run(ordinary["run"]["id"])
+                if current["status"] not in {
+                    "pending", "preparing", "running", "stop_requested"
+                }:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(current["status"], "completed")
 
             ordinary_meta = ordinary["bundle"]["preparation_meta"]
             strict_key, strict_identity = coordinator._preparation_cache_identity(
@@ -1846,6 +1856,7 @@ class StressRuntimeTests(unittest.TestCase):
                 model_settings=model_settings,
                 include_validator=False,
                 seed=202,
+                run_max_cases=0,
             )
             self.assertEqual(warm["preparation"]["cache_result"], "bundle_hit")
             self.assertEqual(warm["bundle"]["id"], ordinary["bundle"]["id"])
