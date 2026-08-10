@@ -118,7 +118,7 @@ Agent 在网页服务未运行时可使用同一事务流程：
 
 preview JSON 会携带题单和全局覆盖两个修订号，CLI apply 会自动读取并校验。平台没有公开标签且用户明确要求补充时，仓库 `acm-workflow` skill 允许 Agent 只读取题面和元数据来生成专题标签，再通过上述 apply/API 写回托管题单；不得直接修改内置题单源文件。标签只描述题目专题，不代表 AC。
 
-`close` 始终先独立保存 attempt，不会自动修改知识库。“结束与复盘”可显式启用 DeepSeek Markdown 总结：发行树根目录的脱敏 `algorithms.md`、`tricks.md` 示例模板会以固定 schema 自动成为已保存目标，其他 `.md` 可推断或自定义 schema。Dashboard 只显示可编辑 Markdown 与安全渲染预览，不展示 unified diff；确认 apply 前目标保持零修改。若 `Source` 题号完全相同，服务只把对应旧条目发送给 DeepSeek，与本次知识语义合并；标题相似但题号不同则新增条目。服务端继续以 proposal revision、基线哈希、备份、原子替换和 hash-guarded revert 保护写入。
+`close` 始终先独立保存 attempt，不会自动修改知识库。“结束与复盘”可显式启用 DeepSeek Markdown 总结：发行树根目录经维护者授权公开的 `algorithms.md`、`tricks.md` 题目知识记录会以固定 schema 自动成为已保存目标，其他 `.md` 可推断或自定义 schema。Dashboard 只显示可编辑 Markdown 与安全渲染预览，不展示 unified diff；确认 apply 前目标保持零修改。若 `Source` 题号完全相同，服务只把对应旧条目发送给 DeepSeek，与本次知识语义合并；标题相似但题号不同则新增条目。服务端继续以 proposal revision、基线哈希、备份、原子替换和 hash-guarded revert 保护写入。
 
 ## 开发验证
 
