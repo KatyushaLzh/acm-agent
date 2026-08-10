@@ -15,7 +15,6 @@ from pathlib import Path
 import stat
 import tempfile
 import threading
-from typing import Any
 
 from .knowledge import (
     KnowledgeError,

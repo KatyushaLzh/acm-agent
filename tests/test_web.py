@@ -3,27 +3,34 @@ from __future__ import annotations
 import http.client
 import json
 from pathlib import Path
+import re
 import tempfile
 import threading
 import time
 import unittest
 
-from tools.acm_agent.web import JobManager, create_server, find_existing_instance
-from tools.acm_agent.storage import TagOverrideRevisionConflict
+from tools.acm_agent.web import (
+    ApiProblem,
+    FileDialogUnavailable,
+    JobManager,
+    _problem_from_exception,
+    _split_host_header,
+    _valid_host,
+    create_server,
+    find_existing_instance,
+)
+from tools.acm_agent.storage import PlanRevisionConflict, TagOverrideRevisionConflict
+from tools.acm_agent.storage_common import (
+    StressArtifactCandidateConflict,
+    StressArtifactProofConflict,
+    StressBundleCertificationConflict,
+    StressPreparationCacheConflict,
+    StressSetupSlotConflict,
+)
+from tools.acm_agent.stress_ai_core import StressPreparationError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
-class RevisionConflict(Exception):
-    pass
-
-
-class StressPreparationError(RuntimeError):
-    def __init__(self, code: str, message: str, **details: object) -> None:
-        super().__init__(message)
-        self.code = code
-        self.details = details
 
 
 class FakeService:
@@ -129,6 +136,9 @@ class FakeService:
     def plan_template(self, **values: object) -> dict[str, object]:
         return self._return("plan_template", values)
 
+    def workspace_template(self, **values: object) -> dict[str, object]:
+        return self._return("workspace_template", values)
+
     def plan_revisions(self, **values: object) -> dict[str, object]:
         return self._return("plan_revisions", values)
 
@@ -140,7 +150,7 @@ class FakeService:
 
     def plan_edit(self, **values: object) -> dict[str, object]:
         if values.get("conflict"):
-            raise RevisionConflict("expected revision 2, current revision is 3")
+            raise PlanRevisionConflict("fixture", 2, 3)
         return self._return("plan_edit", values)
 
     def plan_state(self, **values: object) -> dict[str, object]:
@@ -198,25 +208,27 @@ class FakeService:
             raise StressPreparationError(
                 "stress_artifact_stage_failed",
                 '一个或多个 helper 准备失败: {"secret":"RAW_TOP_LEVEL_MUST_NOT_LEAK"}',
-                primary_failure={
-                    "role": "generator",
-                    "substage": "blueprint",
-                    "path": "cases[2].coverage_tags",
-                    "attempts": 2,
-                    "message": "generator blueprint coverage 未闭合",
-                    "blueprint": {"raw": "RAW_BLUEPRINT_MUST_NOT_LEAK"},
-                    "reasoning": "RAW_REASONING_MUST_NOT_LEAK",
-                    "secret": "TOP_SECRET_MUST_NOT_LEAK",
-                },
-                roles={
-                    "generator": {
-                        "stage": "prepare_generator",
+                details={
+                    "primary_failure": {
                         "role": "generator",
                         "substage": "blueprint",
                         "path": "cases[2].coverage_tags",
                         "attempts": 2,
                         "message": "generator blueprint coverage 未闭合",
-                    }
+                        "blueprint": {"raw": "RAW_BLUEPRINT_MUST_NOT_LEAK"},
+                        "reasoning": "RAW_REASONING_MUST_NOT_LEAK",
+                        "secret": "TOP_SECRET_MUST_NOT_LEAK",
+                    },
+                    "roles": {
+                        "generator": {
+                            "stage": "prepare_generator",
+                            "role": "generator",
+                            "substage": "blueprint",
+                            "path": "cases[2].coverage_tags",
+                            "attempts": 2,
+                            "message": "generator blueprint coverage 未闭合",
+                        }
+                    },
                 },
             )
         for step, (stage, label) in enumerate(
@@ -238,10 +250,12 @@ class FakeService:
                 raise StressPreparationError(
                     "stress_preflight_failed",
                     "brute 调试版本触发越界断言",
-                    artifact="brute",
-                    profile="small",
-                    case_kind="random",
-                    seed=2596,
+                    details={
+                        "artifact": "brute",
+                        "profile": "small",
+                        "case_kind": "random",
+                        "seed": 2596,
+                    },
                 )
         values["progress_callback_injected"] = True
         return self._return("ai_stress_start", values)
@@ -281,6 +295,13 @@ class WebServerTest(unittest.TestCase):
         for suffix in ("woff2", "woff", "ttf"):
             (font_dir / f"fixture.{suffix}").write_bytes(b"font-fixture")
         self.service = FakeService()
+        self.file_picker_result: str | Path | None = None
+        self.file_picker_calls: list[tuple[str, Path]] = []
+
+        def file_picker(kind: str, initial_dir: Path) -> str | Path | None:
+            self.file_picker_calls.append((kind, initial_dir))
+            return self.file_picker_result
+
         self.server = create_server(
             self.root,
             service=self.service,
@@ -289,6 +310,7 @@ class WebServerTest(unittest.TestCase):
             token="test-token",
             static_dir=self.static,
             max_request_bytes=512,
+            file_picker=file_picker,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -384,6 +406,146 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(payload["error"]["code"], "unauthorized")
 
+    def test_local_file_picker_selects_cpp_and_markdown_or_cancels(self) -> None:
+        with tempfile.TemporaryDirectory() as external_directory:
+            cpp_path = Path(external_directory) / "reference.cpp"
+            cpp_path.write_text("int main() {}\n", encoding="utf-8")
+            self.file_picker_result = cpp_path
+            status, payload, _ = self.request(
+                "POST", "/api/local-files/pick", payload={"kind": "cpp"}
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                payload["data"],
+                {
+                    "cancelled": False,
+                    "path": str(cpp_path),
+                    "name": "reference.cpp",
+                },
+            )
+            self.assertEqual(self.file_picker_calls[-1], ("cpp", self.root.resolve()))
+
+            markdown_path = Path(external_directory) / "new-notes.md"
+            self.file_picker_result = markdown_path
+            status, payload, _ = self.request(
+                "POST", "/api/local-files/pick", payload={"kind": "markdown"}
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                payload["data"],
+                {
+                    "cancelled": False,
+                    "path": str(markdown_path),
+                    "name": "new-notes.md",
+                },
+            )
+            self.assertFalse(markdown_path.exists())
+
+        self.file_picker_result = None
+        status, payload, _ = self.request(
+            "POST", "/api/local-files/pick", payload={"kind": "cpp"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"], {"cancelled": True})
+
+    def test_local_file_picker_inherits_auth_and_validates_request(self) -> None:
+        status, payload, _ = self.request(
+            "POST",
+            "/api/local-files/pick",
+            payload={"kind": "cpp"},
+            token=None,
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(payload["error"]["code"], "unauthorized")
+        self.assertEqual(self.file_picker_calls, [])
+
+        for request_payload in ({}, {"kind": "txt"}, {"kind": "cpp", "extra": True}):
+            with self.subTest(payload=request_payload):
+                status, payload, _ = self.request(
+                    "POST", "/api/local-files/pick", payload=request_payload
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(payload["error"]["code"], "invalid_request")
+
+    def test_local_file_picker_reports_busy_and_unavailable(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_picker(kind: str, initial_dir: Path) -> None:
+            entered.set()
+            release.wait(timeout=2)
+            return None
+
+        self.server.file_picker = blocking_picker
+        first_response: list[tuple[int, dict[str, object], dict[str, str]]] = []
+        first_thread = threading.Thread(
+            target=lambda: first_response.append(
+                self.request("POST", "/api/local-files/pick", payload={"kind": "cpp"})
+            ),
+            daemon=True,
+        )
+        first_thread.start()
+        self.assertTrue(entered.wait(timeout=1))
+        status, payload, _ = self.request(
+            "POST", "/api/local-files/pick", payload={"kind": "markdown"}
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"]["code"], "file_dialog_busy")
+        release.set()
+        first_thread.join(timeout=2)
+        self.assertEqual(first_response[0][0], 200)
+        self.assertEqual(first_response[0][1]["data"], {"cancelled": True})
+
+        def unavailable_picker(kind: str, initial_dir: Path) -> None:
+            raise FileDialogUnavailable("fixture desktop unavailable")
+
+        self.server.file_picker = unavailable_picker
+        status, payload, _ = self.request(
+            "POST", "/api/local-files/pick", payload={"kind": "cpp"}
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["error"]["code"], "file_dialog_unavailable")
+
+    def test_local_file_picker_rejects_unsafe_or_invalid_returned_paths(self) -> None:
+        invalid_paths: list[tuple[str, str | Path]] = [
+            ("cpp", "relative.cpp"),
+            ("cpp", r"\\server\share\reference.cpp"),
+            ("cpp", self.root / "missing.cpp"),
+            ("cpp", self.root / "wrong.txt"),
+            ("markdown", self.root / "wrong.txt"),
+            ("markdown", self.root / "missing-parent" / "notes.md"),
+        ]
+        cpp_directory = self.root / "directory.cpp"
+        cpp_directory.mkdir()
+        invalid_paths.append(("cpp", cpp_directory))
+        md_directory = self.root / "directory.md"
+        md_directory.mkdir()
+        invalid_paths.append(("markdown", md_directory))
+
+        for kind, returned_path in invalid_paths:
+            with self.subTest(kind=kind, path=str(returned_path)):
+                self.server.file_picker = lambda _kind, _root, value=returned_path: value
+                status, payload, _ = self.request(
+                    "POST", "/api/local-files/pick", payload={"kind": kind}
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(payload["error"]["code"], "invalid_file_selection")
+
+        real_cpp = self.root / "real.cpp"
+        real_cpp.write_text("int main() {}\n", encoding="utf-8")
+        symlink_cpp = self.root / "symlink.cpp"
+        try:
+            symlink_cpp.symlink_to(real_cpp)
+        except OSError:
+            pass
+        else:
+            self.server.file_picker = lambda _kind, _root: symlink_cpp
+            status, payload, _ = self.request(
+                "POST", "/api/local-files/pick", payload={"kind": "cpp"}
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"]["code"], "invalid_file_selection")
+
     def test_sync_job_succeeds_and_failure_is_reported(self) -> None:
         status, payload, _ = self.request("POST", "/api/jobs/sync", payload={"platform": "all"})
         self.assertEqual(status, 202)
@@ -476,6 +638,10 @@ class WebServerTest(unittest.TestCase):
             "generate_brute": True,
             "prepare_reference": True,
             "large_profile": True,
+            "include_validator": True,
+            "allow_validator_degradation": False,
+            "unvalidated_large": False,
+            "minimal_verification": False,
             "compare": "token",
             "generation_mode": "full_thinking",
             "progress_callback": "client-must-not-control-callback",
@@ -486,6 +652,10 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(job["result"]["operation"], "ai_stress_start")
         self.assertEqual(job["result"]["problem"], "CF1A")
         self.assertTrue(job["result"]["large_profile"])
+        self.assertTrue(job["result"]["include_validator"])
+        self.assertFalse(job["result"]["allow_validator_degradation"])
+        self.assertFalse(job["result"]["unvalidated_large"])
+        self.assertFalse(job["result"]["minimal_verification"])
         self.assertEqual(job["result"]["generation_mode"], "full_thinking")
         self.assertTrue(job["result"]["progress_callback_injected"])
         self.assertEqual(
@@ -498,6 +668,27 @@ class WebServerTest(unittest.TestCase):
                 "updated_at": job["progress"]["updated_at"],
             },
         )
+
+        status, payload, _ = self.request(
+            "POST",
+            "/api/jobs/ai/stress/start",
+            payload={
+                "problem": "CF1A",
+                "generate_generator": True,
+                "prepare_reference_primary": True,
+                "prepare_reference_secondary": True,
+                "large_profile": True,
+                "include_validator": False,
+                "minimal_verification": True,
+                "unvalidated_large": True,
+            },
+        )
+        self.assertEqual(status, 202)
+        minimal_job = self.wait_for_job(payload["data"]["job_id"])
+        self.assertTrue(minimal_job["result"]["minimal_verification"])
+        self.assertTrue(minimal_job["result"]["large_profile"])
+        self.assertFalse(minimal_job["result"]["include_validator"])
+        self.assertTrue(minimal_job["result"]["unvalidated_large"])
 
         failed_payload = {**stress_payload, "fail_preflight": True}
         status, payload, _ = self.request(
@@ -588,6 +779,42 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(payload["error"]["code"], "invalid_request")
 
+    def test_ai_stress_has_no_interactive_wait_or_callback_injection(self) -> None:
+        status, payload, _ = self.request(
+            "POST",
+            "/api/jobs/ai/stress/start",
+            payload={
+                "problem": "CF1A",
+                "generate_generator": True,
+            },
+        )
+        self.assertEqual(status, 202)
+        job = self.wait_for_job(payload["data"]["job_id"])
+        self.assertEqual(job["status"], "succeeded")
+        self.assertNotIn("waiting", job)
+        self.assertNotIn("user_hint_provider", job["result"])
+        self.assertNotIn("contract_reviewer", job["result"])
+
+    def test_ai_stress_rejects_removed_fields_and_endpoints(self) -> None:
+        for field in ("review_contract", "no_hints"):
+            with self.subTest(field=field):
+                status, response, _ = self.request(
+                    "POST",
+                    "/api/jobs/ai/stress/start",
+                    payload={"problem": "CF1A", field: True},
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(response["error"]["code"], "invalid_request")
+                self.assertIn(field, response["error"]["message"])
+
+        for suffix in ("hint", "contract-review", "cancel"):
+            with self.subTest(suffix=suffix):
+                status, response, _ = self.request(
+                    "POST", f"/api/jobs/ai/stress/fixture/{suffix}", payload={}
+                )
+                self.assertEqual(status, 405)
+                self.assertEqual(response["error"]["code"], "method_not_allowed")
+
     def test_synchronous_routes_forward_json_objects(self) -> None:
         routes = {
             "/api/setup": "setup",
@@ -651,6 +878,11 @@ class WebServerTest(unittest.TestCase):
                         "WA",
                     )
 
+    def test_workspace_template_get_route(self) -> None:
+        status, payload, _ = self.request("GET", "/api/workspace/template")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["operation"], "workspace_template")
+
     def test_plan_revision_conflict_is_http_409(self) -> None:
         status, payload, _ = self.request(
             "POST", "/api/plans/edit", payload={"conflict": True}
@@ -699,6 +931,42 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(payload["error"]["code"], "invalid_origin")
 
+    def test_malformed_credentials_answer_instead_of_dropping_the_connection(self) -> None:
+        # http.server decodes headers as latin-1, so a client can put any byte
+        # >0x7F into a header value.  Both guards below used to raise out of
+        # _authorize() -- which only catches ApiProblem -- and out of the
+        # handler entirely, so the client saw a dropped connection with no
+        # HTTP response rather than a refusal.  The Host guard runs before the
+        # token check, so that path was reachable unauthenticated.
+        status, payload, _ = self.request("GET", "/api/bootstrap", token="tokén")
+        self.assertEqual(status, 401)
+        self.assertEqual(payload["error"]["code"], "unauthorized")
+
+        for port_text in ("²", "³", "¹"):
+            with self.subTest(port=port_text):
+                status, payload, _ = self.request(
+                    "GET",
+                    "/api/bootstrap",
+                    headers={"Host": f"127.0.0.1:{port_text}"},
+                )
+                self.assertEqual(status, 403)
+                self.assertEqual(payload["error"]["code"], "invalid_host")
+
+        # The server still answers normally afterwards: the malformed requests
+        # must not have killed the listener or wedged the handler thread.
+        status, payload, _ = self.request("GET", "/api/bootstrap")
+        self.assertEqual(status, 200)
+
+    def test_host_port_accepts_only_ascii_digits(self) -> None:
+        # str.isdigit() is True for latin-1 superscripts that int() rejects, so
+        # guarding int() with isdigit() alone still raised ValueError.
+        self.assertEqual(_split_host_header("127.0.0.1:8765"), ("127.0.0.1", 8765))
+        self.assertEqual(_split_host_header("[::1]:8765"), ("::1", 8765))
+        for hostile in ("127.0.0.1:²", "[::1]:³", "127.0.0.1:¹"):
+            with self.subTest(host=hostile):
+                self.assertEqual(_split_host_header(hostile), ("", None))
+                self.assertFalse(_valid_host(hostile, 8765))
+
     def test_json_content_type_shape_and_size_are_validated(self) -> None:
         status, payload, _ = self.request(
             "POST",
@@ -730,6 +998,18 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(status, 405)
         self.assertEqual(payload["error"]["code"], "method_not_allowed")
 
+        for path in (
+            "/api/knowledge/proposals/proposal-1/refresh",
+            "/api/jobs/knowledge/proposals/proposal-1/apply",
+            "/api/jobs/stress/bundles/bundle-1/revert",
+            "/api/stress/runs/run-1/stop",
+            "/api/ai/conversations/conv-1/messages",
+        ):
+            with self.subTest(path=path):
+                status, response, _ = self.request("GET", path)
+                self.assertEqual(status, 405)
+                self.assertEqual(response["error"]["code"], "method_not_allowed")
+
     def test_runtime_discovery_and_shutdown(self) -> None:
         runtime = find_existing_instance(self.root)
         self.assertIsNotNone(runtime)
@@ -743,6 +1023,32 @@ class WebServerTest(unittest.TestCase):
 
 
 class JobManagerTest(unittest.TestCase):
+    def test_stress_persistence_conflicts_have_typed_http_409_mapping(self) -> None:
+        cases = (
+            (StressSetupSlotConflict("run-2", "run-1"), "stress_setup_active"),
+            (
+                StressPreparationCacheConflict("cache-key"),
+                "stress_preparation_cache_conflict",
+            ),
+            (
+                StressArtifactCandidateConflict("candidate-id"),
+                "stress_artifact_candidate_conflict",
+            ),
+            (
+                StressArtifactProofConflict("proof-key"),
+                "stress_artifact_proof_conflict",
+            ),
+            (
+                StressBundleCertificationConflict("cert-key"),
+                "stress_bundle_certification_conflict",
+            ),
+        )
+        for error, code in cases:
+            with self.subTest(code=code):
+                problem = _problem_from_exception(error)
+                self.assertEqual(problem.status, 409)
+                self.assertEqual(problem.code, code)
+
     def test_jobs_execute_serially(self) -> None:
         manager = JobManager(threading.RLock(), capacity=10)
         running = 0
@@ -771,15 +1077,42 @@ class JobManagerTest(unittest.TestCase):
 
     def test_registry_is_bounded(self) -> None:
         manager = JobManager(threading.RLock(), capacity=2)
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_work() -> dict[str, int]:
+            started.set()
+            release.wait(timeout=2)
+            return {"n": 1}
+
         try:
-            first = manager.submit("one", lambda: {"n": 1})
+            first = manager.submit("one", blocking_work)
+            self.assertTrue(started.wait(timeout=1))
             second = manager.submit("two", lambda: {"n": 2})
+            with self.assertRaises(ApiProblem) as raised:
+                manager.submit("three", lambda: {"n": 3})
+            self.assertEqual(raised.exception.status, 503)
+            self.assertEqual(raised.exception.code, "job_capacity_exhausted")
+            self.assertIsNotNone(manager.get(first["job_id"]))
+            self.assertIsNotNone(manager.get(second["job_id"]))
+
+            release.set()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if manager.get(second["job_id"])["status"] == "succeeded":
+                    break
+                time.sleep(0.01)
             third = manager.submit("three", lambda: {"n": 3})
-            manager.close(wait=True)
-            records = [manager.get(item["job_id"]) for item in (first, second, third)]
-            self.assertLessEqual(sum(record is not None for record in records), 2)
-            self.assertIsNotNone(records[-1])
+            self.assertIsNotNone(manager.get(third["job_id"]))
+            self.assertLessEqual(
+                sum(
+                    manager.get(item["job_id"]) is not None
+                    for item in (first, second, third)
+                ),
+                2,
+            )
         finally:
+            release.set()
             # close() is idempotent for ThreadPoolExecutor.
             manager.close(wait=True)
 
@@ -811,17 +1144,61 @@ class JobManagerTest(unittest.TestCase):
         finally:
             manager.close(wait=True)
 
+    def test_strict_validator_failure_hides_diagnostics(self) -> None:
+        manager = JobManager(threading.RLock(), capacity=10)
+
+        def work():
+            raise StressPreparationError(
+                "stress_validator_positive_probe_failed",
+                "hidden probe rejected seed 42",
+                details={
+                    "validator_strict_certification_failed": True,
+                    "artifact": "validator",
+                    "profile": "contract_probe",
+                    "seed": 42,
+                    "roles": {"validator": {"message": "hidden diagnostic"}},
+                },
+            )
+
+        try:
+            submitted = manager.submit("ai_stress_start", work)
+            manager.close(wait=True)
+            job = manager.get(submitted["job_id"])
+            self.assertEqual(job["status"], "failed")
+            self.assertEqual(
+                job["error"],
+                {
+                    "code": "validator_strict_certification_failed",
+                    "message": (
+                        "validator 严格认证未通过，已终止 AI 对拍；"
+                        "helper 未应用，run 未创建。"
+                    ),
+                    "validator_strict_certification_failed": True,
+                    "helpers_unchanged": True,
+                    "run_created": False,
+                },
+            )
+            serialized = json.dumps(job, ensure_ascii=False)
+            self.assertNotIn("seed", serialized)
+            self.assertNotIn("contract_probe", serialized)
+            self.assertNotIn("hidden diagnostic", serialized)
+        finally:
+            manager.close(wait=True)
+
 
 class StaticPlanEditorTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.script = (
-            REPO_ROOT / "tools/acm_agent/web_static/app.js"
-        ).read_text(encoding="utf-8")
+        self.static = REPO_ROOT / "tools/acm_agent/web_static"
+        self.modules = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in sorted(self.static.glob("*.js"))
+        }
+        self.script = "\n".join(self.modules.values())
         self.html = (
-            REPO_ROOT / "tools/acm_agent/web_static/index.html"
+            self.static / "index.html"
         ).read_text(encoding="utf-8")
         self.styles = (
-            REPO_ROOT / "tools/acm_agent/web_static/styles.css"
+            self.static / "styles.css"
         ).read_text(encoding="utf-8")
 
     def test_plan_and_stage_editing_are_opt_in(self) -> None:
@@ -842,8 +1219,143 @@ class StaticPlanEditorTest(unittest.TestCase):
         self.assertLess(self.html.index(auto_render), self.html.index(app))
         self.assertIn(f'<script src="{katex}" defer></script>', self.html)
         self.assertIn(f'<script src="{auto_render}" defer></script>', self.html)
+        self.assertIn(f'<script type="module" src="{app}"></script>', self.html)
         self.assertNotIn("cdn.jsdelivr.net", self.html)
         self.assertNotIn("cdnjs.cloudflare.com", self.html)
+
+    def test_native_modules_are_small_same_origin_and_acyclic(self) -> None:
+        required = {
+            "app.js",
+            "core.js",
+            "sse.js",
+            "view_ai.js",
+            "view_plans.js",
+            "view_review.js",
+            "view_today.js",
+            "view_workbench.js",
+        }
+        self.assertTrue(required <= set(self.modules))
+        imports = {
+            name: {
+                match.group(1).removeprefix("./")
+                for match in re.finditer(r'from\s+["\'](\./[^"\']+)["\']', script)
+            }
+            for name, script in self.modules.items()
+        }
+        for name, dependencies in imports.items():
+            self.assertTrue(dependencies <= set(self.modules), (name, dependencies - set(self.modules)))
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(name: str) -> None:
+            self.assertNotIn(name, visiting, f"cyclic ESM dependency at {name}")
+            if name in visited:
+                return
+            visiting.add(name)
+            for dependency in imports[name]:
+                visit(dependency)
+            visiting.remove(name)
+            visited.add(name)
+
+        for name in self.modules:
+            visit(name)
+
+        self.assertEqual(self.script.count("async function api("), 1)
+        self.assertEqual(self.modules["core.js"].count("fetch("), 1)
+        self.assertEqual(self.modules["sse.js"].count("fetch("), 1)
+        for name in set(self.modules) - {"core.js", "sse.js"}:
+            self.assertNotIn("fetch(", self.modules[name], name)
+
+    def test_native_module_bindings_have_no_unresolved_calls(self) -> None:
+        exports: dict[str, set[str]] = {}
+        for name, script in self.modules.items():
+            exported: set[str] = set()
+            for match in re.finditer(r"export\s*\{(.*?)\}\s*;", script, re.S):
+                exported.update(
+                    item.strip().split(" as ")[-1]
+                    for item in match.group(1).split(",")
+                    if item.strip()
+                )
+            exports[name] = exported
+
+        browser_globals = {
+            "AbortController", "Array", "Blob", "Boolean", "Date", "Error",
+            "Event", "FileReader", "FormData", "Intl", "JSON", "Map", "Math",
+            "Number", "Object", "Promise", "Set", "String", "TextDecoder",
+            "URL", "URLSearchParams", "Uint8Array", "clearTimeout",
+            "decodeURIComponent", "encodeURIComponent", "fetch", "parseFloat",
+            "parseInt", "setTimeout",
+        }
+        ignored_calls = {"catch", "for", "function", "if", "switch", "while"}
+
+        for name, script in self.modules.items():
+            declared = set(browser_globals)
+            for match in re.finditer(
+                r'import\s*\{(.*?)\}\s*from\s*["\'](\./[^"\']+)["\']',
+                script,
+                re.S,
+            ):
+                dependency = match.group(2).removeprefix("./")
+                imported = {
+                    item.strip().split(" as ")[0]
+                    for item in match.group(1).split(",")
+                    if item.strip()
+                }
+                self.assertTrue(
+                    imported <= exports[dependency],
+                    (name, dependency, imported - exports[dependency]),
+                )
+                declared.update(
+                    item.strip().split(" as ")[-1]
+                    for item in match.group(1).split(",")
+                    if item.strip()
+                )
+            declared.update(
+                match.group(1)
+                for match in re.finditer(
+                    r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)",
+                    script,
+                )
+            )
+            declared.update(
+                match.group(1)
+                for match in re.finditer(
+                    r"\bfunction\s+([A-Za-z_$][\w$]*)",
+                    script,
+                )
+            )
+            parameter_groups = [
+                match.group(1)
+                for pattern in (
+                    r"\bfunction\s+[A-Za-z_$][\w$]*\s*\((.*?)\)",
+                    r"\((.*?)\)\s*=>",
+                    r"(?m)^\s*(?:async\s+)?[A-Za-z_$][\w$]*\s*\((.*?)\)\s*\{",
+                    r"\bcatch\s*\((.*?)\)",
+                )
+                for match in re.finditer(pattern, script, re.S)
+            ]
+            for parameters in parameter_groups:
+                declared.update(re.findall(r"[A-Za-z_$][\w$]*", parameters))
+            declared.update(
+                match.group(1)
+                for match in re.finditer(r"\b([A-Za-z_$][\w$]*)\s*=>", script)
+            )
+            declared.update(
+                match.group(1)
+                for match in re.finditer(
+                    r"(?m)^\s*([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{",
+                    script,
+                )
+            )
+            calls = {
+                match.group(1)
+                for match in re.finditer(
+                    r"(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(",
+                    script,
+                )
+            } - ignored_calls
+            self.assertFalse(calls - declared, (name, calls - declared))
 
     def test_pinned_katex_distribution_is_vendored_with_license_and_fonts(self) -> None:
         vendor = REPO_ROOT / "tools/acm_agent/web_static/vendor/katex"
@@ -933,11 +1445,19 @@ class StaticPlanEditorTest(unittest.TestCase):
         self.assertIn('name="enabled" type="checkbox"', self.html)
         for option in (
             "generate_generator",
-            "generate_brute",
-            "prepare_reference",
+            "prepare_reference_primary",
+            "prepare_reference_secondary",
             "large_profile",
         ):
             self.assertIn(f'name="{option}" type="checkbox" checked', self.html)
+        self.assertNotIn('name="minimal_verification"', self.html)
+        validator_label = (
+            "启用 validator（启用后升级为完整严格认证，"
+            "正确性更高但生成成功率显著下降）"
+        )
+        self.assertIn('name="include_validator" type="checkbox"', self.html)
+        self.assertNotIn('name="include_validator" type="checkbox" checked', self.html)
+        self.assertIn(validator_label, self.html)
         for identifier in (
             'id="ai-stress-stop"',
             'id="ai-stress-resume"',
@@ -1003,6 +1523,31 @@ class StaticPlanEditorTest(unittest.TestCase):
         self.assertIn("preparation_timeout_seconds: preparationTimeout", self.script)
         self.assertIn("cache_mode: form.elements.cache_mode.value", self.script)
         self.assertIn("generation_mode: form.elements.generation_mode.value", self.script)
+        self.assertIn("const includeValidator = form.elements.include_validator.checked", self.script)
+        self.assertIn("include_validator: includeValidator", self.script)
+        self.assertIn("minimal_verification: minimalVerification", self.script)
+        self.assertIn("const minimalVerification = !includeValidator", self.script)
+        self.assertIn("unvalidated_large: minimalVerification && largeProfile", self.script)
+        self.assertNotIn("function syncAiStressVerificationMode", self.script)
+        self.assertNotIn('["helper 来源"', self.script)
+        self.assertNotIn('metrics.push(["认证"', self.script)
+        self.assertNotIn("仅三方 oracle 判定，无 large", self.script)
+        self.assertIn("function stressElapsedEnd(run, status)", self.script)
+        self.assertIn('normalizedStatus === "stop_requested"', self.script)
+        self.assertIn("run.completed_at || run.updated_at", self.script)
+        self.assertIn("async function waitForStressPause(runId, initialPayload)", self.script)
+        self.assertIn("Date.now() + 10000", self.script)
+        self.assertIn("result = await waitForStressPause(state.stressRunId, result)", self.script)
+        self.assertIn("if (includeValidator)", self.script)
+        self.assertIn("payload.allow_validator_degradation = false", self.script)
+        self.assertIn("payload.unvalidated_large = false", self.script)
+        self.assertIn(
+            '"validator 严格认证未通过，已终止 AI 对拍；helper 未应用，run 未创建。"',
+            self.script,
+        )
+        self.assertIn("jobError.validator_strict_certification_failed === true", self.script)
+        self.assertIn("includeValidator && isStrictValidatorCertificationFailure(error)", self.script)
+        self.assertIn('role === "validator" ? "" : String(item.source_url', self.script)
         self.assertIn("preparationTimeout < 60 || preparationTimeout > 1800", self.script)
         self.assertIn("Fast 降级 ${fastFallback ?", self.script)
         self.assertIn("推理 token ${Math.max(0, reasoningTokens).toFixed(0)}", self.script)

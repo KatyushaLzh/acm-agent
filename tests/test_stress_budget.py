@@ -19,6 +19,38 @@ class FakeClock:
 
 
 class PreparationBudgetTests(unittest.TestCase):
+    def test_pause_resume_excludes_user_wait_from_every_deadline(self) -> None:
+        clock = FakeClock()
+        budget = PreparationBudget(clock=clock)
+        remaining_before = budget.remaining(include_cleanup_reserve=True)
+        phase_before = dict(budget.phase_deadline_offsets())
+        budget.pause()
+        clock.now += 120.0
+        budget.resume()
+        self.assertAlmostEqual(
+            budget.remaining(include_cleanup_reserve=True), remaining_before, places=6
+        )
+        phase_after = budget.phase_deadline_offsets()
+        for phase, offset in phase_before.items():
+            self.assertAlmostEqual(phase_after[phase] - offset, 120.0, places=6)
+        self.assertEqual(budget.paused_total_seconds(), 120.0)
+        self.assertAlmostEqual(budget.elapsed(), 0.0, places=6)
+
+        # Nested pause/resume is idempotent.
+        budget.pause()
+        budget.pause()
+        clock.now += 30.0
+        budget.resume()
+        budget.resume()
+        self.assertEqual(budget.paused_total_seconds(), 150.0)
+        self.assertAlmostEqual(
+            budget.remaining(include_cleanup_reserve=True), remaining_before, places=6
+        )
+
+        # After the window elapses, remaining really drops.
+        clock.now += 599.0
+        self.assertLessEqual(budget.remaining(include_cleanup_reserve=True), 1.0)
+
     def test_documented_bounds_and_scaled_soft_budgets(self) -> None:
         for invalid in (59, 1801, True, 300.0):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):

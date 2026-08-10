@@ -3,6 +3,11 @@
 One monotonic total deadline owns cumulative phase cutoffs.  Provider work has
 an earlier hard stop, leaving non-borrowable local-validation and cleanup gates;
 individual request and subprocess timeouts can only shorten those deadlines.
+
+Phase cutoffs scale with the configured total, but per-request floors do not:
+they describe what the provider physically needs to return a usable body.  A
+small configured total can therefore leave a provider window too short for any
+thinking request; ``supports_thinking_requests()`` reports that up front.
 """
 
 from __future__ import annotations
@@ -18,12 +23,25 @@ from typing import Callable, Iterator
 MIN_PREPARATION_TIMEOUT_SECONDS = 60
 DEFAULT_PREPARATION_TIMEOUT_SECONDS = 600
 MAX_PREPARATION_TIMEOUT_SECONDS = 1800
-PREPARATION_CLEANUP_RESERVE_SECONDS = 10.0
+
+# Default ``request_cap_seconds`` for provider_timeout().  This is a preparation
+# policy ceiling, not a socket ceiling: deepseek.MAX_TRANSPORT_REQUEST_SECONDS
+# bounds the HTTP layer separately and is deliberately looser, because the
+# policy caps below always clamp the value before it reaches that client.
 MAX_PROVIDER_REQUEST_SECONDS = 180.0
 MAX_NON_THINKING_REQUEST_SECONDS = 120.0
 MAX_THINKING_REQUEST_SECONDS = 180.0
 MAX_AUDIT_REQUEST_SECONDS = 50.0
 MAX_PROVIDER_TOKENS_PER_PREPARATION = 100_000
+
+# Per-request floors.  Unlike the phase schedule below these are absolute and
+# are NOT scaled by ``PreparationBudget.scale``: they describe how long the
+# provider physically needs to return a usable body, which does not shrink just
+# because the operator configured a smaller total.  A configured total whose
+# scaled provider window is under MIN_THINKING_REQUEST_SECONDS therefore cannot
+# issue thinking requests at all -- ``hybrid`` degrades to non-thinking and
+# ``full_thinking`` fails closed.  ``supports_thinking_requests()`` reports this
+# up front and the exhaustion details explain it at the point of failure.
 MIN_NON_THINKING_REQUEST_SECONDS = 8.0
 MIN_THINKING_REQUEST_SECONDS = 30.0
 MIN_AUDIT_REQUEST_SECONDS = 8.0
@@ -42,6 +60,14 @@ BASE_PHASE_DEADLINES: dict[str, float] = {
     "local_validation": 590.0,
     "total": 600.0,
 }
+
+# The cleanup window at the 600-second default, derived from the schedule so the
+# two cannot drift.  It is a reporting constant only: every PreparationBudget
+# recomputes its own ``cleanup_reserve_seconds`` as ``deadline - local_deadline``,
+# which scales with the configured total (1s at 60s, 30s at 1800s).
+PREPARATION_CLEANUP_RESERVE_SECONDS = (
+    BASE_PHASE_DEADLINES["total"] - BASE_PHASE_DEADLINES["local_validation"]
+)
 
 # These numbers describe nominal phase durations at the 600-second default.
 # They remain reporting hints; BASE_PHASE_DEADLINES owns enforcement.
@@ -124,9 +150,22 @@ class PreparationTokenBudgetExhausted(PreparationBudgetExhausted):
 
     def __init__(self, budget: "PreparationBudget", stage: str) -> None:
         used = budget.provider_tokens_used()
+        limit = MAX_PROVIDER_TOKENS_PER_PREPARATION
+        # Distinguish the two fail-closed boundaries.  add_usage() fires only on a
+        # real overrun (``> limit``): a call that lands exactly on the allowance
+        # spent what it was given and its result stays usable.  provider_timeout()
+        # fires on ``>= limit`` because starting another request with zero
+        # allowance left could only overrun.  Both end preparation; the message
+        # says which one was hit instead of claiming an overrun that never
+        # happened.
+        reason = (
+            f"已用尽单次 {limit} provider tokens 硬上限，无法再发起请求"
+            if used <= limit
+            else f"超过单次 {limit} provider tokens 硬上限"
+        )
         RuntimeError.__init__(
             self,
-            "AI 对拍准备超过单次 100000 provider tokens 硬上限"
+            f"AI 对拍准备{reason}"
             f"（最后阶段：{stage}，累计 {used:g} tokens）"
         )
         self.details = {
@@ -142,7 +181,10 @@ class PreparationTokenBudgetExhausted(PreparationBudgetExhausted):
 class PreparationBudget:
     timeout_seconds: int = DEFAULT_PREPARATION_TIMEOUT_SECONDS
     clock: Callable[[], float] = time.monotonic
-    cleanup_reserve_seconds: float = PREPARATION_CLEANUP_RESERVE_SECONDS
+    # Derived in __post_init__ from the scaled phase schedule.  It is not a
+    # constructor argument: an accepted-then-overwritten value would silently
+    # mislead callers into believing they had widened the cleanup window.
+    cleanup_reserve_seconds: float = field(init=False)
     started_at: float = field(init=False)
     deadline: float = field(init=False)
     work_deadline: float = field(init=False)
@@ -157,6 +199,8 @@ class PreparationBudget:
     _current_stage: str = field(default="queued", init=False)
     _current_stage_started: float = field(init=False)
     _phase_deadlines: dict[str, float] = field(default_factory=dict, init=False)
+    _paused_at: float | None = field(default=None, init=False)
+    _paused_total: float = field(default=0.0, init=False)
 
     def __post_init__(self) -> None:
         value = self.timeout_seconds
@@ -184,6 +228,22 @@ class PreparationBudget:
     @property
     def scale(self) -> float:
         return float(self.timeout_seconds) / DEFAULT_PREPARATION_TIMEOUT_SECONDS
+
+    def thinking_window_seconds(self) -> float:
+        """Return the whole scaled provider window in seconds."""
+
+        return max(0.0, self.provider_deadline - self.started_at)
+
+    def supports_thinking_requests(self) -> bool:
+        """Report whether this configured total can ever issue a thinking request.
+
+        Per-request floors are absolute while phase cutoffs scale, so a small
+        configured total can leave a provider window shorter than one thinking
+        request needs.  Callers use this to explain the limit up front instead of
+        surfacing it as a mid-preparation timeout.
+        """
+
+        return self.thinking_window_seconds() >= MIN_THINKING_REQUEST_SECONDS
 
     def phase_deadline_offsets(self) -> dict[str, float]:
         """Return scaled cumulative phase cutoffs in seconds from start."""
@@ -245,7 +305,44 @@ class PreparationBudget:
         return max(0.0, self.deadline_for_stage(stage, soft_stage=soft_stage) - float(self.clock()))
 
     def elapsed(self) -> float:
-        return max(0.0, float(self.clock()) - self.started_at)
+        with self._lock:
+            paused = self._paused_total
+        return max(0.0, float(self.clock()) - self.started_at - paused)
+
+    @property
+    def paused(self) -> bool:
+        with self._lock:
+            return self._paused_at is not None
+
+    def pause(self) -> None:
+        """Exclude interactive user-wait time from every budget deadline.
+
+        User think time must not consume the preparation window: the caller
+        pauses before blocking on user input and resumes immediately after,
+        shifting all absolute phase cutoffs by the paused duration.
+        """
+
+        with self._lock:
+            if self._paused_at is None:
+                self._paused_at = float(self.clock())
+
+    def resume(self) -> None:
+        with self._lock:
+            if self._paused_at is not None:
+                delta = max(0.0, float(self.clock()) - self._paused_at)
+                self._paused_at = None
+                self._paused_total += delta
+                if delta > 0.0:
+                    self.deadline += delta
+                    self.work_deadline += delta
+                    self.provider_deadline += delta
+                    self.local_deadline += delta
+                    for phase in self._phase_deadlines:
+                        self._phase_deadlines[phase] += delta
+
+    def paused_total_seconds(self) -> float:
+        with self._lock:
+            return round(self._paused_total, 3)
 
     def remaining(self, *, include_cleanup_reserve: bool = False) -> float:
         target = self.deadline if include_cleanup_reserve else self.work_deadline
@@ -316,6 +413,11 @@ class PreparationBudget:
                     if isinstance(current, (int, float)):
                         self._usage[str(key)] = current + value
             total = self._usage.get("total_tokens", 0)
+            # Strictly greater: a response that lands exactly on the allowance has
+            # not overrun it, so its result stays usable.  The pre-call check in
+            # provider_timeout() uses ``>=`` and stops the next request.  Token
+            # cost is not knowable before a call, so one overshoot is unavoidable
+            # -- the cap bounds it rather than pretending to predict it.
             exceeded = (
                 isinstance(total, (int, float))
                 and not isinstance(total, bool)
@@ -415,18 +517,29 @@ class PreparationBudget:
                 if reserve_is_scaled
                 else max(0.0, float(reserve_seconds))
             )
-            raise PreparationBudgetExhausted(
-                self,
-                stage,
-                details={
-                    "available_seconds": round(available, 3),
-                    "reserved_gate_seconds": round(reserve, 3),
-                    "minimum_request_seconds": round(minimum, 3),
-                    "phase_deadline_seconds": round(
-                        phase_deadline - self.started_at, 3
-                    ),
-                },
-            )
+            details: dict[str, object] = {
+                "available_seconds": round(available, 3),
+                "reserved_gate_seconds": round(reserve, 3),
+                "minimum_request_seconds": round(minimum, 3),
+                "phase_deadline_seconds": round(
+                    phase_deadline - self.started_at, 3
+                ),
+                "thinking_request": thinking,
+            }
+            if thinking and not self.supports_thinking_requests():
+                # Per-request floors are absolute while phase cutoffs scale, so
+                # this is a configuration limit rather than a slow provider.
+                details["thinking_window_seconds"] = round(
+                    self.thinking_window_seconds(), 3
+                )
+                details["thinking_supported"] = False
+                details["hint"] = (
+                    f"配置的准备预算 {self.timeout_seconds} 秒过小："
+                    f"provider 窗口只有 {self.thinking_window_seconds():.1f} 秒，"
+                    f"不足单次 thinking 请求所需的 {MIN_THINKING_REQUEST_SECONDS:g} 秒。"
+                    "请调大准备预算，或改用 fast / hybrid 生成模式。"
+                )
+            raise PreparationBudgetExhausted(self, stage, details=details)
         return min(float(request_cap_seconds), policy_cap, available)
 
     def subprocess_timeout(self, stage: str, requested: float) -> float:
@@ -474,6 +587,7 @@ class PreparationBudget:
             "reasoning_tokens": reasoning_tokens,
             "provider_token_limit": MAX_PROVIDER_TOKENS_PER_PREPARATION,
             "provider_tokens_used": self.provider_tokens_used(),
+            "paused_total_seconds": self.paused_total_seconds(),
             **self.context(),
         }
 
@@ -520,6 +634,7 @@ class PreparationBudget:
                 else 0
             ),
             "reasoning_tokens": _reasoning_tokens(usage),
+            "paused_total_seconds": self.paused_total_seconds(),
             **context,
         }
 
@@ -530,6 +645,7 @@ __all__ = [
     "DEFAULT_PREPARATION_TIMEOUT_SECONDS",
     "MAX_AUDIT_REQUEST_SECONDS",
     "MAX_NON_THINKING_REQUEST_SECONDS",
+    "MAX_PROVIDER_REQUEST_SECONDS",
     "MAX_PROVIDER_TOKENS_PER_PREPARATION",
     "MAX_PREPARATION_TIMEOUT_SECONDS",
     "MAX_THINKING_REQUEST_SECONDS",

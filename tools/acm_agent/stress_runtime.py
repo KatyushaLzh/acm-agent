@@ -11,33 +11,40 @@ import os
 from pathlib import Path
 import random
 import re
-import shutil
+import sqlite3
 import subprocess
 import threading
 import time
 from typing import Any, Callable, Mapping
 from uuid import uuid4
 
+from .canonical import canonical_json_bytes as _canonical_json
 from .config import Paths
 from .deepseek import DeepSeekCancelScope
-from .storage import Database
+from .storage import Database, StressRunRevisionConflict
 from .stress import (
+    HELPER_COMPILE_FLAG_SETS,
+    HELPER_PREFLIGHT_VERSION,
     HelperBundle,
     HelperBundleManager,
     HelperPreflightConfig,
     HelperPreflightError,
     HelperSources,
+    LEGACY_TRIO_PROTOCOL,
     LayeredStressRunner,
     SampleCase,
     SandboxBackend,
     SandboxUnavailableError,
+    StagedHelperBundle,
     StopToken,
     StressExecutables,
     StressRunConfig,
     StressRunResult,
     TRUSTED_GENERATOR_HARNESS_VERSION,
     WindowsAppContainerBackend,
-    probe_generator_v2,
+    cpp_compiler_fingerprint,
+    portable_cpp_flags,
+    resolve_cpp_compiler,
     sha256_bytes,
     sha256_file,
 )
@@ -50,10 +57,26 @@ from .stress_ai import (
     extract_contract,
     generate_artifact,
     generate_generator_blueprint,
+    generate_generator_recipe,
+    compose_generator_recipe_artifact,
     prepare_stress,
     validate_generator_blueprint,
+    validate_generator_recipe,
 )
-from .stress_sources import AllowlistedCrawler
+from .stress_recipe import (
+    GENERATOR_RECIPE_COMPOSER_VERSION,
+    GENERATOR_RECIPE_ENGINE,
+    GENERATOR_RECIPE_SCHEMA_VERSION,
+    RecipeCatalog,
+    UnsupportedRecipeError,
+)
+from .stress_recipe_v2 import (
+    GENERATOR_RECIPE_V2_ENGINE,
+    compile_static_contract_v2,
+    recipe_v2_identity,
+)
+from .stress_sources import AllowlistedCrawler, source_order_labels
+from .usage import merge_usage
 from .stress_budget import (
     DEFAULT_PREPARATION_TIMEOUT_SECONDS,
     PreparationBudget,
@@ -67,8 +90,14 @@ from .stress_checkpoint import (
 )
 
 
+REFERENCE_ROLES = ("reference_primary", "reference_secondary")
+DUAL_REFERENCE_PROTOCOL = "dual_reference_v1"
+
+
 def _next_external_reference(
     artifact: GeneratedArtifact | None,
+    *,
+    role: str | None = None,
 ) -> GeneratedArtifact | None:
     """Return the next already-vetted allowlisted source without provider work."""
 
@@ -91,8 +120,9 @@ def _next_external_reference(
     if not code or source_kind is None:
         return None
     static_audit = raw.get("static_audit")
+    selected_role = role or artifact.kind
     return GeneratedArtifact(
-        kind="reference",
+        kind=selected_role,
         code=code,
         origin=source_kind,
         notes="前一白名单参考解未通过本地门禁，切换同层下一份完整候选。",
@@ -108,16 +138,15 @@ def _next_external_reference(
 def _use_reference_alternate(
     preparation: StressPreparation,
     alternate: GeneratedArtifact,
+    *,
+    role: str,
 ) -> StressPreparation:
     metadata = dict(preparation.generation_metadata)
-    metadata["reference_alternates_used"] = (
-        int(metadata.get("reference_alternates_used") or 0) + 1
+    counter = f"{role}_alternates_used"
+    metadata[counter] = (
+        int(metadata.get(counter) or 0) + 1
     )
-    return replace(
-        preparation,
-        reference=alternate,
-        generation_metadata=metadata,
-    )
+    return replace(preparation, **{role: alternate}, generation_metadata=metadata)
 
 
 def _generator_safe_seed_families(
@@ -335,9 +364,100 @@ def _contract_probe_repair_diagnostic(
     }
 
 
+def _preflight_repair_witness(exc: HelperPreflightError) -> dict[str, Any] | None:
+    """Project only the bounded failing-role witness into an AI repair prompt."""
+
+    if (
+        str(exc.artifact) in REFERENCE_ROLES
+        and str(exc.case_kind) == "official_sample"
+        and isinstance(exc.details.get("input_excerpt"), str)
+    ):
+        witness = {
+            "kind": (
+                "official_sample_mismatch"
+                if str(exc.code) == "stress_reference_sample_mismatch"
+                else "official_sample_execution_failure"
+            ),
+            "failure_code": str(exc.code)[:120],
+            "sample_name": str(exc.details.get("sample_name") or "")[:200],
+            "input_excerpt": str(exc.details.get("input_excerpt") or "")[:2000],
+            "expected_stdout": str(
+                exc.details.get("expected_stdout") or ""
+            )[:2000],
+        }
+        if str(exc.code) == "stress_reference_sample_mismatch":
+            witness["actual_stdout"] = str(
+                exc.details.get("actual_stdout") or ""
+            )[:2000]
+        else:
+            actual = exc.details.get("actual")
+            if isinstance(actual, Mapping):
+                failure = actual.get("failure")
+                returncode = actual.get("returncode")
+                if isinstance(failure, str):
+                    witness["execution_failure"] = failure[:120]
+                if isinstance(returncode, int) and not isinstance(returncode, bool):
+                    witness["returncode"] = returncode
+        return witness
+    source_safety = exc.details.get("source_safety")
+    if (
+        exc.profile == "build"
+        and exc.case_kind == "source_safety"
+        and isinstance(source_safety, Mapping)
+    ):
+        witness: dict[str, Any] = {"kind": "source_safety"}
+        for key, limit in (
+            ("rule_id", 80),
+            ("matched_token", 80),
+            ("excerpt", 240),
+        ):
+            value = source_safety.get(key)
+            if isinstance(value, str) and value:
+                witness[key] = value[:limit]
+        for key in ("line", "column"):
+            value = source_safety.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                witness[key] = value
+        return witness
+    return None
+
+
+def _preflight_role_repair_limit(role: str, exc: HelperPreflightError) -> int:
+    if role == "generator":
+        return 2
+    if (
+        role in REFERENCE_ROLES
+        and (
+            (exc.profile == "build" and exc.case_kind == "source_safety")
+            or exc.case_kind == "official_sample"
+        )
+    ):
+        # Safety and official-sample failures both have exact, bounded local
+        # witnesses.  Permit one additional targeted generation; every
+        # replacement still returns through source-safety, compile and the
+        # complete helper preflight before it can be applied.
+        return 2
+    return 1
+
+
+def _preflight_repair_from_scratch(
+    role: str, exc: HelperPreflightError, *, repair_attempt: int
+) -> bool:
+    if role == "generator" and repair_attempt >= 2:
+        return True
+    if role not in REFERENCE_ROLES:
+        return False
+    if exc.profile == "build" and exc.case_kind == "source_safety":
+        return True
+    failure = str(exc).casefold()
+    return exc.case_kind == "official_sample" and (
+        "timeout" in failure or "runtime" in failure
+    )
+
+
 def _bundle_source_identity(artifacts: Mapping[str, GeneratedArtifact | None]) -> str:
     digest = hashlib.sha256()
-    for role in ("generator", "validator", "brute", "reference"):
+    for role in ("generator", "validator", *REFERENCE_ROLES):
         artifact = artifacts.get(role)
         digest.update(role.encode("ascii"))
         digest.update(b"\0")
@@ -404,45 +524,59 @@ def _run_locally_confirmed_gate(
         return result
 
 
-STRESS_PREPARATION_CACHE_VERSION = 2
-STRESS_CONTRACT_PROMPT_VERSION = 5
-STRESS_BLUEPRINT_PROMPT_VERSION = 6
-STRESS_ARTIFACT_PROMPT_VERSION = 7
-STRESS_PREFLIGHT_VERSION = 5
+STRESS_PREPARATION_CACHE_VERSION = 5
+STRESS_CONTRACT_PROMPT_VERSION = 10
+STRESS_BLUEPRINT_PROMPT_VERSION = 7
+STRESS_RECIPE_PROMPT_VERSION = 1
+STRESS_ARTIFACT_PROMPT_VERSION = 14
+STRESS_PREFLIGHT_VERSION = HELPER_PREFLIGHT_VERSION
 STRESS_SAFETY_POLICY_VERSION = 2
 STRESS_SANDBOX_POLICY_VERSION = 2
-STRESS_BLUEPRINT_POLICY_VERSION = 3
-STRESS_GENERATOR_COVERAGE_POLICY_VERSION = 1
+STRESS_BLUEPRINT_POLICY_VERSION = 4
+STRESS_GENERATOR_COVERAGE_POLICY_VERSION = 2
 
 
-def _canonical_json(value: Mapping[str, Any]) -> bytes:
-    return json.dumps(
-        dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+def _validate_generator_plan(
+    value: Mapping[str, Any], *, contract: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    if value.get("engine") in {
+        GENERATOR_RECIPE_ENGINE,
+        GENERATOR_RECIPE_V2_ENGINE,
+    }:
+        return validate_generator_recipe(value, contract=contract)
+    return validate_generator_blueprint(value, contract=contract)
+
+
+def _recipe_identity_fields() -> dict[str, Any]:
+    catalog = RecipeCatalog.load()
+    v2 = dict(recipe_v2_identity())
+    return {
+        "recipe_schema_version": GENERATOR_RECIPE_SCHEMA_VERSION,
+        "recipe_prompt_version": STRESS_RECIPE_PROMPT_VERSION,
+        "catalog_sha256": catalog.sha256,
+        "composer_version": GENERATOR_RECIPE_COMPOSER_VERSION,
+        "recipe_engines": [GENERATOR_RECIPE_ENGINE, GENERATOR_RECIPE_V2_ENGINE],
+        "recipe_v2_schema_version": v2["recipe_schema_version"],
+        "recipe_v2_catalog_sha256": v2["catalog_sha256"],
+        "recipe_v2_composer_version": v2["composer_version"],
+    }
+
+
+def _validator_preflight_succeeded(preflight: Mapping[str, Any]) -> bool:
+    return bool(
+        preflight.get("independent_input_validator") is True
+        and isinstance(preflight.get("validator_probes"), list)
+    )
+
+# The benchmark-only pre-apply gate is an internal capability of the local
+# stress benchmark.  Public Service/CLI/web entry points never expose it; the
+# runtime rejects any gate whose owner module is not the benchmark, so arbitrary
+# callbacks cannot be injected through production callers.
+_BENCHMARK_PRE_APPLY_GATE_MODULE = "tests.manual.benchmarks.stress_benchmark"
 
 
 def _compiler_fingerprint() -> str:
-    compiler = shutil.which("g++")
-    if compiler is None:
-        return "missing"
-    try:
-        result = subprocess.run(
-            [compiler, "--version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=3.0,
-            check=False,
-            shell=False,
-        )
-        version = result.stdout[:4096]
-    except (OSError, subprocess.TimeoutExpired):
-        version = b"unavailable"
-    try:
-        stat = Path(compiler).stat()
-        identity = f"{Path(compiler).resolve()}\0{stat.st_size}\0{stat.st_mtime_ns}".encode()
-    except OSError:
-        identity = str(compiler).encode()
-    return hashlib.sha256(identity + b"\0" + version).hexdigest()
+    return cpp_compiler_fingerprint("g++", flag_sets=HELPER_COMPILE_FLAG_SETS)
 
 
 class StressRuntimeError(RuntimeError):
@@ -463,12 +597,244 @@ class StressRuntimeError(RuntimeError):
                 setattr(self, key, self.details[key])
 
 
+_STRESS_FAILURE_CATEGORIES = frozenset(
+    {"internal", "environment", "provider", "artifact", "execution", "oracle"}
+)
+_STRESS_FAILURE_IDENTIFIER = re.compile(r"^[A-Za-z0-9_.:$\[\]-]{1,160}$")
+_STRESS_EXCEPTION_CODE = re.compile(r"^[A-Z][A-Za-z0-9_]*(?:Error|Exception)$")
+
+
+def _safe_stress_failure_identifier(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    selected = value.strip()
+    return selected if _STRESS_FAILURE_IDENTIFIER.fullmatch(selected) else None
+
+
+def _safe_stress_failure_message(value: Any) -> str:
+    selected = " ".join(str(value or "stress operation failed").split())
+    fence = selected.find("```")
+    if fence >= 0:
+        selected = selected[:fence].rstrip() + " [details omitted]"
+    brace = selected.find("{")
+    if brace >= 0:
+        selected = selected[:brace].rstrip(" :=") + " [details omitted]"
+    selected = re.sub(r"\b[A-Za-z]:[\\/]\S+", "[path omitted]", selected)
+    selected = re.sub(
+        r"(?<!\w)/(?:home|Users|tmp|var|etc)/\S+",
+        "[path omitted]",
+        selected,
+        flags=re.IGNORECASE,
+    )
+    return selected[:500] or "stress operation failed"
+
+
+def _safe_stress_primary_failure(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    result: dict[str, Any] = {}
+    for key in (
+        "role",
+        "stage",
+        "substage",
+        "code",
+        "profile",
+        "case_kind",
+        "artifact",
+    ):
+        selected = _safe_stress_failure_identifier(value.get(key))
+        if selected is not None:
+            result[key] = selected
+    path = _safe_stress_failure_identifier(value.get("path"))
+    if path is not None:
+        result["path"] = path
+    category = value.get("category")
+    if isinstance(category, str) and category in _STRESS_FAILURE_CATEGORIES:
+        result["category"] = category
+    cause_type = value.get("cause_type")
+    if (
+        isinstance(cause_type, str)
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,119}", cause_type)
+    ):
+        result["cause_type"] = cause_type
+    if "message" in value:
+        result["message"] = _safe_stress_failure_message(value.get("message"))[:320]
+    if "stderr" in value:
+        stderr = _safe_stress_failure_message(value.get("stderr"))[:500]
+        if stderr and stderr != "stress operation failed":
+            result["stderr"] = stderr
+    attempts = value.get("attempts")
+    if isinstance(attempts, int) and not isinstance(attempts, bool):
+        if 0 <= attempts <= 100:
+            result["attempts"] = attempts
+    elif isinstance(attempts, Mapping):
+        safe_attempts: dict[str, int] = {}
+        for role, count in list(attempts.items())[:4]:
+            safe_role = _safe_stress_failure_identifier(role)
+            if (
+                safe_role is not None
+                and isinstance(count, int)
+                and not isinstance(count, bool)
+                and 0 <= count <= 100
+            ):
+                safe_attempts[safe_role] = count
+        if safe_attempts:
+            result["attempts"] = safe_attempts
+    elapsed = value.get("elapsed")
+    if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
+        result["elapsed"] = max(0.0, min(float(elapsed), 86400.0))
+    seed = value.get("seed")
+    if isinstance(seed, int) and not isinstance(seed, bool):
+        result["seed"] = seed
+    return result or None
+
+
+def _stress_failure_category(
+    *, code: str, root_cause_code: str, cause_type: str, phase: str, stage: str
+) -> str:
+    combined = " ".join(
+        (code, root_cause_code, cause_type, phase, stage)
+    ).casefold()
+    if root_cause_code == "stress_internal_error" or cause_type in {
+        "AssertionError",
+        "AttributeError",
+        "KeyError",
+        "TypeError",
+    }:
+        return "internal"
+    if any(token in combined for token in ("oracle", "gold_", "pre_apply_gate")):
+        return "oracle"
+    if any(
+        token in combined
+        for token in (
+            "deepseek",
+            "provider",
+            "network_error",
+            "rate_limit",
+            "server_error",
+            "request_cancelled",
+            "protocol_error",
+        )
+    ):
+        return "provider"
+    if any(
+        token in combined
+        for token in (
+            "sandbox",
+            "compiler",
+            "compile_",
+            "filesystem",
+            "environment",
+            "setup_active",
+            "cleanup",
+            "unavailable",
+            "resource",
+        )
+    ):
+        return "environment"
+    if any(
+        token in combined
+        for token in (
+            "artifact",
+            "recipe",
+            "blueprint",
+            "contract",
+            "generator",
+            "reference",
+            "validator",
+            "preflight",
+            "certification",
+            "source_",
+        )
+    ):
+        return "artifact"
+    if any(
+        token in combined
+        for token in (
+            "execution",
+            "controlled_run",
+            "run:",
+            "mismatch",
+            "fault",
+            "crash",
+            "timeout",
+            "output",
+        )
+    ):
+        return "execution"
+    return "internal"
+
+
+def normalize_stress_failure(
+    exc: BaseException, *, phase: str, stage: str
+) -> dict[str, Any]:
+    """Return a stable, redacted failure envelope shared by all entry points."""
+
+    outer_code = _safe_stress_failure_identifier(getattr(exc, "code", None))
+    code = outer_code or "stress_internal_error"
+    raw_primary = _primary_preparation_failure(exc)
+    primary = _safe_stress_primary_failure(raw_primary)
+    nested_code = (
+        _safe_stress_failure_identifier(primary.get("code"))
+        if primary is not None
+        else None
+    )
+    cause_type = (
+        str(primary.get("cause_type"))
+        if primary is not None and primary.get("cause_type")
+        else exc.__class__.__name__
+    )
+    if nested_code is not None and _STRESS_EXCEPTION_CODE.fullmatch(nested_code):
+        cause_type = nested_code
+        root_cause_code = "stress_internal_error"
+    else:
+        root_cause_code = nested_code or code
+    selected_phase = _safe_stress_failure_identifier(phase) or "unknown"
+    selected_stage = (
+        _safe_stress_failure_identifier(primary.get("stage"))
+        if primary is not None
+        else None
+    )
+    if selected_stage is None:
+        details = getattr(exc, "details", None)
+        if isinstance(details, Mapping):
+            selected_stage = _safe_stress_failure_identifier(
+                details.get("failure_stage") or details.get("stage")
+            )
+    selected_stage = selected_stage or _safe_stress_failure_identifier(stage) or "unknown"
+    primary_category = primary.get("category") if primary is not None else None
+    category = (
+        str(primary_category)
+        if primary_category in _STRESS_FAILURE_CATEGORIES
+        else _stress_failure_category(
+            code=code,
+            root_cause_code=root_cause_code,
+            cause_type=cause_type,
+            phase=selected_phase,
+            stage=selected_stage,
+        )
+    )
+    assert category in _STRESS_FAILURE_CATEGORIES
+    return {
+        "code": code,
+        "root_cause_code": root_cause_code,
+        "category": category,
+        "cause_type": cause_type,
+        "message": _safe_stress_failure_message(exc),
+        "failure_phase": selected_phase,
+        "failure_stage": selected_stage,
+        "primary_failure": primary,
+    }
+
+
 def _add_usage(total: dict[str, Any], usage: Mapping[str, Any]) -> None:
-    for key, value in usage.items():
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            total[key] = total.get(key, 0) + value
-        elif key == "fast_fallback_used" and isinstance(value, bool):
-            total[key] = bool(total.get(key, False)) or value
+    merge_usage(
+        total,
+        usage,
+        flatten_reasoning=False,
+        preserve_scalars=False,
+        bool_or_keys={"fast_fallback_used"},
+    )
 
 
 def _utc_now() -> str:
@@ -493,6 +859,14 @@ def _row_dict(row: Mapping[str, Any]) -> dict[str, Any]:
             result["profile_version"] = int(config.get("profile_version") or 1)
         except (TypeError, ValueError):
             result["profile_version"] = 1
+        result["unvalidated"] = bool(config.get("unvalidated", False))
+        result["degraded_reason"] = str(config.get("degraded_reason") or "")
+        result["validator_requested"] = bool(
+            config.get("validator_requested", False)
+        )
+        result["validator_certified"] = bool(
+            config.get("validator_certified", False)
+        )
     return result
 
 
@@ -549,7 +923,7 @@ def _preparation_failure_label(failure: Mapping[str, Any]) -> tuple[str, str]:
             limit = 2 if role == "generator" else 1
             prefix += f"；修复尝试 {attempts}/{limit}"
         return stage, f"{prefix}：{message}"
-    stage = "prepare_reference" if role == "reference" else f"generate_{role}"
+    stage = "prepare_reference" if role in REFERENCE_ROLES else f"generate_{role}"
     suffix = f"；尝试 {attempts}" if attempts else ""
     return stage, f"{role} 准备失败{suffix}：{message}"
 
@@ -582,6 +956,13 @@ def _role_failure_details(
         if value is not None:
             result[key] = value
     if isinstance(nested, Mapping):
+        stderr = nested.get("stderr")
+        if isinstance(stderr, (str, bytes)):
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", errors="replace")
+            stderr = str(stderr).strip()
+            if stderr:
+                result["stderr"] = stderr[-2000:]
         for key in (
             "expected",
             "actual",
@@ -611,8 +992,8 @@ def _initial_repair_counts(preparation: StressPreparation) -> dict[str, int]:
     return {
         "generator": min(2, role_repairs("generator")),
         "validator": min(1, role_repairs("validator")),
-        "brute": min(1, role_repairs("brute")),
-        "reference": min(1, role_repairs("reference")),
+        "reference_primary": min(1, role_repairs("reference_primary")),
+        "reference_secondary": min(1, role_repairs("reference_secondary")),
     }
 
 
@@ -638,6 +1019,9 @@ def _stress_config(
         if key in StressRunConfig.__dataclass_fields__
     }
     values["profile_version"] = 2
+    values["oracle_protocol"] = str(
+        raw.get("oracle_protocol") or LEGACY_TRIO_PROTOCOL
+    )
     values["first_seed"] = int(first_seed)
     values["schedule_offset"] = int(schedule_offset)
     return StressRunConfig(**values)
@@ -674,12 +1058,14 @@ class StressCoordinator:
                 "backend": capability.backend,
                 "reason": capability.reason,
             },
-            "source_order": [
-                "Codeforces 官方题解 / 洛谷题解",
-                "博客园",
-                "CSDN",
-                "DeepSeek 生成",
-            ],
+            # Derived from stress_sources so the reported order always matches
+            # the order search_reference actually attempts.  It is per-platform:
+            # a Codeforces problem never reads a Luogu editorial, and a Luogu
+            # problem tries cnblogs before the Luogu solution index.
+            "source_order": {
+                platform: source_order_labels(platform)
+                for platform in ("codeforces", "luogu")
+            },
             "active_run": active,
         }
 
@@ -704,8 +1090,8 @@ class StressCoordinator:
         artifacts = {
             "generator": preparation.generator,
             "validator": preparation.validator,
-            "brute": preparation.brute,
-            "reference": preparation.reference,
+            "reference_primary": preparation.reference_primary,
+            "reference_secondary": preparation.reference_secondary,
         }
         references: dict[str, CandidateRef] = {}
         with Database(self.paths.database) as db:
@@ -736,6 +1122,9 @@ class StressCoordinator:
                             preparation.generator_blueprint
                             if role == "generator"
                             else None
+                        ),
+                        "generator_recipe_runtime": (
+                            _recipe_identity_fields() if role == "generator" else None
                         ),
                     },
                 )
@@ -773,7 +1162,7 @@ class StressCoordinator:
         )
         loaded: dict[str, GeneratedArtifact] = {}
         with Database(self.paths.database) as db:
-            for role in ("generator", "validator", "brute", "reference"):
+            for role in ("generator", "validator", *REFERENCE_ROLES):
                 identity = generation_identity(
                     platform=platform,
                     problem_id=stored_problem_id,
@@ -789,6 +1178,9 @@ class StressCoordinator:
                             dict(generator_blueprint or {})
                             if role == "generator"
                             else None
+                        ),
+                        "generator_recipe_runtime": (
+                            _recipe_identity_fields() if role == "generator" else None
                         ),
                     },
                 )
@@ -843,15 +1235,22 @@ class StressCoordinator:
         statement: str,
         compare: str,
         include_generator: bool,
-        include_brute: bool,
-        include_reference: bool,
+        include_validator: bool = True,
+        include_reference_primary: bool = True,
+        include_reference_secondary: bool = True,
         include_large: bool,
         model_settings: Mapping[str, Any],
         sandbox: SandboxBackend,
         generation_mode: str = "hybrid",
         contract: Mapping[str, Any] | None = None,
         generator_blueprint: Mapping[str, Any] | None = None,
+        include_brute: bool | None = None,
+        include_reference: bool | None = None,
     ) -> tuple[str, dict[str, Any]]:
+        if include_brute is not None:
+            include_reference_secondary = bool(include_brute)
+        if include_reference is not None:
+            include_reference_primary = bool(include_reference)
         sample_digest = hashlib.sha256()
         for sample in self._samples(problem_id, platform=platform):
             sample_digest.update(sample.name.encode("utf-8"))
@@ -866,8 +1265,10 @@ class StressCoordinator:
             "prompt_versions": {
                 "contract": STRESS_CONTRACT_PROMPT_VERSION,
                 "blueprint": STRESS_BLUEPRINT_PROMPT_VERSION,
+                "recipe": STRESS_RECIPE_PROMPT_VERSION,
                 "artifact": STRESS_ARTIFACT_PROMPT_VERSION,
             },
+            **_recipe_identity_fields(),
             "preflight_version": STRESS_PREFLIGHT_VERSION,
             "safety_policy_version": STRESS_SAFETY_POLICY_VERSION,
             "sandbox_policy_version": STRESS_SANDBOX_POLICY_VERSION,
@@ -878,10 +1279,11 @@ class StressCoordinator:
             "include_large": bool(include_large),
             "roles": {
                 "generator": bool(include_generator),
-                "validator": True,
-                "brute": bool(include_brute),
-                "reference": bool(include_reference),
+                "validator": bool(include_validator),
+                "reference_primary": bool(include_reference_primary),
+                "reference_secondary": bool(include_reference_secondary),
             },
+            "oracle_protocol": DUAL_REFERENCE_PROTOCOL,
             "model": str(model_settings["model"]),
             "generation_mode": str(generation_mode),
             "reasoning_effort": str(model_settings.get("reasoning_effort") or "high"),
@@ -913,8 +1315,8 @@ class StressCoordinator:
     ) -> tuple[str, dict[str, Any]]:
         metadata = {
             "kind": "stress_contract",
-            # Keep v3 contract identities byte-compatible: the observed P2596
-            # failure is in the blueprint shape, not in contract extraction.
+            # Contract and blueprint identities evolve independently so a
+            # blueprint-only repair does not invalidate provider contract work.
             "prompt_version": STRESS_CONTRACT_PROMPT_VERSION,
             "problem_id": problem_id,
             "statement_sha256": sha256_bytes(statement.encode("utf-8")),
@@ -935,8 +1337,9 @@ class StressCoordinator:
         generation_mode: str,
     ) -> tuple[str, dict[str, Any]]:
         metadata = {
-            "kind": "stress_generator_blueprint",
+            "kind": "stress_generator_plan",
             "prompt_version": STRESS_BLUEPRINT_PROMPT_VERSION,
+            **_recipe_identity_fields(),
             "blueprint_policy_version": STRESS_BLUEPRINT_POLICY_VERSION,
             "coverage_policy_version": STRESS_GENERATOR_COVERAGE_POLICY_VERSION,
             "problem_id": problem_id,
@@ -982,7 +1385,7 @@ class StressCoordinator:
         ):
             return None
         try:
-            return validate_generator_blueprint(candidate), selected_key
+            return _validate_generator_plan(candidate), selected_key
         except Exception:
             return None
 
@@ -994,7 +1397,7 @@ class StressCoordinator:
         *,
         replace_alias: bool = False,
     ) -> str:
-        validated = validate_generator_blueprint(blueprint)
+        validated = _validate_generator_plan(blueprint)
         content_hash = sha256_bytes(_canonical_json(validated))
         with Database(self.paths.database) as db:
             alias = db.stress_preparation_cache(cache_key)
@@ -1089,6 +1492,12 @@ class StressCoordinator:
             manifest = _json_field(row, "baseline_manifest_json")
             contract = _json_field(row, "contract_json")
             artifacts = db.stress_artifacts(str(row["id"]))
+            certification_key = str(row["certification_key"] or "")
+            certification = (
+                db.stress_bundle_certification(certification_key)
+                if certification_key
+                else None
+            )
         if not isinstance(cache_payload, Mapping) or cache_payload.get(
             "cache_identity"
         ) != dict(expected_meta):
@@ -1118,13 +1527,41 @@ class StressCoordinator:
         executable_hashes = dict(
             preparation_meta.get("release_executable_hashes") or {}
         )
-        if set(helper_paths) != {"generator", "brute", "reference"}:
+        expected_roles = expected_meta.get("roles")
+        validator_required = bool(
+            isinstance(expected_roles, Mapping)
+            and expected_roles.get("validator") is True
+        )
+        if validator_required:
+            if certification is None or str(certification["status"]) != "valid":
+                return None
+            certification_identity = _json_field(
+                certification, "certification_identity_json"
+            )
+            certification_preflight = _json_field(
+                certification, "preflight_json"
+            )
+            validator_identity = (
+                certification_identity.get("validator")
+                if isinstance(certification_identity, Mapping)
+                else None
+            )
+            if (
+                not isinstance(validator_identity, Mapping)
+                or str(validator_identity.get("candidate_id") or "")
+                in {"", "unvalidated"}
+                or not isinstance(certification_preflight, Mapping)
+                or not _validator_preflight_succeeded(certification_preflight)
+            ):
+                return None
+        if set(helper_paths) != {"generator", *REFERENCE_ROLES}:
             return None
-        if set(release_executables) != {
-            "generator", "validator", "brute", "reference"
-        }:
+        expected_release_roles = {"generator", *REFERENCE_ROLES}
+        if validator_required:
+            expected_release_roles.add("validator")
+        if set(release_executables) != expected_release_roles:
             return None
-        for role in ("generator", "brute", "reference"):
+        for role in ("generator", *REFERENCE_ROLES):
             source = Path(str(helper_paths.get(role) or ""))
             executable = Path(str(release_executables.get(role) or ""))
             if (
@@ -1135,17 +1572,23 @@ class StressCoordinator:
                 != str(executable_hashes.get(role) or "")
             ):
                 return None
-        validator_executable = Path(str(release_executables.get("validator") or ""))
-        if (
-            not validator_executable.is_file()
-            or sha256_file(validator_executable)
-            != str(executable_hashes.get("validator") or "")
-        ):
-            return None
+        if validator_required:
+            validator_executable = Path(
+                str(release_executables.get("validator") or "")
+            )
+            if (
+                not validator_executable.is_file()
+                or sha256_file(validator_executable)
+                != str(executable_hashes.get("validator") or "")
+            ):
+                return None
         if dict(preparation_meta.get("helper_hashes") or {}) != applied_hashes:
             return None
         rows = {str(item["kind"]): item for item in artifacts}
-        if set(rows) != {"generator", "brute", "reference"}:
+        expected_artifact_roles = {"generator", *REFERENCE_ROLES}
+        if validator_required:
+            expected_artifact_roles.add("validator")
+        if set(rows) != expected_artifact_roles:
             return None
         generated: dict[str, GeneratedArtifact] = {}
         audits: dict[str, dict[str, Any]] = {}
@@ -1190,6 +1633,8 @@ class StressCoordinator:
                     else None
                 ),
             )
+        if validator_required and not _validator_preflight_succeeded(preflight):
+            return None
         try:
             bundle = HelperBundle(
                 bundle_id=str(manifest["bundle_id"]),
@@ -1211,8 +1656,8 @@ class StressCoordinator:
             StressPreparation(
                 dict(contract),
                 generated["generator"],
-                generated["brute"],
-                generated["reference"],
+                generated["reference_primary"],
+                generated["reference_secondary"],
                 {},
                 dict(blueprint) if isinstance(blueprint, Mapping) else None,
                 {
@@ -1223,6 +1668,7 @@ class StressCoordinator:
                         preparation_meta.get("fast_fallback_used", False)
                     ),
                 },
+                generated.get("validator"),
             ),
             preflight,
             audits,
@@ -1247,25 +1693,24 @@ class StressCoordinator:
         cancel_scope: DeepSeekCancelScope | None = None,
     ) -> tuple[StressPreparation, dict[str, dict[str, Any]], dict[str, int]]:
         """Audit each AI helper independently and repair only the rejected role."""
-
         artifacts: dict[str, GeneratedArtifact | None] = {
             "generator": preparation.generator,
             "validator": preparation.validator,
-            "brute": preparation.brute,
-            "reference": preparation.reference,
+            "reference_primary": preparation.reference_primary,
+            "reference_secondary": preparation.reference_secondary,
         }
         counts = repair_counts if repair_counts is not None else {
             "generator": 0,
             "validator": 0,
-            "brute": 0,
-            "reference": 0,
+            "reference_primary": 0,
+            "reference_secondary": 0,
         }
         usage = dict(preparation.usage)
         audits: dict[str, dict[str, Any]] = {}
         while True:
             generated_roles = [
                 role
-                for role in ("generator", "validator", "brute", "reference")
+                for role in ("generator", "validator", *REFERENCE_ROLES)
                 if (
                     artifacts[role] is not None
                     and artifacts[role].origin == "ai_generated"
@@ -1522,18 +1967,19 @@ class StressCoordinator:
                             attempts=dict(counts),
                             last_diagnostic=audit.summary[:500],
                         )
+                    audit_payload = {
+                        "stage": "static_audit",
+                        "artifact": role,
+                        "repair_attempt": counts[role],
+                        "code": "stress_artifact_audit_rejected",
+                        "verdict": audit.verdict,
+                        "confidence": audit.confidence,
+                        "issues": [dict(item) for item in audit.issues],
+                        "witness": dict(audit.witness),
+                        "summary": audit.summary,
+                    }
                     diagnostic = json.dumps(
-                        {
-                            "stage": "static_audit",
-                            "artifact": role,
-                            "repair_attempt": counts[role],
-                            "code": "stress_artifact_audit_rejected",
-                            "verdict": audit.verdict,
-                            "confidence": audit.confidence,
-                            "issues": [dict(item) for item in audit.issues],
-                            "witness": dict(audit.witness),
-                            "summary": audit.summary,
-                        },
+                        audit_payload,
                         ensure_ascii=False,
                     )[:4000]
                     future = executor.submit(
@@ -1576,7 +2022,7 @@ class StressCoordinator:
                             repair_errors[role] = failure
                             _add_usage(usage, failure["usage"])
                         continue
-                    if role == "reference":
+                    if role in REFERENCE_ROLES:
                         replacement = replace(
                             replacement,
                             source_url=artifact.source_url,
@@ -1624,8 +2070,8 @@ class StressCoordinator:
             StressPreparation(
                 dict(preparation.contract),
                 artifacts["generator"],
-                artifacts["brute"],
-                artifacts["reference"],
+                artifacts["reference_primary"],
+                artifacts["reference_secondary"],
                 usage,
                 preparation.generator_blueprint,
                 dict(preparation.generation_metadata),
@@ -1634,6 +2080,25 @@ class StressCoordinator:
             audits,
             counts,
         )
+
+    def _resolve_manual_helper(self, path: Path | str, *, role: str) -> Path:
+        """Validate a local C++ helper without restricting it to the workspace."""
+
+        raw_path = os.fspath(path)
+        portable = str(raw_path).replace("\\", "/")
+        if portable.startswith("//"):
+            raise ValueError(f"{role} 手动文件必须是本机路径，不能使用 UNC/设备路径")
+        requested = Path(raw_path)
+        if not requested.is_absolute():
+            requested = self.paths.root / requested
+        if requested.suffix.lower() != ".cpp" or not requested.is_file():
+            raise ValueError(f"{role} 手动文件必须是存在的 .cpp 文件")
+        if requested.is_symlink():
+            raise ValueError(f"{role} 手动文件不能是符号链接")
+        resolved = requested.resolve(strict=True)
+        if str(resolved).replace("\\", "/").startswith("//"):
+            raise ValueError(f"{role} 手动文件必须是本机路径，不能使用 UNC/设备路径")
+        return resolved
 
     def start(
         self,
@@ -1650,19 +2115,59 @@ class StressCoordinator:
         compare: str = "token",
         seed: int | None = None,
         include_generator: bool = True,
-        include_brute: bool = True,
-        include_reference: bool = True,
+        include_reference_primary: bool = True,
+        include_reference_secondary: bool = True,
+        include_brute: bool | None = None,
+        include_reference: bool | None = None,
+        # Library-level default: a complete certification includes the validator,
+        # so direct callers of this coordinator get the strongest bundle unless
+        # they opt out.  This deliberately differs from the *policy* default in
+        # AgentService.ai_stress_start, which is off to avoid spending provider
+        # budget on a role the escalation path no longer depends on; that entry
+        # point always passes this argument explicitly, so the two never race.
+        # An intentionally absent validator is not a degradation: `degraded`
+        # additionally requires a non-None degraded_reason, so a bundle prepared
+        # without a validator stays cacheable.
+        include_validator: bool = True,
         include_large: bool = True,
+        allow_validator_degradation: bool = False,
+        unvalidated_large: bool = False,
+        minimal_verification: bool = False,
         preparation_timeout_seconds: int = DEFAULT_PREPARATION_TIMEOUT_SECONDS,
         force_regenerate: bool = False,
         cache_mode: str = "reuse",
         generation_mode: str = "hybrid",
         preparation_budget: PreparationBudget | None = None,
         timeout: float = 2.0,
-        brute_timeout: float = 5.0,
+        reference_secondary_timeout: float | None = None,
+        brute_timeout: float | None = None,
         run_max_cases: int | None = None,
         progress_callback: StressProgress | None = None,
+        _pre_apply_gate: Callable[[StagedHelperBundle], Mapping[str, Any] | None] | None = None,
+        reference_primary_file: Path | str | None = None,
+        reference_secondary_file: Path | str | None = None,
+        brute_file: Path | str | None = None,
+        reference_file: Path | str | None = None,
+        generator_file: Path | str | None = None,
     ) -> dict[str, Any]:
+        if include_brute is not None:
+            include_reference_secondary = bool(include_brute)
+        if include_reference is not None:
+            include_reference_primary = bool(include_reference)
+        if reference_primary_file is not None and reference_file is not None:
+            raise ValueError("reference_primary_file 与 reference_file 不能同时提供")
+        if reference_secondary_file is not None and brute_file is not None:
+            raise ValueError("reference_secondary_file 与 brute_file 不能同时提供")
+        reference_primary_file = reference_primary_file or reference_file
+        reference_secondary_file = reference_secondary_file or brute_file
+        if reference_secondary_timeout is None and brute_timeout is not None:
+            reference_secondary_timeout = brute_timeout
+        if _pre_apply_gate is not None:
+            gate_module = str(getattr(_pre_apply_gate, "__module__", "") or "")
+            if gate_module != _BENCHMARK_PRE_APPLY_GATE_MODULE:
+                raise ValueError(
+                    "pre_apply_gate is only available to the local stress benchmark"
+                )
         budget = preparation_budget or PreparationBudget(
             int(preparation_timeout_seconds)
         )
@@ -1696,7 +2201,8 @@ class StressCoordinator:
                     "check_isolation": "isolation_context",
                     "extract_contract": "contract",
                     "generate_generator": "prepare_helpers",
-                    "generate_brute": "prepare_helpers",
+                    "generate_reference_primary": "prepare_helpers",
+                    "generate_reference_secondary": "prepare_helpers",
                     "prepare_reference": "prepare_helpers",
                     "audit_helpers": "audit_helpers",
                     "preflight_helpers": "local_validation",
@@ -1727,9 +2233,19 @@ class StressCoordinator:
         primary = primary_source.resolve()
         existing = {
             "generator": primary.with_name(f"{problem_id}.gen.cpp"),
-            "brute": primary.with_name(f"{problem_id}.bf.cpp"),
-            "reference": primary.with_name(f"{problem_id}.ref.cpp"),
+            "reference_primary": primary.with_name(f"{problem_id}.ref1.cpp"),
+            "reference_secondary": primary.with_name(f"{problem_id}.ref2.cpp"),
         }
+        manual_files: dict[str, Path] = {}
+        for role in ("generator", *REFERENCE_ROLES):
+            manual = {
+                "generator": generator_file,
+                "reference_primary": reference_primary_file,
+                "reference_secondary": reference_secondary_file,
+            }[role]
+            if manual is not None:
+                manual_files[role] = self._resolve_manual_helper(manual, role=role)
+        manual_override = bool(manual_files)
         contract_cache_key, contract_cache_identity = self._contract_cache_identity(
             problem_id=problem_id,
             statement=statement,
@@ -1767,6 +2283,7 @@ class StressCoordinator:
                 budget=budget,
                 progress_callback=progress_callback,
                 cancel_scope=cancel_scope,
+                require_complete_probes=not minimal_verification,
             )
             with Database(self.paths.database) as db:
                 if db.stress_preparation_cache(contract_cache_key) is None:
@@ -1787,7 +2304,13 @@ class StressCoordinator:
         blueprint_cache_result = "not_requested"
         blueprint_cache_key: str | None = None
         blueprint_cache_identity: dict[str, Any] | None = None
-        if include_generator:
+        if include_generator and generator_file is None:
+            try:
+                prepared_blueprint = compile_static_contract_v2(prepared_contract)
+                blueprint_cache_result = "deterministic_contract"
+            except UnsupportedRecipeError:
+                pass
+        if include_generator and generator_file is None:
             blueprint_cache_key, blueprint_cache_identity = (
                 self._blueprint_cache_identity(
                     problem_id=problem_id,
@@ -1797,7 +2320,7 @@ class StressCoordinator:
                     generation_mode=generation_mode,
                 )
             )
-            if not force_regenerate:
+            if prepared_blueprint is None and not force_regenerate:
                 cached_blueprint = self._cached_generator_blueprint(
                     blueprint_cache_key,
                     blueprint_cache_identity,
@@ -1814,8 +2337,9 @@ class StressCoordinator:
             statement=statement,
             compare=compare,
             include_generator=include_generator,
-            include_brute=include_brute,
-            include_reference=include_reference,
+            include_validator=bool(include_validator and not minimal_verification),
+            include_reference_primary=include_reference_primary,
+            include_reference_secondary=include_reference_secondary,
             include_large=include_large,
             model_settings=model_settings,
             sandbox=sandbox,
@@ -1826,6 +2350,7 @@ class StressCoordinator:
         cached = (
             None
             if selected_cache_mode != "reuse"
+            or manual_override
             or (include_generator and prepared_blueprint is None)
             else self._cached_preparation(
                 cache_key,
@@ -1855,9 +2380,12 @@ class StressCoordinator:
                 large_per_cycle=1 if include_large else 0,
                 solution_timeout=float(timeout),
                 generator_timeout=float(timeout),
-                reference_timeout=float(timeout),
-                brute_timeout=float(brute_timeout),
+                reference_primary_timeout=float(timeout),
+                reference_secondary_timeout=float(
+                    reference_secondary_timeout or timeout
+                ),
                 validator_timeout=float(timeout),
+                oracle_protocol=DUAL_REFERENCE_PROTOCOL,
                 max_cases=run_max_cases,
                 exact_output=compare == "exact",
             )
@@ -1870,6 +2398,13 @@ class StressCoordinator:
                 primary=primary,
                 run_id=run_id,
                 config=config,
+                validator_requested=bool(
+                    include_validator and not minimal_verification
+                ),
+                validator_certified=(
+                    preparation.validator is not None
+                    and _validator_preflight_succeeded(preflight_validation)
+                ),
             )
             self._launch(
                 run_id, bundle, executables, config, preparation, platform=platform
@@ -1903,7 +2438,11 @@ class StressCoordinator:
                 model_settings=model_settings,
                 generation_mode=generation_mode,
             )
-            if selected_cache_mode == "reuse" and prepared_blueprint is not None
+            if (
+                selected_cache_mode == "reuse"
+                and prepared_blueprint is not None
+                and not manual_override
+            )
             else {}
         )
         crawler = self._crawler_factory()
@@ -1920,18 +2459,19 @@ class StressCoordinator:
             role_usage: Mapping[str, Any],
             role_blueprint: Mapping[str, Any] | None,
         ) -> None:
+            completed_artifacts[role] = artifact
             role_artifacts: dict[str, GeneratedArtifact | None] = {
                 "generator": None,
                 "validator": None,
-                "brute": None,
-                "reference": None,
+                "reference_primary": None,
+                "reference_secondary": None,
             }
             role_artifacts[role] = artifact
             partial = StressPreparation(
                 dict(prepared_contract),
                 role_artifacts["generator"],
-                role_artifacts["brute"],
-                role_artifacts["reference"],
+                role_artifacts["reference_primary"],
+                role_artifacts["reference_secondary"],
                 dict(role_usage),
                 (
                     dict(role_blueprint)
@@ -1950,8 +2490,12 @@ class StressCoordinator:
                 generation_mode=generation_mode,
                 ai_run_id=ai_run_id,
             )
-        try:
-            preparation = prepare_stress(
+        completed_artifacts: dict[str, GeneratedArtifact] = {}
+        degraded_reason: str | None = "minimal_verification" if minimal_verification else None
+        effective_include_validator = include_validator and not minimal_verification
+
+        def prepare_with_validator(enable_validator: bool) -> StressPreparation:
+            return prepare_stress(
                 client,
                 crawler,
                 platform=platform,
@@ -1961,14 +2505,24 @@ class StressCoordinator:
                 compare=compare,
                 settings=model_settings,
                 generation_mode=generation_mode,
-                include_generator=include_generator,
-                include_validator=True,
-                include_brute=include_brute,
-                include_reference=include_reference,
+                include_generator=include_generator and generator_file is None,
+                include_validator=enable_validator,
+                include_reference_primary=(
+                    include_reference_primary and reference_primary_file is None
+                ),
+                include_reference_secondary=(
+                    include_reference_secondary and reference_secondary_file is None
+                ),
+                # Minimal mode deliberately skips independent artifact audits.
+                # Do not treat unaudited web snippets as trusted references in
+                # that mode; generate isolated references under the same local
+                # source-safety and preflight gates instead.
+                allow_external_references=not minimal_verification,
+                require_complete_probes=not minimal_verification,
                 budget=budget,
                 prepared_contract=prepared_contract,
                 prepared_generator_blueprint=prepared_blueprint,
-                prepared_artifacts=checkpoint_artifacts,
+                prepared_artifacts={**checkpoint_artifacts, **completed_artifacts},
                 provider_reserve_seconds=80.0,
                 initial_usage=contract_usage,
                 progress_callback=progress_callback,
@@ -1976,27 +2530,49 @@ class StressCoordinator:
                 blueprint_repair_limit=2,
                 cancel_scope=cancel_scope,
             )
+
+        try:
+            preparation = prepare_with_validator(effective_include_validator)
         except Exception as exc:
             primary_failure = _primary_preparation_failure(exc)
-            if primary_failure is not None and progress_callback is not None:
-                stage, label = _preparation_failure_label(primary_failure)
-                # Pin the terminal progress after all worker callbacks so a
-                # slower reference audit cannot masquerade as the root cause.
-                progress_callback(stage, label, 3, 10)
-            raise
+            if (
+                effective_include_validator
+                and allow_validator_degradation
+                and primary_failure is not None
+                and str(primary_failure.get("role") or "") == "validator"
+            ):
+                degraded_reason = "validator_generation_failed"
+                merged_usage = dict(contract_usage)
+                _add_usage(merged_usage, dict(getattr(exc, "usage", {}) or {}))
+                contract_usage = merged_usage
+                # prepare_stress cancels the logical operation tree on a
+                # sibling failure.  A degradation retry is a new operation
+                # tree and must never inherit that sticky cancellation bit.
+                cancel_scope = DeepSeekCancelScope()
+                if hasattr(crawler, "cancel_scope"):
+                    crawler.cancel_scope = cancel_scope
+                preparation = prepare_with_validator(False)
+            else:
+                if primary_failure is not None and progress_callback is not None:
+                    stage, label = _preparation_failure_label(primary_failure)
+                    # Pin the terminal progress after all worker callbacks so a
+                    # slower reference audit cannot masquerade as the root cause.
+                    progress_callback(stage, label, 3, 10)
+                raise
         budget.set_context(
             fast_fallback_used=bool(
                 preparation.usage.get("fast_fallback_used", False)
             )
         )
-        if include_generator:
+        if include_generator and generator_file is None:
             if preparation.generator_blueprint is None:
                 raise StressRuntimeError(
                     "stress_blueprint_invalid",
                     "generator 准备完成但缺少已验证 blueprint",
                 )
-            prepared_blueprint = validate_generator_blueprint(
-                preparation.generator_blueprint
+            prepared_blueprint = _validate_generator_plan(
+                preparation.generator_blueprint,
+                contract=preparation.contract,
             )
             assert blueprint_cache_key is not None
             assert blueprint_cache_identity is not None
@@ -2013,8 +2589,9 @@ class StressCoordinator:
                 statement=statement,
                 compare=compare,
                 include_generator=include_generator,
-                include_brute=include_brute,
-                include_reference=include_reference,
+                include_validator=preparation.validator is not None,
+                include_reference_primary=include_reference_primary,
+                include_reference_secondary=include_reference_secondary,
                 include_large=include_large,
                 model_settings=model_settings,
                 sandbox=sandbox,
@@ -2025,35 +2602,46 @@ class StressCoordinator:
         artifacts: dict[str, GeneratedArtifact | None] = {
             "generator": preparation.generator,
             "validator": preparation.validator,
-            "brute": preparation.brute,
-            "reference": preparation.reference,
+            "reference_primary": preparation.reference_primary,
+            "reference_secondary": preparation.reference_secondary,
         }
         enabled_roles = {
-            "generator": bool(include_generator),
-            "validator": True,
-            "brute": bool(include_brute),
-            "reference": bool(include_reference),
+            "generator": bool(include_generator) and generator_file is None,
+            "validator": bool(include_validator),
+            "reference_primary": (
+                bool(include_reference_primary) and reference_primary_file is None
+            ),
+            "reference_secondary": (
+                bool(include_reference_secondary) and reference_secondary_file is None
+            ),
         }
         for role, enabled in enabled_roles.items():
+            if role == "validator":
+                continue
             if enabled:
                 continue
-            path = existing[role]
-            if not path.is_file():
-                raise StressRuntimeError(
-                    "missing_stress_helper", f"未生成 {role} 且本地文件不存在"
-                )
+            if role in manual_files:
+                path = manual_files[role]
+            else:
+                path = existing[role]
+                if not path.is_file():
+                    raise StressRuntimeError(
+                        "missing_stress_helper", f"未生成 {role} 且本地文件不存在"
+                    )
             artifacts[role] = GeneratedArtifact(
                 role,
                 path.read_text(encoding="utf-8"),
-                "local_existing",
-                "使用已有 helper",
+                "user_specified" if role in manual_files else "local_existing",
+                "用户手动指定 helper" if role in manual_files else "使用已有 helper",
             )
-        assert all(artifacts.values())
+        assert artifacts["generator"] is not None
+        assert artifacts["reference_primary"] is not None
+        assert artifacts["reference_secondary"] is not None
         preparation = StressPreparation(
             dict(preparation.contract),
             artifacts["generator"],
-            artifacts["brute"],
-            artifacts["reference"],
+            artifacts["reference_primary"],
+            artifacts["reference_secondary"],
             dict(preparation.usage),
             prepared_blueprint,
             dict(preparation.generation_metadata),
@@ -2088,13 +2676,19 @@ class StressCoordinator:
         qualification_config = HelperPreflightConfig(
             contract_hash=sha256_bytes(contract_bytes),
             generator_blueprint=preparation.generator_blueprint,
-            validator_probes=tuple(preparation.contract.get("validator_probes", [])),
+            validator_probes=(
+                tuple(preparation.contract.get("validator_probes", []))
+                if preparation.validator is not None
+                else ()
+            ),
             include_large=bool(include_large),
             exact_output=compare == "exact",
             small_random_cases=16,
             generator_timeout=float(timeout),
-            reference_timeout=float(timeout),
-            brute_timeout=float(brute_timeout),
+            reference_primary_timeout=float(timeout),
+            reference_secondary_timeout=float(
+                reference_secondary_timeout or timeout
+            ),
             validator_timeout=float(timeout),
             deadline=budget.work_deadline,
             clock=budget.clock,
@@ -2107,19 +2701,39 @@ class StressCoordinator:
         local_gate_confirmations: set[
             tuple[str, str, str, str, str, int]
         ] = set()
-        while qualified_staged is None:
+        stored_problem_id = (
+            problem_id[2:]
+            if platform == "codeforces" and problem_id.upper().startswith("CF")
+            else problem_id
+        )
+        proof_identity = {
+            "compiler_fingerprint": _compiler_fingerprint(),
+            "sandbox": (
+                f"{sandbox.__class__.__module__}."
+                f"{sandbox.__class__.__qualname__}"
+            ),
+            "safety_policy_version": STRESS_SAFETY_POLICY_VERSION,
+            "protocol": {"profile": 2, "preflight": STRESS_PREFLIGHT_VERSION},
+        }
+        while qualified_staged is None and not minimal_verification:
             machine_artifacts = {
                 "generator": preparation.generator,
                 "validator": preparation.validator,
-                "brute": preparation.brute,
-                "reference": preparation.reference,
+                "reference_primary": preparation.reference_primary,
+                "reference_secondary": preparation.reference_secondary,
             }
-            assert all(machine_artifacts.values())
+            assert machine_artifacts["generator"] is not None
+            assert machine_artifacts["reference_primary"] is not None
+            assert machine_artifacts["reference_secondary"] is not None
             machine_sources = HelperSources(
                 machine_artifacts["generator"].code,
-                machine_artifacts["brute"].code,
-                machine_artifacts["reference"].code,
-                machine_artifacts["validator"].code,
+                machine_artifacts["reference_primary"].code,
+                machine_artifacts["reference_secondary"].code,
+                (
+                    machine_artifacts["validator"].code
+                    if machine_artifacts["validator"] is not None
+                    else None
+                ),
             )
             try:
                 budget.require("prepare_helpers")
@@ -2148,29 +2762,32 @@ class StressCoordinator:
                     qualified_staged = None
                 failed_role = str(exc.artifact)
                 if failed_role == "oracle":
-                    reference = preparation.reference
-                    # The small brute is intentionally the simplest oracle. If
-                    # it disagrees with an AI-generated full-constraint
-                    # reference, rewrite the more complex AI reference once.
-                    # A complete allowlisted external reference instead makes
-                    # the generated brute the higher-risk side.  The repaired
-                    # pair must still pass audit and the complete joint
-                    # preflight; this attribution never applies a bundle by
-                    # itself.
-                    failed_role = (
-                        "reference"
-                        if reference is not None
-                        and (
-                            reference.origin == "ai_generated"
-                            or _next_external_reference(reference) is not None
-                        )
-                        else "brute"
+                    primary_failure = _role_failure_details(
+                        exc,
+                        role="oracle",
+                        stage="prepare_helpers",
+                        substage="pre_audit_machine_gate",
+                        elapsed=budget.elapsed(),
+                        attempts=0,
                     )
-                if failed_role == "reference":
-                    alternate = _next_external_reference(preparation.reference)
+                    raise StressRuntimeError(
+                        str(exc.code),
+                        "两份 reference 在写入前输出不一致；不自动猜测或修复任一方",
+                        details={
+                            **exc.details,
+                            "artifact": "oracle",
+                            "primary_failure": primary_failure,
+                        },
+                        usage=preparation.usage,
+                    ) from exc
+                if failed_role in REFERENCE_ROLES:
+                    current_reference = getattr(preparation, failed_role)
+                    alternate = _next_external_reference(
+                        current_reference, role=failed_role
+                    )
                     if alternate is not None:
                         preparation = _use_reference_alternate(
-                            preparation, alternate
+                            preparation, alternate, role=failed_role
                         )
                         candidate_refs = self._checkpoint_candidates(
                             preparation,
@@ -2182,8 +2799,53 @@ class StressCoordinator:
                             ai_run_id=ai_run_id,
                         )
                         continue
-                repair_limit = 2 if failed_role == "generator" else 1
+                if (
+                    failed_role == "generator"
+                    and isinstance(preparation.generator_blueprint, Mapping)
+                    and preparation.generator_blueprint.get("engine")
+                    == GENERATOR_RECIPE_V2_ENGINE
+                ):
+                    raise StressRuntimeError(
+                        "stress_local_recipe_v2_preflight_failed",
+                        "确定性 generator_recipe/v2 未通过本地预验；禁止回退或调用 AI generator",
+                        details={
+                            **exc.details,
+                            "root_cause_code": str(exc.code),
+                            "generator_engine": GENERATOR_RECIPE_V2_ENGINE,
+                        },
+                        usage=preparation.usage,
+                    ) from exc
+                repair_limit = _preflight_role_repair_limit(failed_role, exc)
                 if repair_counts.get(failed_role, 0) >= repair_limit:
+                    if (
+                        failed_role == "validator"
+                        and allow_validator_degradation
+                        and qualified_staged is not None
+                    ):
+                        manager.discard(qualified_staged)
+                        qualified_staged = None
+                    if (
+                        failed_role == "validator"
+                        and allow_validator_degradation
+                        and degraded_reason is None
+                    ):
+                        # The validator cannot be certified against the hidden
+                        # probes.  Drop the role and continue without input
+                        # certification: small cases stay protected by the
+                        # triple oracle and large cases are disabled unless the
+                        # user explicitly opted into unvalidated large runs.
+                        degraded_reason = str(exc.code)
+                        preparation = StressPreparation(
+                            dict(preparation.contract),
+                            machine_artifacts["generator"],
+                            machine_artifacts["reference_primary"],
+                            machine_artifacts["reference_secondary"],
+                            preparation.usage,
+                            preparation.generator_blueprint,
+                            dict(preparation.generation_metadata),
+                            None,
+                        )
+                        break
                     primary_failure = _role_failure_details(
                         exc,
                         role=failed_role,
@@ -2229,6 +2891,9 @@ class StressCoordinator:
                         exc,
                         repair_attempt=repair_counts[failed_role],
                     )
+                repair_witness = _preflight_repair_witness(exc)
+                if repair_witness is not None:
+                    diagnostic_payload["witness"] = repair_witness
                 prior_diagnostics = list(
                     machine_diagnostic_history.get(failed_role, [])[-2:]
                 )
@@ -2244,7 +2909,8 @@ class StressCoordinator:
                     )
                 if (
                     failed_role == "validator"
-                    and "ERR_TRAILING" in diagnostic_payload["stderr"]
+                    and "ERR_TRAILING"
+                    in str(diagnostic_payload.get("stderr") or "")
                     and re.search(r"\.peek\s*\(\s*\)\s*!=\s*EOF", prior.code)
                 ):
                     diagnostic_payload["required_change"] = (
@@ -2254,7 +2920,8 @@ class StressCoordinator:
                     )
                 if (
                     failed_role == "validator"
-                    and "singular mutable iterator" in diagnostic_payload["stderr"]
+                    and "singular mutable iterator"
+                    in str(diagnostic_payload.get("stderr") or "")
                     and "splice" in prior.code
                 ):
                     diagnostic_payload["required_change"] = (
@@ -2348,7 +3015,7 @@ class StressCoordinator:
                         "pointer；只在确认合法后追加操作。large/random 不维护动态序列，只输出"
                         "契约中无条件合法或只读的操作。"
                     )
-                if failed_role == "reference" and (
+                if failed_role in REFERENCE_ROLES and (
                     "timeout" in str(exc).casefold()
                     or "runtime" in str(exc).casefold()
                 ):
@@ -2396,36 +3063,64 @@ class StressCoordinator:
                 machine_diagnostic_history[failed_role] = (
                     machine_diagnostic_history[failed_role][-3:]
                 )
+                repaired_generator_plan: dict[str, Any] | None = None
+                rewrite_from_scratch = _preflight_repair_from_scratch(
+                    failed_role,
+                    exc,
+                    repair_attempt=repair_counts[failed_role],
+                )
                 try:
-                    replacement, repair_usage = generate_artifact(
-                        client,
-                        kind=failed_role,
-                        problem_id=problem_id,
-                        statement=statement,
-                        contract=preparation.contract,
-                        settings=model_settings,
-                        generator_blueprint=(
-                            preparation.generator_blueprint
-                            if failed_role == "generator"
-                            else None
-                        ),
-                        generation_mode=generation_mode,
-                        diagnostic=diagnostic,
-                        previous_code=(
-                            ""
-                            if failed_role == "generator"
-                            and repair_counts[failed_role] >= 2
-                            else prior.code
-                        ),
-                        repair_from_scratch=(
-                            failed_role == "generator"
-                            and repair_counts[failed_role] >= 2
-                        ),
-                        provider_reserve_seconds=65.0,
-                        budget=budget,
-                        progress_callback=None,
-                        cancel_scope=cancel_scope,
-                    )
+                    if (
+                        failed_role == "generator"
+                        and isinstance(preparation.generator_blueprint, Mapping)
+                        and preparation.generator_blueprint.get("engine")
+                        == GENERATOR_RECIPE_ENGINE
+                    ):
+                        repaired_generator_plan, repair_usage = (
+                            generate_generator_recipe(
+                                client,
+                                problem_id=problem_id,
+                                statement=statement,
+                                contract=preparation.contract,
+                                settings=model_settings,
+                                generation_mode=generation_mode,
+                                diagnostic=diagnostic,
+                                previous_recipe=preparation.generator_blueprint,
+                                repair_limit=0,
+                                provider_reserve_seconds=65.0,
+                                budget=budget,
+                                progress_callback=None,
+                                cancel_scope=cancel_scope,
+                            )
+                        )
+                        replacement = compose_generator_recipe_artifact(
+                            repaired_generator_plan,
+                            contract=preparation.contract,
+                        )
+                    else:
+                        replacement, repair_usage = generate_artifact(
+                            client,
+                            kind=failed_role,
+                            problem_id=problem_id,
+                            statement=statement,
+                            contract=preparation.contract,
+                            settings=model_settings,
+                            generator_blueprint=(
+                                preparation.generator_blueprint
+                                if failed_role == "generator"
+                                else None
+                            ),
+                            generation_mode=generation_mode,
+                            diagnostic=diagnostic,
+                            previous_code=(
+                                "" if rewrite_from_scratch else prior.code
+                            ),
+                            repair_from_scratch=rewrite_from_scratch,
+                            provider_reserve_seconds=65.0,
+                            budget=budget,
+                            progress_callback=None,
+                            cancel_scope=cancel_scope,
+                        )
                 except Exception as repair_exc:
                     details = getattr(repair_exc, "details", None)
                     if isinstance(details, dict):
@@ -2446,7 +3141,7 @@ class StressCoordinator:
                     except (AttributeError, TypeError):
                         pass
                     raise
-                if failed_role == "reference":
+                if failed_role in REFERENCE_ROLES:
                     replacement = replace(
                         replacement,
                         source_url=prior.source_url,
@@ -2464,13 +3159,28 @@ class StressCoordinator:
                 preparation = StressPreparation(
                     dict(preparation.contract),
                     machine_artifacts["generator"],
-                    machine_artifacts["brute"],
-                    machine_artifacts["reference"],
+                    machine_artifacts["reference_primary"],
+                    machine_artifacts["reference_secondary"],
                     usage,
-                    preparation.generator_blueprint,
+                    (
+                        repaired_generator_plan
+                        if repaired_generator_plan is not None
+                        else preparation.generator_blueprint
+                    ),
                     dict(preparation.generation_metadata),
                     machine_artifacts["validator"],
                 )
+                if (
+                    repaired_generator_plan is not None
+                    and blueprint_cache_key
+                    and blueprint_cache_identity
+                ):
+                    self._save_generator_blueprint(
+                        blueprint_cache_key,
+                        blueprint_cache_identity,
+                        repaired_generator_plan,
+                        replace_alias=True,
+                    )
                 candidate_refs = self._checkpoint_candidates(
                     preparation,
                     platform=platform,
@@ -2485,20 +3195,6 @@ class StressCoordinator:
                 role: artifact.code
                 for role, artifact in machine_artifacts.items()
                 if artifact is not None
-            }
-            stored_problem_id = (
-                problem_id[2:]
-                if platform == "codeforces" and problem_id.upper().startswith("CF")
-                else problem_id
-            )
-            proof_identity = {
-                "compiler_fingerprint": _compiler_fingerprint(),
-                "sandbox": (
-                    f"{sandbox.__class__.__module__}."
-                    f"{sandbox.__class__.__qualname__}"
-                ),
-                "safety_policy_version": STRESS_SAFETY_POLICY_VERSION,
-                "protocol": {"profile": 2, "preflight": STRESS_PREFLIGHT_VERSION},
             }
             with Database(self.paths.database) as db:
                 qualified_store = StressCheckpointStore(
@@ -2515,24 +3211,28 @@ class StressCoordinator:
                         status="passed",
                         result={"source_safe": True, "compiled": True},
                     )
-        preparation, audit_reports, repair_counts = (
-            self._audit_and_repair_generated_artifacts(
-                client,
-                preparation,
-                problem_id=problem_id,
-                statement=statement,
-                model_settings=model_settings,
-                generation_mode=generation_mode,
-                progress_callback=progress_callback,
-                budget=budget,
-                repair_counts=repair_counts,
-                blueprint_cache_key=blueprint_cache_key,
-                blueprint_cache_identity=blueprint_cache_identity,
-                machine_gate_evidence=qualification_result,
-                machine_gate_codes=qualified_codes,
-                cancel_scope=cancel_scope,
+        if minimal_verification:
+            audit_reports: dict[str, dict[str, Any]] = {}
+            repair_counts = _initial_repair_counts(preparation)
+        else:
+            preparation, audit_reports, repair_counts = (
+                self._audit_and_repair_generated_artifacts(
+                    client,
+                    preparation,
+                    problem_id=problem_id,
+                    statement=statement,
+                    model_settings=model_settings,
+                    generation_mode=generation_mode,
+                    progress_callback=progress_callback,
+                    budget=budget,
+                    repair_counts=repair_counts,
+                    blueprint_cache_key=blueprint_cache_key,
+                    blueprint_cache_identity=blueprint_cache_identity,
+                    machine_gate_evidence=qualification_result,
+                    machine_gate_codes=qualified_codes,
+                    cancel_scope=cancel_scope,
+                )
             )
-        )
         candidate_refs = self._checkpoint_candidates(
             preparation,
             platform=platform,
@@ -2545,23 +3245,35 @@ class StressCoordinator:
         post_audit_codes = {
             "generator": preparation.generator.code if preparation.generator else "",
             "validator": preparation.validator.code if preparation.validator else "",
-            "brute": preparation.brute.code if preparation.brute else "",
-            "reference": preparation.reference.code if preparation.reference else "",
+            "reference_primary": (
+                preparation.reference_primary.code if preparation.reference_primary else ""
+            ),
+            "reference_secondary": (
+                preparation.reference_secondary.code if preparation.reference_secondary else ""
+            ),
         }
         if post_audit_codes != qualified_codes:
-            manager.discard(qualified_staged)
+            if qualified_staged is not None:
+                manager.discard(qualified_staged)
             qualified_staged = None
         preflight_validation: dict[str, Any] = {}
         bundle: HelperBundle | None = None
         certification_row: Mapping[str, Any] | None = None
+        pre_apply_gate_result: Mapping[str, Any] | None = None
+        degraded = degraded_reason is not None and preparation.validator is None
+        if degraded and not unvalidated_large:
+            include_large = False
+        effective_include_large = bool(include_large)
         while bundle is None:
             current_artifacts = {
                 "generator": preparation.generator,
                 "validator": preparation.validator,
-                "brute": preparation.brute,
-                "reference": preparation.reference,
+                "reference_primary": preparation.reference_primary,
+                "reference_secondary": preparation.reference_secondary,
             }
-            assert all(current_artifacts.values())
+            assert current_artifacts["generator"] is not None
+            assert current_artifacts["reference_primary"] is not None
+            assert current_artifacts["reference_secondary"] is not None
             candidate_refs = self._checkpoint_candidates(
                 preparation,
                 platform=platform,
@@ -2573,9 +3285,13 @@ class StressCoordinator:
             )
             sources = HelperSources(
                 current_artifacts["generator"].code,
-                current_artifacts["brute"].code,
-                current_artifacts["reference"].code,
-                current_artifacts["validator"].code,
+                current_artifacts["reference_primary"].code,
+                current_artifacts["reference_secondary"].code,
+                (
+                    current_artifacts["validator"].code
+                    if current_artifacts["validator"] is not None
+                    else None
+                ),
             )
             def report_preflight(
                 profile_name: str,
@@ -2632,20 +3348,39 @@ class StressCoordinator:
                         "preflight_helpers", "调试构建与逐 case 预验", 8, 10
                     )
                 preflight_samples = self._samples(problem_id, platform=platform)
+                local_recipe_preflight = bool(
+                    isinstance(preparation.generator_blueprint, Mapping)
+                    and preparation.generator_blueprint.get("engine")
+                    in {GENERATOR_RECIPE_ENGINE, GENERATOR_RECIPE_V2_ENGINE}
+                )
                 preflight_config = HelperPreflightConfig(
                     contract_hash=sha256_bytes(contract_bytes),
                     samples=preflight_samples,
                     generator_blueprint=preparation.generator_blueprint,
-                    validator_probes=tuple(
-                        preparation.contract.get("validator_probes", [])
+                    validator_probes=(
+                        tuple(preparation.contract.get("validator_probes", []))
+                        if preparation.validator is not None
+                        else ()
                     ),
-                    include_large=bool(include_large),
+                    include_large=effective_include_large,
                     exact_output=compare == "exact",
                     small_random_cases=16,
                     generator_timeout=float(timeout),
-                    reference_timeout=float(timeout),
-                    brute_timeout=float(brute_timeout),
+                    reference_primary_timeout=float(timeout),
+                    reference_secondary_timeout=float(
+                        reference_secondary_timeout or timeout
+                    ),
                     validator_timeout=float(timeout),
+                    require_manifest=(
+                        local_recipe_preflight or not minimal_verification
+                    ),
+                    require_coverage=(
+                        local_recipe_preflight or not minimal_verification
+                    ),
+                    # The 16-case small/random window is already executed in
+                    # minimal mode.  Always use it to reject a seed-insensitive
+                    # generator; this adds no provider calls or sandbox cases.
+                    require_seed_variation=True,
                     deadline=budget.work_deadline,
                     clock=budget.clock,
                 )
@@ -2667,11 +3402,15 @@ class StressCoordinator:
                         producer_ai_run_id=ai_run_id,
                     )
                     certification_row = (
-                        checkpoint_store.save_exact_trio_certification(
+                        checkpoint_store.save_dual_reference_certification(
                             generator=candidate_refs["generator"],
-                            validator=candidate_refs["validator"],
-                            brute=candidate_refs["brute"],
-                            reference=candidate_refs["reference"],
+                            validator=(
+                                candidate_refs["validator"]
+                                if "validator" in candidate_refs
+                                else None
+                            ),
+                            reference_primary=candidate_refs["reference_primary"],
+                            reference_secondary=candidate_refs["reference_secondary"],
                             compiler={"fingerprint": _compiler_fingerprint()},
                             sandbox={
                                 "backend": (
@@ -2682,20 +3421,32 @@ class StressCoordinator:
                             },
                             samples=preflight_samples,
                             protocol={
+                                "oracle_protocol": DUAL_REFERENCE_PROTOCOL,
                                 "profile_version": 2,
-                                "manifest_version": 1,
+                                "manifest_version": (
+                                    2
+                                    if isinstance(
+                                        preparation.generator_blueprint, Mapping
+                                    )
+                                    and preparation.generator_blueprint.get("engine")
+                                    == GENERATOR_RECIPE_V2_ENGINE
+                                    else 1
+                                ),
                                 "trusted_harness_version": TRUSTED_GENERATOR_HARNESS_VERSION,
                                 "contract_schema_version": 3,
+                                **_recipe_identity_fields(),
                             },
                             gate={
                                 "preflight_version": STRESS_PREFLIGHT_VERSION,
                                 "small_random_cases": 16,
-                                "include_large": bool(include_large),
+                                "include_large": effective_include_large,
+                                "unvalidated": bool(degraded),
+                                "degraded_reason": degraded_reason or "",
                             },
                             scope={
                                 "official_samples": len(preflight_samples),
                                 "small_random_cases": 16,
-                                "large_cases": 2 if include_large else 0,
+                                "large_cases": 2 if effective_include_large else 0,
                             },
                             preflight=preflight_validation,
                         )
@@ -2714,7 +3465,7 @@ class StressCoordinator:
             except HelperPreflightError as exc:
                 failed_artifact = str(exc.artifact)
                 failed_candidates = (
-                    ("brute", "reference")
+                    REFERENCE_ROLES
                     if failed_artifact == "oracle"
                     else (failed_artifact,)
                 )
@@ -2751,23 +3502,30 @@ class StressCoordinator:
                     ) from exc
                 failed_role = str(exc.artifact)
                 if failed_role == "oracle":
-                    reference = preparation.reference
-                    if _next_external_reference(reference) is not None:
-                        failed_role = "reference"
-                    elif reference is not None and reference.origin != "ai_generated":
-                        failed_role = "brute"
-                    else:
-                        raise StressRuntimeError(
-                            "stress_oracle_preflight_conflict",
-                            "AI-generated reference 与 brute 在写入前无法达成一致；旧 helper 未修改，run 未创建",
-                            details=exc.details,
-                            usage=preparation.usage,
-                        ) from exc
-                if failed_role == "reference":
-                    alternate = _next_external_reference(preparation.reference)
+                    primary_failure = _role_failure_details(
+                        exc,
+                        role="oracle",
+                        stage="preflight_helpers",
+                        substage="preflight",
+                        elapsed=budget.elapsed(),
+                        attempts=0,
+                    )
+                    raise StressRuntimeError(
+                        "stress_oracle_preflight_conflict",
+                        "两份 reference 在写入前输出不一致；旧 helper 未修改，run 未创建",
+                        details={
+                            **exc.details,
+                            "primary_failure": primary_failure,
+                        },
+                        usage=preparation.usage,
+                    ) from exc
+                if failed_role in REFERENCE_ROLES:
+                    alternate = _next_external_reference(
+                        getattr(preparation, failed_role), role=failed_role
+                    )
                     if alternate is not None:
                         preparation = _use_reference_alternate(
-                            preparation, alternate
+                            preparation, alternate, role=failed_role
                         )
                         continue
                 if failed_role not in enabled_roles or not enabled_roles[failed_role]:
@@ -2777,7 +3535,23 @@ class StressCoordinator:
                         details=exc.details,
                         usage=preparation.usage,
                     ) from exc
-                repair_limit = 2 if failed_role == "generator" else 1
+                if (
+                    failed_role == "generator"
+                    and isinstance(preparation.generator_blueprint, Mapping)
+                    and preparation.generator_blueprint.get("engine")
+                    == GENERATOR_RECIPE_V2_ENGINE
+                ):
+                    raise StressRuntimeError(
+                        "stress_local_recipe_v2_preflight_failed",
+                        "确定性 generator_recipe/v2 未通过写入前预验；禁止回退或调用 AI generator",
+                        details={
+                            **exc.details,
+                            "root_cause_code": str(exc.code),
+                            "generator_engine": GENERATOR_RECIPE_V2_ENGINE,
+                        },
+                        usage=preparation.usage,
+                    ) from exc
+                repair_limit = _preflight_role_repair_limit(failed_role, exc)
                 if repair_counts.get(failed_role, 0) >= repair_limit:
                     primary_failure = _role_failure_details(
                         exc,
@@ -2828,6 +3602,9 @@ class StressCoordinator:
                         failed_role, []
                     )[-3:],
                 }
+                repair_witness = _preflight_repair_witness(exc)
+                if repair_witness is not None:
+                    diagnostic_payload["witness"] = repair_witness
                 if failed_role == "generator":
                     diagnostic_payload["invariants_to_preserve"] = (
                         _generator_repair_invariants(
@@ -2839,45 +3616,75 @@ class StressCoordinator:
                     ensure_ascii=False,
                 )[:4000]
                 prior = current_artifacts[failed_role]
+                repaired_generator_plan: dict[str, Any] | None = None
+                rewrite_from_scratch = _preflight_repair_from_scratch(
+                    failed_role,
+                    exc,
+                    repair_attempt=repair_counts[failed_role],
+                )
                 try:
-                    replacement, repair_usage = generate_artifact(
-                        client,
-                        kind=failed_role,
-                        problem_id=problem_id,
-                        statement=statement,
-                        contract=preparation.contract,
-                        settings=model_settings,
-                        generator_blueprint=(
-                            preparation.generator_blueprint
-                            if failed_role == "generator"
-                            else None
-                        ),
-                        generation_mode=generation_mode,
-                        diagnostic=diagnostic,
-                        previous_code=(
-                            ""
-                            if failed_role == "generator"
-                            and repair_counts[failed_role] >= 2
-                            else prior.code
-                            if prior
-                            else ""
-                        ),
-                        repair_from_scratch=(
-                            failed_role == "generator"
-                            and repair_counts[failed_role] >= 2
-                        ),
-                        provider_reserve_seconds=(
-                            75.0
-                            if failed_role == "generator"
-                            and repair_counts[failed_role] >= 2
-                            else 115.0
-                            if failed_role == "generator"
-                            else 65.0
-                        ),
-                        budget=budget,
-                        progress_callback=None,
-                        cancel_scope=cancel_scope,
-                    )
+                    if (
+                        failed_role == "generator"
+                        and isinstance(preparation.generator_blueprint, Mapping)
+                        and preparation.generator_blueprint.get("engine")
+                        == GENERATOR_RECIPE_ENGINE
+                    ):
+                        repaired_generator_plan, repair_usage = (
+                            generate_generator_recipe(
+                                client,
+                                problem_id=problem_id,
+                                statement=statement,
+                                contract=preparation.contract,
+                                settings=model_settings,
+                                generation_mode=generation_mode,
+                                diagnostic=diagnostic,
+                                previous_recipe=preparation.generator_blueprint,
+                                repair_limit=0,
+                                provider_reserve_seconds=115.0,
+                                budget=budget,
+                                progress_callback=None,
+                                cancel_scope=cancel_scope,
+                            )
+                        )
+                        replacement = compose_generator_recipe_artifact(
+                            repaired_generator_plan,
+                            contract=preparation.contract,
+                        )
+                    else:
+                        replacement, repair_usage = generate_artifact(
+                            client,
+                            kind=failed_role,
+                            problem_id=problem_id,
+                            statement=statement,
+                            contract=preparation.contract,
+                            settings=model_settings,
+                            generator_blueprint=(
+                                preparation.generator_blueprint
+                                if failed_role == "generator"
+                                else None
+                            ),
+                            generation_mode=generation_mode,
+                            diagnostic=diagnostic,
+                            previous_code=(
+                                ""
+                                if rewrite_from_scratch
+                                else prior.code
+                                if prior
+                                else ""
+                            ),
+                            repair_from_scratch=rewrite_from_scratch,
+                            provider_reserve_seconds=(
+                                75.0
+                                if failed_role == "generator"
+                                and repair_counts[failed_role] >= 2
+                                else 115.0
+                                if failed_role == "generator"
+                                else 65.0
+                            ),
+                            budget=budget,
+                            progress_callback=None,
+                            cancel_scope=cancel_scope,
+                        )
                 except Exception as repair_exc:
                     details = getattr(repair_exc, "details", None)
                     if isinstance(details, dict):
@@ -2899,7 +3706,7 @@ class StressCoordinator:
                         pass
                     raise
                 assert prior is not None
-                if failed_role == "reference":
+                if failed_role in REFERENCE_ROLES:
                     replacement = replace(
                         replacement,
                         source_url=prior.source_url,
@@ -2917,38 +3724,95 @@ class StressCoordinator:
                 preparation = StressPreparation(
                     dict(preparation.contract),
                     current_artifacts["generator"],
-                    current_artifacts["brute"],
-                    current_artifacts["reference"],
+                    current_artifacts["reference_primary"],
+                    current_artifacts["reference_secondary"],
                     usage,
-                    preparation.generator_blueprint,
+                    (
+                        repaired_generator_plan
+                        if repaired_generator_plan is not None
+                        else preparation.generator_blueprint
+                    ),
                     dict(preparation.generation_metadata),
                     current_artifacts["validator"],
                 )
-                preparation, refreshed_audits, repair_counts = (
-                    self._audit_and_repair_generated_artifacts(
-                        client,
-                        preparation,
-                        problem_id=problem_id,
-                        statement=statement,
-                        model_settings=model_settings,
-                        generation_mode=generation_mode,
-                        progress_callback=progress_callback,
-                        budget=budget,
-                        repair_counts=repair_counts,
-                        blueprint_cache_key=blueprint_cache_key,
-                        blueprint_cache_identity=blueprint_cache_identity,
-                        machine_gate_evidence=qualification_result,
-                        machine_gate_codes=qualified_codes,
-                        cancel_scope=cancel_scope,
+                if (
+                    repaired_generator_plan is not None
+                    and blueprint_cache_key
+                    and blueprint_cache_identity
+                ):
+                    self._save_generator_blueprint(
+                        blueprint_cache_key,
+                        blueprint_cache_identity,
+                        repaired_generator_plan,
+                        replace_alias=True,
                     )
-                )
-                audit_reports.update(refreshed_audits)
+                if not minimal_verification:
+                    preparation, refreshed_audits, repair_counts = (
+                        self._audit_and_repair_generated_artifacts(
+                            client,
+                            preparation,
+                            problem_id=problem_id,
+                            statement=statement,
+                            model_settings=model_settings,
+                            generation_mode=generation_mode,
+                            progress_callback=progress_callback,
+                            budget=budget,
+                            repair_counts=repair_counts,
+                            blueprint_cache_key=blueprint_cache_key,
+                            blueprint_cache_identity=blueprint_cache_identity,
+                            machine_gate_evidence=qualification_result,
+                            machine_gate_codes=qualified_codes,
+                            cancel_scope=cancel_scope,
+                        )
+                    )
+                    audit_reports.update(refreshed_audits)
                 continue
             if progress_callback is not None:
                 progress_callback(
                     "apply_helpers", "安全替换 helper", 9, 10
                 )
             assert staged is not None
+            if _pre_apply_gate is not None and preparation.validator is not None:
+                try:
+                    pre_apply_gate_result = _pre_apply_gate(staged)
+                except Exception as exc:
+                    manager.discard(staged)
+                    details = dict(getattr(exc, "details", None) or {})
+                    details.setdefault(
+                        "code", str(getattr(exc, "code", type(exc).__name__))
+                    )
+                    details.setdefault("message", str(exc)[:1000])
+                    raise StressRuntimeError(
+                        "stress_pre_apply_gate",
+                        "模型不可见的发布前认证未通过；旧 helper 未修改，run 未创建",
+                        details=details,
+                        usage=preparation.usage,
+                    ) from exc
+            strict_validator_requested = bool(
+                include_validator
+                and not minimal_verification
+                and not allow_validator_degradation
+            )
+            if strict_validator_requested and (
+                preparation.validator is None
+                or not _validator_preflight_succeeded(preflight_validation)
+            ):
+                manager.discard(staged)
+                raise StressRuntimeError(
+                    "stress_validator_certification_missing",
+                    "validator 严格认证未生成完整的 validator/probe 证据",
+                    details={
+                        "validator_strict_certification_failed": True,
+                        "validator_present": preparation.validator is not None,
+                        "validator_preflight_succeeded": (
+                            _validator_preflight_succeeded(preflight_validation)
+                        ),
+                        "validator_probes_recorded": isinstance(
+                            preflight_validation.get("validator_probes"), list
+                        ),
+                    },
+                    usage=preparation.usage,
+                )
             budget.require("apply_helpers")
             bundle = manager.apply(staged)
         try:
@@ -2961,8 +3825,9 @@ class StressCoordinator:
                 statement=statement,
                 compare=compare,
                 include_generator=include_generator,
-                include_brute=include_brute,
-                include_reference=include_reference,
+                include_validator=preparation.validator is not None,
+                include_reference_primary=include_reference_primary,
+                include_reference_secondary=include_reference_secondary,
                 include_large=include_large,
                 model_settings=model_settings,
                 sandbox=sandbox,
@@ -2986,8 +3851,11 @@ class StressCoordinator:
                 large_per_cycle=1 if include_large else 0,
                 solution_timeout=float(timeout),
                 generator_timeout=float(timeout),
-                reference_timeout=float(timeout),
-                brute_timeout=float(brute_timeout),
+                reference_primary_timeout=float(timeout),
+                reference_secondary_timeout=float(
+                    reference_secondary_timeout or timeout
+                ),
+                oracle_protocol=DUAL_REFERENCE_PROTOCOL,
                 validator_timeout=float(timeout),
                 max_cases=run_max_cases,
                 exact_output=compare == "exact",
@@ -3013,6 +3881,16 @@ class StressCoordinator:
                 audit_reports=audit_reports,
                 preparation_cache_key=cache_key,
                 certification_key=str(certification_row["certification_key"]),
+                cacheable=not manual_override and not degraded,
+                unvalidated=bool(degraded),
+                degraded_reason=degraded_reason,
+                validator_requested=bool(
+                    include_validator and not minimal_verification
+                ),
+                validator_certified=(
+                    preparation.validator is not None
+                    and _validator_preflight_succeeded(preflight_validation)
+                ),
                 preparation_meta={
                     "cache_identity": cache_identity,
                     "contract_sha256": sha256_bytes(contract_bytes),
@@ -3027,6 +3905,25 @@ class StressCoordinator:
                         if preparation.generator_blueprint is not None
                         else ""
                     ),
+                    "generator_recipe": (
+                        dict(preparation.generator_blueprint)
+                        if isinstance(preparation.generator_blueprint, Mapping)
+                        and preparation.generator_blueprint.get("engine")
+                        in {GENERATOR_RECIPE_ENGINE, GENERATOR_RECIPE_V2_ENGINE}
+                        else None
+                    ),
+                    "recipe_sha256": (
+                        sha256_bytes(_canonical_json(preparation.generator_blueprint))
+                        if isinstance(preparation.generator_blueprint, Mapping)
+                        and preparation.generator_blueprint.get("engine")
+                        in {GENERATOR_RECIPE_ENGINE, GENERATOR_RECIPE_V2_ENGINE}
+                        else ""
+                    ),
+                    "generator_engine": str(
+                        preparation.generation_metadata.get("generator_engine")
+                        or "legacy_ai_cpp"
+                    ),
+                    **_recipe_identity_fields(),
                     "blueprint_cache_result": blueprint_cache_result,
                     "generation": dict(preparation.generation_metadata),
                     "fast_fallback_used": bool(
@@ -3040,7 +3937,13 @@ class StressCoordinator:
                     "budget": budget.snapshot(),
                     "cache_result": "miss" if not force_regenerate else "forced",
                     "contract_cache_result": contract_cache_result,
-                    "validator_candidate_id": candidate_refs["validator"].id,
+                    "validator_candidate_id": (
+                        candidate_refs["validator"].id
+                        if "validator" in candidate_refs
+                        else "unvalidated"
+                    ),
+                    "unvalidated": bool(degraded),
+                    "degraded_reason": degraded_reason or "",
                 },
             )
         except Exception:
@@ -3054,6 +3957,9 @@ class StressCoordinator:
             "run": self.run(run_id),
             "bundle": self.bundle(bundle.bundle_id),
             "usage": preparation.usage,
+            "pre_apply_gate_result": (
+                dict(pre_apply_gate_result) if pre_apply_gate_result is not None else None
+            ),
             "preparation": {
                 **budget.snapshot(),
                 "cache_result": "miss" if not force_regenerate else "forced",
@@ -3076,13 +3982,18 @@ class StressCoordinator:
         budget: PreparationBudget | None = None,
         reuse_helpers: bool = False,
     ) -> StressExecutables:
-        compiler = shutil.which("g++")
+        compiler = resolve_cpp_compiler("g++")
         if compiler is None:
-            raise StressRuntimeError("compiler_missing", "找不到 g++")
+            raise StressRuntimeError("compiler_missing", "找不到可用的 C++17 编译器")
         staging = Path(bundle.staging_dir).resolve()
         targets = {"solution": primary}
         outputs: dict[str, Path] = {}
-        for role in ("generator", "brute", "reference"):
+        helper_roles = (
+            ("generator", *REFERENCE_ROLES)
+            if set(REFERENCE_ROLES).issubset(bundle.helper_paths)
+            else ("generator", "brute", "reference")
+        )
+        for role in helper_roles:
             cached = Path(str(bundle.release_executables.get(role) or ""))
             if reuse_helpers and cached.is_file():
                 outputs[role] = cached
@@ -3105,8 +4016,7 @@ class StressCoordinator:
             command = [
                 compiler,
                 "-std=c++17",
-                "-O2",
-                "-static",
+                *portable_cpp_flags(("-O2", "-static")),
                 str(source),
                 "-o",
                 str(output),
@@ -3138,12 +4048,20 @@ class StressCoordinator:
             for future in as_completed(futures):
                 role, output = future.result()
                 outputs[role] = output
+        if set(REFERENCE_ROLES).issubset(outputs):
+            return StressExecutables(
+                outputs["solution"],
+                outputs["generator"],
+                reference_primary=outputs["reference_primary"],
+                reference_secondary=outputs["reference_secondary"],
+                validator=outputs.get("validator"),
+            )
         return StressExecutables(
             outputs["solution"],
             outputs["generator"],
-            outputs["brute"],
-            outputs["reference"],
-            outputs.get("validator"),
+            brute=outputs["brute"],
+            reference=outputs["reference"],
+            validator=outputs.get("validator"),
         )
 
     def _persist_bundle_and_run(
@@ -3164,6 +4082,11 @@ class StressCoordinator:
         preparation_cache_key: str,
         certification_key: str,
         preparation_meta: Mapping[str, Any],
+        cacheable: bool = True,
+        unvalidated: bool = False,
+        degraded_reason: str | None = None,
+        validator_requested: bool = False,
+        validator_certified: bool = False,
     ) -> None:
         stored_problem_id = (
             problem_id[2:]
@@ -3172,24 +4095,26 @@ class StressCoordinator:
         )
         artifacts = {
             "generator": preparation.generator,
-            "brute": preparation.brute,
-            "reference": preparation.reference,
+            "validator": preparation.validator,
+            "reference_primary": preparation.reference_primary,
+            "reference_secondary": preparation.reference_secondary,
         }
         with Database(self.paths.database) as db:
             with db.atomic():
                 db.upsert_problem({"platform": platform, "problem_id": stored_problem_id})
-                db.save_stress_preparation_cache(
-                    preparation_cache_key,
-                    payload={
-                        "cache_identity": dict(
-                            preparation_meta.get("cache_identity") or {}
-                        )
-                    },
-                    metadata={
-                        "status": "validated",
-                        "last_used_at": _utc_now(),
-                    },
-                )
+                if cacheable:
+                    db.save_stress_preparation_cache(
+                        preparation_cache_key,
+                        payload={
+                            "cache_identity": dict(
+                                preparation_meta.get("cache_identity") or {}
+                            )
+                        },
+                        metadata={
+                            "status": "validated",
+                            "last_used_at": _utc_now(),
+                        },
+                    )
                 db.create_stress_artifact_bundle(
                     bundle.bundle_id,
                     platform=platform,
@@ -3197,7 +4122,9 @@ class StressCoordinator:
                     attempt_id=attempt_id,
                     contract=preparation.contract,
                     baseline_manifest=bundle.to_dict(),
-                    preparation_cache_key=preparation_cache_key,
+                    preparation_cache_key=(
+                        preparation_cache_key if cacheable else None
+                    ),
                     certification_key=certification_key,
                     preparation_meta=preparation_meta,
                     status="applied",
@@ -3210,19 +4137,30 @@ class StressCoordinator:
                 )
                 for role, generated in artifacts.items():
                     if generated is None:
+                        if role == "validator":
+                            continue
                         path = Path(bundle.helper_paths[role])
                         generated = GeneratedArtifact(
                             role, path.read_text(encoding="utf-8"), "local_existing", "使用已有 helper"
                         )
+                    if role == "validator":
+                        target_path = (
+                            Path(bundle.staging_dir)
+                            / f"{bundle.problem_id}.validator.cpp"
+                        )
+                        baseline_hash = None
+                    else:
+                        target_path = bundle.helper_paths[role]
+                        baseline_hash = bundle.baseline_hashes[role]
                     db.save_stress_artifact(
                         str(uuid4()),
                         bundle_id=bundle.bundle_id,
                         kind=role,
                         source_code=generated.code,
-                        target_path=bundle.helper_paths[role],
+                        target_path=target_path,
                         source_kind=generated.origin,
                         ai_run_id=ai_run_id,
-                        baseline_hash=bundle.baseline_hashes[role],
+                        baseline_hash=baseline_hash,
                         source_url=generated.source_url,
                         source_title=generated.source_title,
                         source_license=generated.license,
@@ -3255,7 +4193,14 @@ class StressCoordinator:
                     user_source_path=primary,
                     user_source_hash=sha256_file(primary),
                     attempt_id=attempt_id,
-                    config={**asdict(config), "rate_base_total": 0},
+                    config={
+                        **asdict(config),
+                        "rate_base_total": 0,
+                        "unvalidated": bool(unvalidated),
+                        "degraded_reason": degraded_reason or "",
+                        "validator_requested": bool(validator_requested),
+                        "validator_certified": bool(validator_certified),
+                    },
                     status="pending",
                     phase="preparing",
                     start_seed=config.first_seed,
@@ -3272,6 +4217,8 @@ class StressCoordinator:
                     problem_id=stored_problem_id,
                     producer_ai_run_id=ai_run_id,
                 )
+                if not cacheable:
+                    return
                 certification_alias_key = f"bundle:{preparation_cache_key}"
                 current_alias = db.stress_cache_alias(certification_alias_key)
                 if (
@@ -3299,6 +4246,8 @@ class StressCoordinator:
         primary: Path,
         run_id: str,
         config: StressRunConfig,
+        validator_requested: bool = False,
+        validator_certified: bool = False,
     ) -> None:
         stored_problem_id = (
             problem_id[2:]
@@ -3314,7 +4263,12 @@ class StressCoordinator:
                 user_source_path=primary,
                 user_source_hash=sha256_file(primary),
                 attempt_id=attempt_id,
-                config={**asdict(config), "rate_base_total": 0},
+                config={
+                    **asdict(config),
+                    "rate_base_total": 0,
+                    "validator_requested": bool(validator_requested),
+                    "validator_certified": bool(validator_certified),
+                },
                 status="pending",
                 phase="preparing",
                 start_seed=config.first_seed,
@@ -3364,6 +4318,31 @@ class StressCoordinator:
                     )
         return samples
 
+    def _run_contract(
+        self, bundle: HelperBundle, preparation: StressPreparation | None
+    ) -> Mapping[str, Any] | None:
+        """The contract the search driver profiles inputs against.
+
+        ``preparation`` is ``None`` on the resume path, so fall back to the copy
+        persisted with the bundle.  Returning ``None`` is safe — the runner then
+        stays recipe-only, which is the pre-driver behaviour.
+        """
+
+        if preparation is not None and preparation.contract:
+            return preparation.contract
+        try:
+            with Database(self.paths.database) as db:
+                row = db.stress_artifact_bundle(bundle.bundle_id)
+        except (OSError, sqlite3.Error):
+            return None
+        if row is None:
+            return None
+        try:
+            contract = json.loads(row["contract_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return contract if isinstance(contract, Mapping) and contract else None
+
     def _launch(
         self,
         run_id: str,
@@ -3377,6 +4356,7 @@ class StressCoordinator:
         base_large: int = 0,
         base_total: int = 0,
         reference_source_override: Mapping[str, str] | None = None,
+        reference_sources_override: Mapping[str, Mapping[str, str]] | None = None,
     ) -> None:
         with self._lock:
             existing = self._threads.get(run_id)
@@ -3431,14 +4411,37 @@ class StressCoordinator:
                             )
                         helpers_validated = True
 
-            reference = preparation.reference if preparation is not None else None
             reference_source = dict(reference_source_override or {})
-            if reference is not None:
-                reference_source = {
-                    "url": reference.source_url or "",
-                    "title": reference.source_title or "",
-                    "origin": reference.origin,
+            reference_sources = {
+                str(role): dict(source)
+                for role, source in dict(reference_sources_override or {}).items()
+            }
+            if preparation is not None:
+                for role in REFERENCE_ROLES:
+                    reference = getattr(preparation, role)
+                    if reference is not None:
+                        reference_sources[role] = {
+                            "url": reference.source_url or "",
+                            "title": reference.source_title or "",
+                            "origin": reference.origin,
+                        }
+            helper_roles = (
+                ("generator", *REFERENCE_ROLES)
+                if set(REFERENCE_ROLES).issubset(bundle.helper_paths)
+                else ("generator", "brute", "reference")
+            )
+            source_hashes = {"solution": sha256_file(executables.solution)}
+            source_hashes.update(
+                {
+                    role: sha256_file(Path(bundle.helper_paths[role]))
+                    for role in helper_roles
                 }
+            )
+            conflict_role = (
+                "reference_primary"
+                if "reference_primary" in bundle.helper_paths
+                else "reference"
+            )
             runner = LayeredStressRunner(
                 self.paths.root,
                 bundle.problem_id,
@@ -3446,14 +4449,11 @@ class StressCoordinator:
                 self._sandbox_factory(),
                 stop_token=token,
                 progress=progress,
-                source_hashes={
-                    "solution": sha256_file(executables.solution),
-                    "generator": sha256_file(Path(bundle.helper_paths["generator"])),
-                    "brute": sha256_file(Path(bundle.helper_paths["brute"])),
-                    "reference": sha256_file(Path(bundle.helper_paths["reference"])),
-                },
+                source_hashes=source_hashes,
                 reference_source=reference_source,
-                conflict_export_dir=Path(bundle.helper_paths["reference"]).resolve().parent,
+                reference_sources=reference_sources,
+                conflict_export_dir=Path(bundle.helper_paths[conflict_role]).resolve().parent,
+                contract=self._run_contract(bundle, preparation),
             )
 
             def target() -> None:
@@ -3644,6 +4644,16 @@ class StressCoordinator:
             if reference_row is not None
             else {}
         )
+        reference_sources = {
+            role: {
+                "url": str(item["source_url"] or ""),
+                "title": str(item["source_title"] or ""),
+                "origin": str(item["source_kind"] or ""),
+            }
+            for role in REFERENCE_ROLES
+            for item in artifact_rows
+            if str(item["kind"]) == role
+        }
         self._launch(
             run_id,
             bundle,
@@ -3655,6 +4665,7 @@ class StressCoordinator:
             base_large=base_large,
             base_total=base_total,
             reference_source_override=reference_source,
+            reference_sources_override=reference_sources,
         )
         return {"ok": True, "run": self.run(run_id)}
 
@@ -3700,18 +4711,8 @@ class StressCoordinator:
         with self._lock:
             active = list(self._runners.items())
             threads = list(self._threads.items())
-        for run_id, runner in active:
+        for _run_id, runner in active:
             runner.request_stop()
-            with Database(self.paths.database) as db:
-                row = db.stress_run(run_id)
-                if row is not None and row["status"] in {"pending", "preparing", "running", "stop_requested"}:
-                    db.update_stress_run(
-                        run_id,
-                        status="interrupted",
-                        phase="complete",
-                        stop_reason="service_shutdown",
-                        completed_at=_utc_now(),
-                    )
         # request_stop cancels the active sandbox process.  Wait for each
         # worker's finally block to remove its run directory and release the
         # copied AppContainer launcher before a disposable workspace is
@@ -3722,12 +4723,37 @@ class StressCoordinator:
             if remaining <= 0:
                 break
             thread.join(timeout=remaining)
+        # A worker that observed request_stop owns its final state transition.
+        # Only force an interrupted state for workers still alive after the
+        # cleanup deadline, avoiding an optimistic-revision race with normal
+        # worker completion.
+        live_run_ids = tuple(
+            run_id for run_id, thread in threads if thread.is_alive()
+        )
+        for run_id in live_run_ids:
+            with Database(self.paths.database) as db:
+                for _attempt in range(3):
+                    row = db.stress_run(run_id)
+                    if row is None or row["status"] not in {
+                        "pending", "preparing", "running", "stop_requested"
+                    }:
+                        break
+                    try:
+                        db.update_stress_run(
+                            run_id,
+                            expected_revision=int(row["revision"]),
+                            status="interrupted",
+                            phase="complete",
+                            stop_reason="service_shutdown",
+                            completed_at=_utc_now(),
+                        )
+                        break
+                    except StressRunRevisionConflict:
+                        continue
         # Callers that own a disposable workspace need to know whether it is
         # safe to remove that workspace.  Returning the still-live run ids is
         # backward compatible with callers that ignore shutdown's result.
-        return tuple(
-            run_id for run_id, thread in threads if thread.is_alive()
-        )
+        return live_run_ids
 
 
-__all__ = ["StressCoordinator", "StressRuntimeError"]
+__all__ = ["StressCoordinator", "StressRuntimeError", "normalize_stress_failure"]

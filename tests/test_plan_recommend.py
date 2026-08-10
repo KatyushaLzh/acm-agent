@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from tools.acm_agent.plan import check_plan, load_plan, plan_task_records
+from tools.acm_agent.plan import check_plan, load_plan, load_plan_data, plan_task_records
 from tools.acm_agent.recommend import (
     compute_weakness,
     estimate_cf_baseline,
@@ -44,18 +44,34 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(result.stats["required_tasks"], 91)
         self.assertEqual(result.stats["required_by_platform"], {"codeforces": 50, "luogu": 41})
 
-    def test_public_plan_is_progressive_and_has_no_personal_dates(self):
-        plan = load_plan(PLAN)
-        self.assertEqual(plan.schedule_mode, "progressive")
-        self.assertIsNone(plan.start_date)
-        self.assertIsNone(plan.end_date)
-        self.assertTrue(all(stage.due_date is None for stage in plan.stages))
-        self.assertTrue(all(stage.unlock_at is None for stage in plan.stages))
-
-        records = plan_task_records(plan)
-        d14 = [row for row in records if row["day"] == 14]
-        self.assertEqual(len(d14), 4)
-        self.assertTrue(all(row["unlock_at"] is None for row in d14))
+    def test_flattened_contest_tasks_keep_unlock_date(self):
+        raw = {
+            "schema_version": 2,
+            "plan_id": "synthetic-dated-plan",
+            "title": "Synthetic dated plan",
+            "description": "Exercises stage date propagation without repository-local dates.",
+            "schedule_mode": "dated",
+            "stages": [
+                {
+                    "stage_key": "contest",
+                    "topic": "Synthetic contest",
+                    "kind": "virtual_contest",
+                    "due_date": "2030-01-02",
+                    "unlock_at": "2030-01-02",
+                    "tasks": [
+                        {
+                            "task_key": f"contest-{index}",
+                            "problem_id": f"CF{index}A",
+                            "platform": "codeforces",
+                        }
+                        for index in range(1, 5)
+                    ],
+                }
+            ],
+        }
+        records = plan_task_records(load_plan_data(raw))
+        self.assertEqual(len(records), 4)
+        self.assertTrue(all(row["unlock_at"] == "2030-01-02" for row in records))
 
     def test_check_detects_readme_drift(self):
         text = README.read_text(encoding="utf-8-sig").replace("problem/P3374", "problem/P3375", 1)

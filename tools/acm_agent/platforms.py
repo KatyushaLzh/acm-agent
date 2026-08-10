@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any, Callable, Iterable, Iterator, Mapping, MutableMapping, Protocol, Sequence
 
-from .storage import Database, utc_now
+from .storage import Database
 
 
 CF_BASE = "https://codeforces.com/api"

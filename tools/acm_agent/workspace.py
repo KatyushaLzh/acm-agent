@@ -2,16 +2,31 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 import re
+import tempfile
 from urllib.parse import urlparse
 
 
 _CF_ID_RE = re.compile(r"^CF(?P<contest>\d+)(?P<index>[A-Z][A-Z0-9]*)$", re.I)
 _LUOGU_ID_RE = re.compile(r"^P(?P<number>\d+)$", re.I)
-_SOLUTION_RE = re.compile(r"^(CF\d+[A-Z][A-Z0-9]*|P\d+)\.cpp$", re.I)
+_SOLUTION_RE = re.compile(
+    r"^((?:CF\d+[A-Z][A-Z0-9]*|P\d+|[A-Za-z0-9_][A-Za-z0-9_.-]*[A-Za-z0-9]))\.cpp$",
+    re.I,
+)
+_HELPER_FILE_SUFFIXES = (".gen.cpp", ".bf.cpp", ".ref.cpp", ".stress.cpp")
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    }
+)
+_CUSTOM_ID_MAX_LENGTH = 64
+DEFAULT_TEMPLATE_MAX_BYTES = 64 * 1024
 
 
 DEFAULT_TEMPLATE = """#include <bits/stdc++.h>
@@ -152,7 +167,26 @@ def parse_problem_ref(value: str | ProblemRef) -> ProblemRef:
             return _require_problem_id(parts[1], expected_platform="luogu")
         raise ValueError(f"unsupported Luogu problem URL: {value}")
 
-    raise ValueError(f"unsupported problem id or URL: {value}")
+    if "://" in raw or raw.startswith("www."):
+        raise ValueError(f"unsupported problem URL: {value}")
+
+    return _custom_problem_ref(raw)
+
+
+def _custom_problem_ref(value: str) -> ProblemRef:
+    """Accept an arbitrary problem id as a pure discriminator.
+
+    The id only names files, attempt records and Markdown summaries, so any
+    value is accepted as long as it stays filesystem-safe on Windows.
+    """
+    normalized = value.upper()
+    sanitized = re.sub(r"[^\w.-]", "_", normalized, flags=re.UNICODE).strip("._-")
+    sanitized = sanitized[:_CUSTOM_ID_MAX_LENGTH]
+    if not sanitized:
+        raise ValueError(f"unsupported problem id or URL: {value}")
+    if sanitized.split(".", 1)[0] in _WINDOWS_RESERVED_NAMES:
+        raise ValueError(f"problem id {value!r} conflicts with a Windows reserved name")
+    return ProblemRef("custom", sanitized)
 
 
 def _parse_problem_id(value: str) -> ProblemRef | None:
@@ -200,6 +234,12 @@ def scan_local_solutions(root: str | Path) -> list[LocalSolution]:
                 for path in day_dir.iterdir():
                     if not path.is_file():
                         continue
+                    name_lower = path.name.lower()
+                    if (
+                        name_lower == "template.cpp"
+                        or name_lower.endswith(_HELPER_FILE_SUFFIXES)
+                    ):
+                        continue
                     match = _SOLUTION_RE.fullmatch(path.name)
                     if not match:
                         continue
@@ -223,6 +263,46 @@ def find_solution(root: str | Path, problem: str | ProblemRef) -> Path:
     return max(matches, key=lambda item: (item.solved_on, str(item.path))).path
 
 
+def global_template_path(root: str | Path) -> Path:
+    """The user-editable default source template under ``.acm``."""
+    return Path(root).resolve() / ".acm" / "template.cpp"
+
+
+def load_default_template(root: str | Path) -> str:
+    path = global_template_path(root)
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+    return DEFAULT_TEMPLATE
+
+
+def validate_default_template(source: object) -> str:
+    if not isinstance(source, str):
+        raise ValueError("缺省源必须是文本")
+    if "\x00" in source:
+        raise ValueError("缺省源不能包含 NUL 字符")
+    if len(source.encode("utf-8")) > DEFAULT_TEMPLATE_MAX_BYTES:
+        raise ValueError(f"缺省源不能超过 {DEFAULT_TEMPLATE_MAX_BYTES // 1024} KiB")
+    return source
+
+
+def save_default_template(root: str | Path, source: str) -> Path:
+    path = global_template_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix="template-", suffix=".cpp", dir=path.parent
+    )
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(source.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return path
+
+
 def start_problem(
     root: str | Path,
     problem: str | ProblemRef,
@@ -241,6 +321,10 @@ def start_problem(
     reused = source.exists()
     template_source = day_dir / "template.cpp"
     chosen_template: Path | None = template_source if template_source.is_file() else None
+    if chosen_template is None:
+        global_template = global_template_path(root_path)
+        if global_template.is_file():
+            chosen_template = global_template
     if not reused:
         if chosen_template:
             source.write_bytes(chosen_template.read_bytes())
@@ -273,7 +357,11 @@ __all__ = [
     "ProblemRef",
     "StartResult",
     "find_solution",
+    "global_template_path",
+    "load_default_template",
     "parse_problem_ref",
+    "save_default_template",
     "scan_local_solutions",
     "start_problem",
+    "validate_default_template",
 ]

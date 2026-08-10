@@ -38,7 +38,50 @@ TIER_HOSTS = {
     "cnblogs": frozenset({"www.cnblogs.com"}),
     "csdn": frozenset({"blog.csdn.net"}),
 }
+# Every tier name the crawler accepts.  This is a validation set, not an
+# execution order: use source_order_for_platform() for the order actually tried.
 SOURCE_ORDER = ("codeforces_official", "luogu_solutions", "cnblogs", "csdn")
+
+# The single source of truth for reference-lookup order, per platform.
+#
+# Luogu's solution index consumes most of the bounded crawl-page budget (index
+# page + article pages + AI audits) before a source is even selected, so a
+# complete allowlisted cnblogs source is preferred first; it still passes the
+# identical safety, dual-build, oracle, sample and full-preflight gates.  A
+# Codeforces problem has no Luogu editorial to read, so that tier is skipped.
+PLATFORM_SOURCE_ORDER: dict[str, tuple[str, ...]] = {
+    "codeforces": ("codeforces_official", "cnblogs", "csdn"),
+    "luogu": ("cnblogs", "luogu_solutions", "csdn"),
+}
+DEFAULT_SOURCE_ORDER = PLATFORM_SOURCE_ORDER["luogu"]
+
+# Display labels for the same tiers, plus the terminal generated fallback.
+SOURCE_TIER_LABELS: dict[str, str] = {
+    "codeforces_official": "Codeforces 官方题解",
+    "luogu_solutions": "洛谷题解",
+    "cnblogs": "博客园",
+    "csdn": "CSDN",
+}
+GENERATED_SOURCE_LABEL = "DeepSeek 生成"
+
+
+def source_order_for_platform(platform: str) -> tuple[str, ...]:
+    """Return the tier order actually attempted for ``platform``."""
+
+    return PLATFORM_SOURCE_ORDER.get(str(platform).strip().casefold(), DEFAULT_SOURCE_ORDER)
+
+
+def source_order_labels(platform: str) -> list[str]:
+    """Return display labels for ``platform``'s real order, generation last."""
+
+    labels = [
+        SOURCE_TIER_LABELS.get(tier, tier)
+        for tier in source_order_for_platform(platform)
+    ]
+    labels.append(GENERATED_SOURCE_LABEL)
+    return labels
+
+
 _CHALLENGE_MARKERS = (
     "captcha",
     "verify you are human",
@@ -559,8 +602,14 @@ SEARCH_TOOL = {
 __all__ = [
     "ALLOWED_HOSTS",
     "AllowlistedCrawler",
+    "DEFAULT_SOURCE_ORDER",
+    "GENERATED_SOURCE_LABEL",
+    "PLATFORM_SOURCE_ORDER",
     "SEARCH_TOOL",
     "SOURCE_ORDER",
+    "SOURCE_TIER_LABELS",
     "SourceCandidate",
     "SourceSearchError",
+    "source_order_for_platform",
+    "source_order_labels",
 ]

@@ -449,7 +449,11 @@ class DeepSeekClientTests(unittest.TestCase):
         sleeps: list[float] = []
         transport = QueueTransport(rate_limited, FakeResponse(completion("ok")))
         client = DeepSeekClient(
-            "key", transport=transport, retries=2, sleep=sleeps.append
+            "key",
+            transport=transport,
+            retries=2,
+            sleep=sleeps.append,
+            random_value=lambda: 0.5,
         )
         result = client.chat([{"role": "user", "content": "hi"}])
         self.assertEqual(result.content, "ok")
@@ -462,7 +466,11 @@ class DeepSeekClientTests(unittest.TestCase):
         transport = QueueTransport(reset, reset, reset)
         with self.assertRaises(DeepSeekError) as exhausted:
             DeepSeekClient(
-                "key", transport=transport, retries=2, sleep=lambda _delay: None
+                "key",
+                transport=transport,
+                retries=2,
+                sleep=lambda _delay: None,
+                random_value=lambda: 0.5,
             ).chat(
                 [{"role": "user", "content": "hi"}],
                 retry_callback=lambda attempt, total, code, delay: retry_events.append(
@@ -495,6 +503,104 @@ class DeepSeekClientTests(unittest.TestCase):
         self.assertEqual(len(transport.requests), 1)
         self.assertNotIn("secret-value", str(caught.exception))
         self.assertNotIn("sk-abcdefghijk", str(caught.exception))
+
+    def test_transient_gateway_statuses_retry_and_retry_after_is_bounded(self) -> None:
+        for status in (408, 502, 504):
+            with self.subTest(status=status):
+                transport = QueueTransport(
+                    urllib.error.HTTPError(
+                        DEEPSEEK_ENDPOINT,
+                        status,
+                        "transient",
+                        {},
+                        io.BytesIO(b'{}'),
+                    ),
+                    FakeResponse(completion("ok")),
+                )
+                result = DeepSeekClient(
+                    "key",
+                    transport=transport,
+                    retries=1,
+                    sleep=lambda _delay: None,
+                    random_value=lambda: 0.5,
+                ).chat([{"role": "user", "content": "hi"}])
+                self.assertEqual(result.content, "ok")
+                self.assertEqual(len(transport.requests), 2)
+
+        sleeps: list[float] = []
+        transport = QueueTransport(
+            urllib.error.HTTPError(
+                DEEPSEEK_ENDPOINT,
+                429,
+                "rate limited",
+                {"Retry-After": "120"},
+                io.BytesIO(b'{}'),
+            ),
+            FakeResponse(completion("ok")),
+        )
+        DeepSeekClient(
+            "key",
+            transport=transport,
+            retries=1,
+            sleep=sleeps.append,
+            random_value=lambda: 0.0,
+        ).chat([{"role": "user", "content": "hi"}])
+        self.assertEqual(sleeps, [60.0])
+
+    def test_retry_after_respects_deadline_and_backoff_is_cancellable(self) -> None:
+        clock = FakeClock()
+        transport = QueueTransport(
+            urllib.error.HTTPError(
+                DEEPSEEK_ENDPOINT,
+                503,
+                "busy",
+                {"Retry-After": "60"},
+                io.BytesIO(b'{}'),
+            ),
+            FakeResponse(completion("must not run")),
+        )
+        with self.assertRaises(DeepSeekError) as timed_out:
+            DeepSeekClient(
+                "key",
+                transport=transport,
+                retries=1,
+                sleep=clock.sleep,
+                monotonic=clock,
+                random_value=lambda: 0.5,
+            ).chat([{"role": "user", "content": "hi"}], total_timeout=2.0)
+        self.assertEqual(timed_out.exception.code, "timeout")
+        self.assertEqual(clock.now, 2.0)
+        self.assertEqual(len(transport.requests), 1)
+
+        scope = DeepSeekCancelScope()
+        sleep_started = threading.Event()
+        release_sleep = threading.Event()
+        errors: list[BaseException] = []
+
+        def blocking_sleep(_seconds: float) -> None:
+            sleep_started.set()
+            release_sleep.wait(1)
+
+        def run() -> None:
+            try:
+                DeepSeekClient(
+                    "key",
+                    transport=QueueTransport(urllib.error.URLError("offline")),
+                    retries=1,
+                    sleep=blocking_sleep,
+                    random_value=lambda: 0.5,
+                ).chat([{"role": "user", "content": "hi"}], cancel_scope=scope)
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.assertTrue(sleep_started.wait(1))
+        scope.cancel()
+        release_sleep.set()
+        worker.join(1)
+        self.assertFalse(worker.is_alive())
+        self.assertIsInstance(errors[0], DeepSeekCancelledError)
 
     def test_json_output_sets_contract_and_retries_empty_once(self) -> None:
         transport = QueueTransport(
@@ -634,6 +740,7 @@ class DeepSeekClientTests(unittest.TestCase):
             retries=1,
             sleep=clock.sleep,
             monotonic=clock,
+            random_value=lambda: 0.5,
         ).chat(
             [{"role": "user", "content": "hi"}],
             deadline=15,
@@ -888,7 +995,11 @@ class DeepSeekClientTests(unittest.TestCase):
         transport = QueueTransport(urllib.error.URLError("offline"), complete)
         events = list(
             DeepSeekClient(
-                "key", transport=transport, retries=2, sleep=sleeps.append
+                "key",
+                transport=transport,
+                retries=2,
+                sleep=sleeps.append,
+                random_value=lambda: 0.5,
             ).stream_chat([{"role": "user", "content": "hi"}])
         )
         self.assertEqual([event.kind for event in events], ["delta", "done"])
@@ -923,7 +1034,11 @@ class DeepSeekClientTests(unittest.TestCase):
             FakeResponse(completion("ok")),
         )
         result = DeepSeekClient(
-            "key", transport=transport, retries=1, sleep=sleeps.append
+            "key",
+            transport=transport,
+            retries=1,
+            sleep=sleeps.append,
+            random_value=lambda: 0.5,
         ).chat([{"role": "user", "content": "hi"}])
         self.assertEqual(result.content, "ok")
         self.assertEqual(len(transport.requests), 2)

@@ -14,7 +14,7 @@ from datetime import date, timedelta
 import json
 from pathlib import Path
 import re
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping
 from urllib.parse import urlparse
 
 

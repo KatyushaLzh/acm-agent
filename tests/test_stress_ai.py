@@ -4,20 +4,28 @@ import json
 import threading
 import time
 import unittest
+from unittest import mock
 
 from tools.acm_agent.deepseek import DeepSeekProtocolError
 from tools.acm_agent.stress_ai import (
-    ARTIFACT_AUDIT_TOTAL_SECONDS,
     CONTRACT_SCHEMA_VERSION,
     GeneratedArtifact,
     StressPreparation,
     StressPreparationError,
+    _OPTIONAL_GENERATOR_CASES,
+    _REQUIRED_GENERATOR_CASES,
     _compact_audit_contract,
     _compact_generator_contract,
+    _generator_recipe_prompt_content,
+    _canonicalize_recipe_case_slots,
+    _normalize_recipe_case_identity,
+    _normalize_recipe_semantic_goal,
+    _materialize_recipe_boundary_parameters,
     audit_generated_artifact,
     extract_contract,
     generate_artifact,
     generate_generator_blueprint,
+    generate_generator_recipe,
     normalize_stress_contract,
     prepare_stress,
     search_reference,
@@ -25,13 +33,12 @@ from tools.acm_agent.stress_ai import (
 )
 from tools.acm_agent.stress_sources import SourceCandidate, SourceSearchError
 from tools.acm_agent.stress_budget import PreparationBudget, PreparationBudgetExhausted
-
-
-class Result:
-    def __init__(self, data=None, content="{}", usage=None):
-        self.data = data or {}
-        self.content = content
-        self.usage = usage or {"total_tokens": 1}
+from tools.acm_agent.stress_recipe import UnsupportedRecipeError, compose_generator_recipe
+from tests.helpers.recipes import (
+    p1111_recipe as _p1111_recipe,
+    static_recipe as checked_in_static_recipe,
+)
+from tests.helpers.fakes import FakeChatResult as Result
 
 
 GENERATOR_SOURCE = (
@@ -185,7 +192,13 @@ class ParallelPreparationClient:
             self.active -= 1
         return Result(
             data={
-                "code": GENERATOR_SOURCE if role == "generator" else "#include <iostream>\nint main(){return 0;}",
+                "code": (
+                    GENERATOR_SOURCE
+                    if role == "generator"
+                    else "#include <iostream>\nint main(){return %d;}" % (
+                        1 if role == "reference_primary" else 2
+                    )
+                ),
                 "notes": role,
             }
         )
@@ -263,6 +276,23 @@ def contract_v3(statement: str = "Input one integer n with 1 <= n <= 10."):
             }
         ],
     }
+
+
+def static_recipe_contract_v3():
+    contract = contract_v3()
+    contract["constraints"][0]["args"]["maximum"] = 1000
+    contract["input_summary"] = "one integer n followed by n integers"
+    contract["syntax"]["sections"].append(
+        {
+            "id": "values",
+            "kind": "list",
+            "count_from": "header.n",
+            "fields": [{"name": "value", "type": "int"}],
+            "variants": [],
+            "evidence_ids": ["n_range"],
+        }
+    )
+    return contract
 AUDIT_ACCEPT = {
     "verdict": "accept",
     "confidence": 0.96,
@@ -283,13 +313,15 @@ AUDIT_REJECT = {
     ],
     "summary": "数组容量不足",
 }
+# The primary fixture declares only the three core required pairs.  It still
+# carries an optional small/lower_bound *case* so the optional branch stays
+# exercised end-to-end; LEGACY_FOUR_CASE_BLUEPRINT below covers the old
+# four-pair `required_cases` wire format.
 VALID_BLUEPRINT = {
     "schema_version": 1,
     "required_cases": [
-        {"profile": "small", "case_kind": "lower_bound"},
-        {"profile": "small", "case_kind": "random"},
-        {"profile": "large", "case_kind": "upper_bound"},
-        {"profile": "large", "case_kind": "random"},
+        {"profile": profile, "case_kind": case_kind}
+        for profile, case_kind in _REQUIRED_GENERATOR_CASES
     ],
     "dimensions": [{"name": "n", "minimum": 1, "maximum": 100000}],
     "operation_families": ["query"],
@@ -339,8 +371,156 @@ VALID_BLUEPRINT = {
     ],
 }
 
+# Deliberately spelled out as literals rather than derived from
+# ``_OPTIONAL_GENERATOR_CASES``/``_REQUIRED_GENERATOR_CASES``.  This is the
+# frozen legacy wire format of already-certified blueprints, so it must keep
+# describing four required cases even if the live policy constants change.
+LEGACY_FOUR_CASE_BLUEPRINT = {
+    **json.loads(json.dumps(VALID_BLUEPRINT)),
+    "required_cases": [
+        {"profile": "small", "case_kind": "lower_bound"},
+        {"profile": "small", "case_kind": "random"},
+        {"profile": "large", "case_kind": "upper_bound"},
+        {"profile": "large", "case_kind": "random"},
+    ],
+}
+
+
+def blueprint_case_pairs(blueprint):
+    """Return the (profile, case_kind) pairs declared in ``cases``."""
+
+    return [(case["profile"], case["case_kind"]) for case in blueprint["cases"]]
+
+
+def required_case_pairs(blueprint):
+    """Return the (profile, case_kind) pairs declared in ``required_cases``."""
+
+    return [
+        (item["profile"], item["case_kind"]) for item in blueprint["required_cases"]
+    ]
+
+
+def blueprint_without_cases(*dropped):
+    """Copy ``VALID_BLUEPRINT`` with the given case pairs removed."""
+
+    blueprint = json.loads(json.dumps(VALID_BLUEPRINT))
+    blueprint["cases"] = [
+        case
+        for case in blueprint["cases"]
+        if (case["profile"], case["case_kind"]) not in set(dropped)
+    ]
+    return blueprint
+
+
+def blueprint_case(blueprint, profile, case_kind):
+    """Return the mutable case entry for a declared pair."""
+
+    return blueprint["cases"][blueprint_case_index(blueprint, profile, case_kind)]
+
+
+def blueprint_case_index(blueprint, profile, case_kind):
+    """Return the ``cases`` index of a declared pair, for error-path asserts."""
+
+    for index, case in enumerate(blueprint["cases"]):
+        if (case["profile"], case["case_kind"]) == (profile, case_kind):
+            return index
+    raise AssertionError(f"fixture is missing the {profile}/{case_kind} case")
+
 
 class StressAITests(unittest.TestCase):
+    def test_recipe_case_identity_normalizes_only_closed_enum_aliases(self) -> None:
+        self.assertEqual(
+            _normalize_recipe_case_identity(
+                {"profile": "small_profile", "case_kind": "minimum"}
+            ),
+            {"profile": "small", "case_kind": "lower_bound"},
+        )
+        self.assertEqual(
+            _normalize_recipe_case_identity(
+                {"profile": "large", "case_kind": "seeded-random"}
+            ),
+            {"profile": "large", "case_kind": "random"},
+        )
+        self.assertEqual(
+            _normalize_recipe_case_identity(
+                {"profile": "mystery", "case_kind": "adversarial"}
+            ),
+            {"profile": "mystery", "case_kind": "adversarial"},
+        )
+        slots = _canonicalize_recipe_case_slots(
+            [
+                {"profile": "small", "case_kind": "boundary"},
+                {"profile": "small", "case_kind": "random"},
+                {"profile": "large", "case_kind": "boundary"},
+                {"profile": "large", "case_kind": "random"},
+            ]
+        )
+        self.assertEqual(
+            [(case["profile"], case["case_kind"]) for case in slots],
+            list(_REQUIRED_GENERATOR_CASES),
+        )
+        self.assertEqual(
+            _normalize_recipe_semantic_goal(
+                {
+                    "template_id": "label.equal",
+                    "parameters": {"label_min": 1, "label_max": 1},
+                },
+                case_kind="lower_bound",
+            ),
+            "equal_labels",
+        )
+        self.assertEqual(
+            _normalize_recipe_semantic_goal(
+                {"kind": "edge_time", "policy": "equal"},
+                case_kind="lower_bound",
+            ),
+            "equal_labels",
+        )
+        self.assertEqual(
+            _normalize_recipe_semantic_goal(
+                {"kind": "random"}, case_kind="random"
+            ),
+            "seed_variation",
+        )
+
+    def test_boundary_dimensions_are_materialized_before_catalog_preconditions(self) -> None:
+        from tools.acm_agent.stress_recipe import RecipeCatalog
+
+        catalog = RecipeCatalog.load()
+        structure = {
+            "template_id": "graph.connected",
+            "parameters": {
+                "n_min": 1,
+                "n_max": 10,
+                "m_min": 1,
+                "m_max": 100000,
+            },
+        }
+        capability = {
+            "bindings": {"n": "header.n", "m": "header.m"}
+        }
+        ranges = {"header.n": (1, 1000), "header.m": (1, 100000)}
+
+        upper = _materialize_recipe_boundary_parameters(
+            structure,
+            capability=capability,
+            ranges=ranges,
+            case_kind="upper_bound",
+            catalog=catalog,
+        )
+
+        self.assertEqual(
+            upper["parameters"],
+            {
+                "n": 1000,
+                "n_min": 1000,
+                "n_max": 1000,
+                "m": 100000,
+                "m_min": 100000,
+                "m_max": 100000,
+            },
+        )
+
     def test_generator_contract_keeps_operation_semantics_evidence(self) -> None:
         contract = contract_v3()
         contract["syntax"]["sections"].append(
@@ -487,6 +667,22 @@ class StressAITests(unittest.TestCase):
         with self.assertRaises(StressPreparationError) as missing:
             normalize_stress_contract(contract, compare="token", statement=statement)
         self.assertEqual(missing.exception.details["path"], "validator_probes")
+        self.assertEqual(
+            missing.exception.details["allowed_dynamic_constraint_ids"],
+            ["c_dynamic"],
+        )
+        self.assertEqual(
+            missing.exception.details["dynamic_constraint_kinds"],
+            {"c_dynamic": "state_precondition"},
+        )
+
+        relaxed = normalize_stress_contract(
+            contract,
+            compare="token",
+            statement=statement,
+            require_complete_probes=False,
+        )
+        self.assertEqual(relaxed["validator_probes"], [])
 
         contract["validator_probes"] = [
             {
@@ -519,6 +715,63 @@ class StressAITests(unittest.TestCase):
         validator_prompt = json.dumps(client.prompts, ensure_ascii=False)
         self.assertNotIn("validator_probes", validator_prompt)
         self.assertNotIn("Move 1 -1", validator_prompt)
+
+    def test_static_validator_probe_is_dropped_but_unknown_binding_fails_closed(self) -> None:
+        statement = "Input one integer n with 1 <= n <= 10."
+        contract = contract_v3(statement)
+        contract["constraints"].append(
+            {
+                "id": "c_dynamic",
+                "kind": "dependent_bound",
+                "target": "values.x",
+                "args": {"description": "x depends on the current state"},
+                "evidence_ids": ["n_range"],
+            }
+        )
+        static_probe = {
+            "id": "vp_static",
+            "constraint_id": "n_range",
+            "valid_input": "1 1 1\n",
+            "invalid_input": "1 1 2\n",
+            "evidence_ids": ["n_range"],
+        }
+        dynamic_probe = {
+            "id": "vp_dynamic",
+            "constraint_id": "c_dynamic",
+            "valid_input": "2 1 1\n",
+            "invalid_input": "2 1 2\n",
+            "evidence_ids": ["n_range"],
+        }
+        contract["validator_probes"] = [static_probe, dynamic_probe]
+
+        normalized = normalize_stress_contract(
+            contract, compare="token", statement=statement
+        )
+
+        self.assertEqual(
+            [item["id"] for item in normalized["validator_probes"]],
+            ["vp_dynamic"],
+        )
+
+        contract["validator_probes"] = [{**dynamic_probe, "constraint_id": "missing"}]
+        with self.assertRaises(StressPreparationError) as unknown:
+            normalize_stress_contract(contract, compare="token", statement=statement)
+        self.assertEqual(
+            unknown.exception.details["allowed_dynamic_constraint_ids"],
+            ["c_dynamic"],
+        )
+        self.assertEqual(
+            unknown.exception.details["dynamic_constraint_kinds"],
+            {"c_dynamic": "dependent_bound"},
+        )
+        self.assertEqual(unknown.exception.details["constraint_id"], "missing")
+
+        contract["validator_probes"] = [static_probe]
+        with self.assertRaises(StressPreparationError) as missing:
+            normalize_stress_contract(contract, compare="token", statement=statement)
+        self.assertEqual(
+            missing.exception.details["missing_constraint_ids"], ["c_dynamic"]
+        )
 
     def test_p2596_reversed_state_probe_is_independently_certified(self) -> None:
         statement = (
@@ -574,6 +827,48 @@ class StressAITests(unittest.TestCase):
         )
         self.assertEqual(client.json_kwargs[1]["max_tokens"], 1536)
         self.assertFalse(client.json_kwargs[1]["thinking"])
+
+    def test_probe_certification_semantic_failure_keeps_bounded_response_evidence(self) -> None:
+        statement = (
+            "Input one integer n with 1 <= n <= 10. Insert s -1 moves the book "
+            "one position upward and must not cross the current top boundary."
+        )
+        raw = contract_v3(statement)
+        raw["constraints"].append(
+            {
+                "id": "c_dynamic",
+                "kind": "state_precondition",
+                "target": "operations.Insert",
+                "args": {"description": "Insert must not cross current boundary"},
+                "evidence_ids": ["n_range"],
+            }
+        )
+        raw["validator_probes"] = [
+            {
+                "id": "vp_dynamic",
+                "constraint_id": "c_dynamic",
+                "valid_input": "3 2\n1 2 3\nTop 3\nInsert 3 -1\n",
+                "invalid_input": "3 2\n1 2 3\nTop 3\nInsert 3 1\n",
+                "evidence_ids": ["n_range"],
+            }
+        ]
+        malformed = {"probes_wrong_key": "bad payload"}
+        client = FakeClient([raw, malformed, raw, malformed])
+        with self.assertRaises(StressPreparationError) as caught:
+            extract_contract(
+                client,
+                problem_id="P1",
+                statement=statement,
+                compare="token",
+                settings=SETTINGS,
+                generation_mode="hybrid",
+            )
+        details = caught.exception.details
+        self.assertIn("validator_probes", str(details.get("path") or ""))
+        self.assertEqual(len(details.get("response_sha256") or ""), 64)
+        excerpt = str(details.get("response_excerpt") or "")
+        self.assertIn("probes_wrong_key", excerpt)
+        self.assertLessEqual(len(excerpt), 1000)
 
     def test_generated_code_rejects_unfinished_self_revision_comments(self) -> None:
         client = FakeClient(
@@ -633,22 +928,28 @@ class StressAITests(unittest.TestCase):
             settings=SETTINGS,
         )
         self.assertEqual(client.max_active, 3)
-        self.assertEqual(set(client.roles), {"generator", "brute", "reference"})
+        self.assertEqual(
+            set(client.roles),
+            {"generator", "reference_primary", "reference_secondary"},
+        )
         self.assertIsNotNone(prepared.generator)
-        self.assertIsNotNone(prepared.brute)
-        self.assertIsNotNone(prepared.reference)
+        self.assertIsNotNone(prepared.reference_primary)
+        self.assertIsNotNone(prepared.reference_secondary)
         prefixes = {}
         for messages in client.prompts[1:]:
             request = json.loads(messages[-1]["content"])
             key = request.get("artifact_kind") or "blueprint"
             prefixes[key] = messages[:3]
-        self.assertEqual(set(prefixes), {"blueprint", "generator", "brute", "reference"})
+        self.assertEqual(
+            set(prefixes),
+            {"blueprint", "generator", "reference_primary", "reference_secondary"},
+        )
         # Blueprint prewarms the compact contract-only prefix used by the two
         # input-side roles; solution roles retain the full statement.
         self.assertEqual(prefixes["blueprint"], prefixes["generator"])
-        self.assertEqual(prefixes["brute"], prefixes["reference"])
+        self.assertEqual(prefixes["reference_primary"], prefixes["reference_secondary"])
         compact_context = json.loads(prefixes["generator"][1]["content"])
-        full_context = json.loads(prefixes["brute"][1]["content"])
+        full_context = json.loads(prefixes["reference_primary"][1]["content"])
         self.assertTrue(compact_context["statement_omitted"])
         self.assertNotIn("statement", compact_context)
         self.assertEqual(full_context["statement"], "statement")
@@ -668,7 +969,7 @@ class StressAITests(unittest.TestCase):
         prompt = json.dumps(client.prompts, ensure_ascii=False)
         self.assertIn("手工核对", prompt)
         self.assertIn("80% 到 100%", prompt)
-        self.assertIn("恰好达到合法下界", prompt)
+        self.assertIn("small/lower_bound 必须精确实现", prompt)
         self.assertIn("全局最大总规模", prompt)
 
     def test_contract_v3_is_canonical_and_evidence_bound(self) -> None:
@@ -689,6 +990,92 @@ class StressAITests(unittest.TestCase):
             contract["coverage_obligations"][0]["predicate"]["kind"],
             "constraint_boundary",
         )
+
+    def test_contract_v3_binds_flattened_bullet_dash_evidence_quote(self) -> None:
+        statement = (
+            "The shelf holds books `1..n` from top to bottom.\n"
+            "- `Top s`: move book `s` to the top.\n"
+            "- `Insert s t`: swap book `s` with the adjacent book.\n"
+            "Every legality check is against the current order."
+        )
+        flattened_quote = (
+            "The shelf holds books 1..n from top to bottom. - Top s: move book "
+            "s to the top. - Insert s t: swap book s with the adjacent book. "
+            "Every legality check is against the current order."
+        )
+        raw_contract = contract_v3()
+        raw_contract["evidence"][0]["quote"] = flattened_quote
+        raw_contract["evidence"][0]["start"] = 0
+        raw_contract["evidence"][0]["end"] = 20
+        contract = normalize_stress_contract(
+            raw_contract, compare="token", statement=statement
+        )
+        evidence = contract["evidence"][0]
+        self.assertEqual(
+            statement[evidence["start"] : evidence["end"]], evidence["quote"]
+        )
+        self.assertNotEqual(evidence["quote"], flattened_quote)
+        self.assertIn("move book `s` to the top", evidence["quote"])
+
+    def test_contract_v3_drops_degenerate_identical_probe_pairs(self) -> None:
+        raw = contract_v3()
+        raw["constraints"].append(
+            {
+                "id": "c_dynamic",
+                "kind": "state_precondition",
+                "target": "operations.Insert",
+                "args": {"description": "Insert must not cross current boundary"},
+                "evidence_ids": ["n_range"],
+            }
+        )
+        raw["validator_probes"] = [
+            {
+                "id": "vp_ok",
+                "constraint_id": "c_dynamic",
+                "valid_input": "3 1\n1 2 3\nInsert 2 1\n",
+                "invalid_input": "3 1\n1 2 3\nInsert 2 -1\n",
+                "evidence_ids": ["n_range"],
+            },
+            {
+                "id": "vp_degenerate",
+                "constraint_id": "c_dynamic",
+                "valid_input": "3 1\n1 2 3\nInsert 2 1\n",
+                "invalid_input": "3 1\n1 2 3\nInsert 2 1\n",
+                "evidence_ids": ["n_range"],
+            },
+        ]
+        contract = normalize_stress_contract(raw, compare="token", statement="Input one integer n with 1 <= n <= 10.")
+        self.assertEqual(
+            [probe["id"] for probe in contract["validator_probes"]],
+            ["vp_ok"],
+        )
+
+    def test_contract_v3_all_degenerate_probes_fail_closed(self) -> None:
+        raw = contract_v3()
+        raw["constraints"].append(
+            {
+                "id": "c_dynamic",
+                "kind": "state_precondition",
+                "target": "operations.Insert",
+                "args": {"description": "Insert must not cross current boundary"},
+                "evidence_ids": ["n_range"],
+            }
+        )
+        raw["validator_probes"] = [
+            {
+                "id": "vp_degenerate",
+                "constraint_id": "c_dynamic",
+                "valid_input": "3 1\n1 2 3\nInsert 2 1\n",
+                "invalid_input": "3 1\n1 2 3\nInsert 2 1\n",
+                "evidence_ids": ["n_range"],
+            }
+        ]
+        with self.assertRaises(StressPreparationError) as caught:
+            normalize_stress_contract(
+                raw, compare="token", statement="Input one integer n with 1 <= n <= 10."
+            )
+        self.assertEqual(caught.exception.details["path"], "validator_probes")
+        self.assertIn("c_dynamic", str(caught.exception.details.get("missing_constraint_ids") or ""))
 
     def test_contract_v3_rejects_unbound_evidence_and_bad_references(self) -> None:
         statement = "Input one integer n with 1 <= n <= 10."
@@ -1064,13 +1451,8 @@ class StressAITests(unittest.TestCase):
             {"schema_version": 1, "cases": cases}, contract=contract
         )
         self.assertEqual(
-            [(item["profile"], item["case_kind"]) for item in validated["required_cases"]],
-            [
-                ("small", "lower_bound"),
-                ("small", "random"),
-                ("large", "upper_bound"),
-                ("large", "random"),
-            ],
+            required_case_pairs(validated),
+            list(_REQUIRED_GENERATOR_CASES),
         )
         self.assertEqual(validated["dimensions"], [{"name": "n"}])
         self.assertEqual(validated["cases"][0]["coverage_tags"], ["n_minimum"])
@@ -1131,7 +1513,7 @@ class StressAITests(unittest.TestCase):
         statement = "Input one integer n with 1 <= n <= 10."
         invalid = contract_v3(statement)
         invalid["evidence"][0]["quote"] = "paraphrased and hallucinated evidence"
-        client = FakeClient([invalid, invalid])
+        client = FakeClient([invalid, invalid, invalid, invalid])
         with self.assertRaises(StressPreparationError) as raised:
             extract_contract(
                 client,
@@ -1142,11 +1524,38 @@ class StressAITests(unittest.TestCase):
                 generation_mode="hybrid",
             )
         attempts = raised.exception.details["contract_attempts"]
-        self.assertEqual([item["attempt"] for item in attempts], [1, 2])
+        self.assertEqual([item["attempt"] for item in attempts], [1, 2, 3, 4])
         self.assertTrue(all(len(item["sha256"]) == 64 for item in attempts))
         self.assertTrue(
             all("paraphrased and hallucinated" in item["raw_json_excerpt"] for item in attempts)
         )
+
+    def test_minimal_contract_rebinds_only_evidence_after_bounded_repairs(self) -> None:
+        statement = "Input one integer n with 1 <= n <= 10."
+        invalid = contract_v3(statement)
+        invalid["evidence"][0]["quote"] = "paraphrased and hallucinated evidence"
+        client = FakeClient([invalid, invalid, invalid, invalid])
+        contract, usage = extract_contract(
+            client,
+            problem_id="P1",
+            statement=statement,
+            compare="token",
+            settings=SETTINGS,
+            generation_mode="hybrid",
+            require_complete_probes=False,
+        )
+        self.assertTrue(usage["contract_evidence_rebound"])
+        self.assertEqual(usage["contract_repairs_used"], 3)
+        self.assertEqual(
+            contract["syntax"]["sections"][0]["id"],
+            invalid["syntax"]["sections"][0]["id"],
+        )
+        self.assertEqual(
+            contract["constraints"][0]["target"],
+            invalid["constraints"][0]["target"],
+        )
+        self.assertEqual(contract["evidence"][0]["quote"], statement)
+        self.assertEqual(contract["validator_probes"], [])
 
     def test_contract_protocol_length_failure_uses_explicit_repair(self) -> None:
         statement = "Input one integer n with 1 <= n <= 10."
@@ -1176,6 +1585,34 @@ class StressAITests(unittest.TestCase):
         self.assertEqual([item["json_retries"] for item in client.json_kwargs], [0, 1])
         repair = json.loads(client.prompts[1][-1]["content"])
         self.assertEqual(repair["structured_diagnostic"]["path"], "$")
+
+    def test_blueprint_protocol_length_failure_uses_larger_explicit_retry(self) -> None:
+        failure = DeepSeekProtocolError(
+            "invalid_json_output",
+            "completion token limit reached",
+            usage={"completion_tokens": 6144, "total_tokens": 6200},
+            finish_reason="length",
+        )
+        client = FakeClient([failure, json.loads(json.dumps(VALID_BLUEPRINT))])
+        blueprint, usage = generate_generator_blueprint(
+            client,
+            problem_id="P1",
+            statement="statement",
+            contract={**V2_CONTRACT, "profile_version": 2},
+            settings=SETTINGS,
+            generation_mode="hybrid",
+            repair_limit=1,
+        )
+        self.assertEqual(blueprint["schema_version"], 1)
+        self.assertEqual(usage["blueprint_repairs_used"], 1)
+        self.assertEqual(
+            [item["max_tokens"] for item in client.json_kwargs], [6144, 8192]
+        )
+        repair = json.loads(client.prompts[1][-1]["content"])
+        self.assertEqual(
+            repair["structured_diagnostic"]["code"], "invalid_json_output"
+        )
+        self.assertEqual([item["json_retries"] for item in client.json_kwargs], [1, 1])
 
     def test_contract_normalizes_structured_profiles_and_supplies_hard_requirements(self) -> None:
         raw = dict(V2_CONTRACT)
@@ -1249,6 +1686,118 @@ class StressAITests(unittest.TestCase):
             validate_generator_blueprint(missing)
         self.assertEqual(missing_error.exception.details["path"], "dimensions")
 
+    def test_generator_case_policy_pins_four_required_cases(self) -> None:
+        # Single place that pins the policy itself.  Every other test derives
+        # its expectations from these constants, so a deliberate policy change
+        # fails loudly here instead of silently rewriting the whole suite.
+        self.assertEqual(
+            _REQUIRED_GENERATOR_CASES,
+            (
+                ("small", "lower_bound"),
+                ("small", "random"),
+                ("large", "upper_bound"),
+                ("large", "random"),
+            ),
+        )
+        self.assertEqual(_OPTIONAL_GENERATOR_CASES, ())
+        self.assertIn(("small", "lower_bound"), _REQUIRED_GENERATOR_CASES)
+        self.assertFalse(
+            set(_REQUIRED_GENERATOR_CASES) & set(_OPTIONAL_GENERATOR_CASES)
+        )
+
+    def test_blueprint_validates_without_any_optional_case(self) -> None:
+        blueprint = blueprint_without_cases(*_OPTIONAL_GENERATOR_CASES)
+        self.assertEqual(
+            blueprint_case_pairs(blueprint), list(_REQUIRED_GENERATOR_CASES)
+        )
+        validated = validate_generator_blueprint(blueprint)
+        self.assertEqual(validated["schema_version"], 1)
+        self.assertEqual(
+            blueprint_case_pairs(validated), list(_REQUIRED_GENERATOR_CASES)
+        )
+        self.assertEqual(
+            required_case_pairs(validated), list(_REQUIRED_GENERATOR_CASES)
+        )
+        # Re-validating a validated blueprint must be a fixed point.
+        self.assertEqual(validate_generator_blueprint(validated), validated)
+
+    def test_blueprint_rejects_a_missing_required_case(self) -> None:
+        for pair in _REQUIRED_GENERATOR_CASES:
+            with self.subTest(missing=pair):
+                incomplete = blueprint_without_cases(pair)
+                self.assertNotIn(pair, blueprint_case_pairs(incomplete))
+                with self.assertRaises(StressPreparationError) as error:
+                    validate_generator_blueprint(incomplete)
+                self.assertEqual(error.exception.code, "stress_blueprint_invalid")
+                self.assertEqual(error.exception.details["path"], "cases")
+
+    def test_declared_optional_case_is_still_fully_validated(self) -> None:
+        for pair in _OPTIONAL_GENERATOR_CASES:
+            profile, case_kind = pair
+            # Positive control: a well-formed optional case is accepted and kept.
+            accepted = validate_generator_blueprint(
+                json.loads(json.dumps(VALID_BLUEPRINT))
+            )
+            self.assertIn(pair, blueprint_case_pairs(accepted))
+            self.assertNotIn(pair, required_case_pairs(accepted))
+
+            index = blueprint_case_index(VALID_BLUEPRINT, profile, case_kind)
+            malformations = (
+                ("dimensions", {}, f"cases[{index}].dimensions"),
+                ("dimensions", 7, f"cases[{index}].dimensions"),
+                ("uses_seed", "no", f"cases[{index}].uses_seed"),
+                ("total_complexity", "", f"cases[{index}].total_complexity"),
+            )
+            for field, bad_value, expected_path in malformations:
+                with self.subTest(case=pair, field=field, value=bad_value):
+                    invalid = json.loads(json.dumps(VALID_BLUEPRINT))
+                    blueprint_case(invalid, profile, case_kind)[field] = bad_value
+                    with self.assertRaises(StressPreparationError) as error:
+                        validate_generator_blueprint(invalid)
+                    self.assertEqual(
+                        error.exception.code, "stress_blueprint_invalid"
+                    )
+                    self.assertEqual(
+                        error.exception.details["path"], expected_path
+                    )
+
+    def test_legacy_four_case_required_cases_blueprint_still_validates(self) -> None:
+        """Backward compatibility: already-certified four-pair blueprints."""
+
+        legacy_pairs = required_case_pairs(LEGACY_FOUR_CASE_BLUEPRINT)
+        self.assertEqual(len(legacy_pairs), 4)
+        self.assertEqual(
+            set(legacy_pairs),
+            set(_REQUIRED_GENERATOR_CASES) | set(_OPTIONAL_GENERATOR_CASES),
+        )
+
+        validated = validate_generator_blueprint(
+            json.loads(json.dumps(LEGACY_FOUR_CASE_BLUEPRINT))
+        )
+        self.assertEqual(validated["schema_version"], 1)
+        # The historical four-case declaration is still the canonical policy.
+        self.assertEqual(
+            required_case_pairs(validated), list(_REQUIRED_GENERATOR_CASES)
+        )
+        self.assertEqual(
+            blueprint_case_pairs(validated),
+            list(_OPTIONAL_GENERATOR_CASES) + list(_REQUIRED_GENERATOR_CASES),
+        )
+        # A legacy blueprint normalizes to exactly the current four-pair fixture.
+        self.assertEqual(
+            validated,
+            validate_generator_blueprint(json.loads(json.dumps(VALID_BLUEPRINT))),
+        )
+
+        bogus = json.loads(json.dumps(VALID_BLUEPRINT))
+        bogus["required_cases"] = [
+            {"profile": "small", "case_kind": "upper_bound"},
+            *bogus["required_cases"],
+        ]
+        with self.assertRaises(StressPreparationError) as error:
+            validate_generator_blueprint(bogus)
+        self.assertEqual(error.exception.details["path"], "required_cases")
+
     def test_blueprint_prompt_is_compact_and_keeps_fixed_cases(self) -> None:
         client = FakeClient([json.loads(json.dumps(VALID_BLUEPRINT))])
         generate_generator_blueprint(
@@ -1259,15 +1808,17 @@ class StressAITests(unittest.TestCase):
             settings=SETTINGS,
         )
         request = json.loads(client.prompts[0][3]["content"])
-        fixed_cases = [
-            ("small", "lower_bound"),
-            ("small", "random"),
-            ("large", "upper_bound"),
-            ("large", "random"),
-        ]
+        # The prompt pins all four required pairs.
         self.assertEqual(
             [(item["profile"], item["case_kind"]) for item in request["fixed_cases"]],
-            fixed_cases,
+            list(_REQUIRED_GENERATOR_CASES),
+        )
+        self.assertEqual(
+            [
+                (item["profile"], item["case_kind"])
+                for item in request["optional_compatibility_cases"]
+            ],
+            list(_OPTIONAL_GENERATOR_CASES),
         )
         self.assertNotIn("json_schema", request)
         self.assertNotIn("template", request)
@@ -1344,7 +1895,7 @@ class StressAITests(unittest.TestCase):
         self.assertIn("temperature", client.json_kwargs[0])
         self.assertIn("temperature", client.json_kwargs[1])
         self.assertEqual(
-            [kwargs["max_tokens"] for kwargs in client.json_kwargs], [4096, 8192]
+            [kwargs["max_tokens"] for kwargs in client.json_kwargs], [6144, 8192]
         )
         self.assertEqual(usage["prompt_tokens"], 10)
         self.assertEqual(usage["completion_tokens"], 16)
@@ -1585,7 +2136,7 @@ class StressAITests(unittest.TestCase):
         self.assertEqual(blueprint["schema_version"], 1)
         blueprint_kwargs = blueprint_client.json_kwargs[0]
         self.assertFalse(blueprint_kwargs["thinking"])
-        self.assertEqual(blueprint_kwargs["max_tokens"], 4096)
+        self.assertEqual(blueprint_kwargs["max_tokens"], 6144)
         self.assertIn("temperature", blueprint_kwargs)
 
         contract_client = FakeClient([dict(V2_CONTRACT)])
@@ -1732,16 +2283,429 @@ class StressAITests(unittest.TestCase):
             ["small/random", "large/random"],
         )
         self.assertEqual(
-            [
-                (item["profile"], item["case_kind"])
-                for item in role_request["generator_blueprint"]["required_cases"]
+            required_case_pairs(role_request["generator_blueprint"]),
+            list(_REQUIRED_GENERATOR_CASES),
+        )
+
+    def test_reference_prompt_requires_general_trivial_initial_state_check(self) -> None:
+        for kind in ("reference_primary", "reference_secondary"):
+            with self.subTest(kind=kind):
+                client = FakeClient(
+                    [{"code": "#include <iostream>\nint main(){return 0;}\n", "notes": "ref"}]
+                )
+                generate_artifact(
+                    client,
+                    kind=kind,
+                    problem_id="P1111",
+                    statement="A single village is already connected.",
+                    contract={**V2_CONTRACT, "profile_version": 2},
+                    settings=SETTINGS,
+                )
+                role_request = json.loads(client.prompts[0][-1]["content"])
+                self.assertIn("单元素", role_request["rules"])
+                self.assertIn("初态满足", role_request["rules"])
+                self.assertIn("零时刻或零操作答案", role_request["rules"])
+
+        unrelated = FakeClient(
+            [{"code": "#include <iostream>\nint main(){return 0;}\n", "notes": "ref"}]
+        )
+        generate_artifact(
+            unrelated,
+            kind="reference_primary",
+            problem_id="P1001",
+            statement="statement",
+            contract={**V2_CONTRACT, "profile_version": 2},
+            settings=SETTINGS,
+        )
+        unrelated_request = json.loads(unrelated.prompts[0][-1]["content"])
+        self.assertIn("单元素", unrelated_request["rules"])
+        self.assertIn("初态满足", unrelated_request["rules"])
+
+    def test_generator_recipe_prompt_materializes_checked_in_catalog(self) -> None:
+        provider_recipe = checked_in_static_recipe()
+        for case in provider_recipe["cases"]:
+            # Provider-owned role guesses are intentionally ignored; the exact
+            # contract matcher owns serializer bindings locally.
+            case["serialization"]["bindings"] = {"u": "values.value"}
+        client = FakeClient([provider_recipe])
+        recipe, usage = generate_generator_recipe(
+            client,
+            problem_id="P1001",
+            statement="Input one integer n with 1 <= n <= 10.",
+            contract=static_recipe_contract_v3(),
+            settings=SETTINGS,
+        )
+
+        self.assertEqual(recipe["engine"], "local_templates_v1")
+        self.assertTrue(
+            all(
+                case["serialization"]["bindings"] == {"n": "header.n"}
+                for case in recipe["cases"]
+            )
+        )
+        self.assertEqual(usage["total_tokens"], 1)
+        self.assertEqual(len(client.prompts), 1)
+        request = json.loads(client.prompts[0][-1]["content"])
+        self.assertEqual(request["type"], "acm_stress_generator_recipe_v1")
+        self.assertNotIn("case_shape", request)
+        self.assertTrue(request["structure_templates"])
+        self.assertFalse(
+            {"rng", "transform"}.intersection(
+                template["kind"] for template in request["structure_templates"]
+            )
+        )
+        self.assertEqual(
+            [item["format_id"] for item in request["serializer_candidates"]],
+            ["list_n"],
+        )
+        for template in request["structure_templates"]:
+            self.assertIsInstance(template["parameters"], dict)
+            for specification in template["parameters"].values():
+                self.assertIsInstance(specification, dict)
+
+    def test_public_generator_recipe_api_rejects_missing_contract_before_provider(self) -> None:
+        client = FakeClient([checked_in_static_recipe()])
+        with self.assertRaises(UnsupportedRecipeError) as caught:
+            generate_generator_recipe(
+                client,
+                problem_id="generic",
+                statement="statement",
+                contract=None,  # type: ignore[arg-type]
+                settings=SETTINGS,
+            )
+
+        self.assertEqual(caught.exception.reason, "contract_missing")
+        self.assertEqual(client.prompts, [])
+
+    def test_matrix_and_interval_capabilities_reach_provider_and_local_composer(self) -> None:
+        def shaped_recipe(template_id: str, parameters: dict[str, int], format_id: str):
+            def case(profile: str, case_kind: str):
+                return {
+                    "profile": profile,
+                    "case_kind": case_kind,
+                    "families": [
+                        {
+                            "structure": {
+                                "template_id": template_id,
+                                "parameters": dict(parameters),
+                            },
+                            "labels": [],
+                            "semantic_goals": ["seed_variation"],
+                        }
+                    ],
+                    "selection": {
+                        "policy": "balanced_round_robin_v1",
+                        "seed_stride": 1 if profile == "small" else 5,
+                    },
+                    "serialization": {"format_id": format_id},
+                    "byte_budget": {
+                        "hard_max": 2 * 1024 * 1024 if profile == "small" else 32 * 1024 * 1024,
+                        "buckets": (
+                            [[1, 25], [26, 50], [51, 75], [76, 100], [101, 2 * 1024 * 1024]]
+                            if profile == "small"
+                            else [[1, 32 * 1024 * 1024]]
+                        ),
+                    },
+                }
+
+            return {
+                "schema_version": 1,
+                "engine": "local_templates_v1",
+                "cases": [
+                    case("small", "lower_bound"),
+                    case("small", "random"),
+                    case("large", "upper_bound"),
+                    case("large", "random"),
+                ],
+            }
+
+        scenarios = [
+            (
+                "matrix_n_m",
+                {
+                    "syntax": {
+                        "mode": "single_case",
+                        "sections": [
+                            {
+                                "id": "header",
+                                "kind": "scalar",
+                                "fields": [
+                                    {"name": "n", "type": "int"},
+                                    {"name": "m", "type": "int"},
+                                ],
+                            },
+                            {
+                                "id": "grid",
+                                "kind": "matrix",
+                                "count_from": "header.n",
+                                "fields": [{"name": "value", "type": "int"}],
+                            },
+                        ],
+                    },
+                    "constraints": [
+                        {"kind": "range", "target": "header.n", "args": {"minimum": 1, "maximum": 4}},
+                        {"kind": "range", "target": "header.m", "args": {"minimum": 1, "maximum": 5}},
+                    ],
+                },
+                shaped_recipe(
+                    "matrix.uniform",
+                    {"rows_min": 1, "rows_max": 4, "cols_min": 1, "cols_max": 5, "value_min": 0, "value_max": 9},
+                    "matrix_n_m",
+                ),
+            ),
+            (
+                "intervals_n",
+                {
+                    "syntax": {
+                        "mode": "single_case",
+                        "sections": [
+                            {"id": "header", "kind": "scalar", "fields": [{"name": "n", "type": "int"}]},
+                            {
+                                "id": "segments",
+                                "kind": "intervals",
+                                "count_from": "header.n",
+                                "fields": [{"name": "l", "type": "int"}, {"name": "r", "type": "int"}],
+                            },
+                        ],
+                    },
+                    "constraints": [
+                        {"kind": "range", "target": "header.n", "args": {"minimum": 1, "maximum": 10}}
+                    ],
+                },
+                shaped_recipe(
+                    "interval.random",
+                    {"n_min": 1, "n_max": 10, "lo": 0, "hi": 20},
+                    "intervals_n",
+                ),
+            ),
+        ]
+
+        for format_id, contract, provider_recipe in scenarios:
+            with self.subTest(format_id=format_id):
+                client = FakeClient([provider_recipe])
+                normalized, _ = generate_generator_recipe(
+                    client,
+                    problem_id="generic",
+                    statement="statement",
+                    contract=contract,
+                    settings=SETTINGS,
+                )
+                request = json.loads(client.prompts[0][-1]["content"])
+                self.assertEqual(
+                    [item["format_id"] for item in request["serializer_candidates"]],
+                    [format_id],
+                )
+                composed = compose_generator_recipe(normalized, contract=contract)
+                self.assertIn("// ACM_LOCAL_RECIPE_GENERATOR_V1", composed.source)
+
+    def test_weighted_recipe_omitted_labels_are_filled_from_contract_range(self) -> None:
+        provider_recipe = json.loads(json.dumps(_p1111_recipe()))
+        for case in provider_recipe["cases"]:
+            for family in case["families"]:
+                family["labels"] = []
+        provider_recipe["cases"][0]["families"][0]["structure"] = {
+            "template_id": "tree.path",
+            "parameters": {"n": 1},
+        }
+        connected = provider_recipe["cases"][1]["families"][-1]["structure"]
+        connected["parameters"] = {
+            "n_min": 1,
+            "n_max": 8,
+            "m_min": 7,
+            "m_max": 20,
+        }
+        components = provider_recipe["cases"][1]["families"][1]["structure"]
+        components["parameters"] = {
+            "n_min": 1,
+            "n_max": 8,
+            "m_min": 1,
+            "m_max": 20,
+            "component_count": 2,
+        }
+        contract = {
+            "syntax": {
+                "mode": "single_case",
+                "sections": [
+                    {
+                        "id": "header",
+                        "kind": "scalar",
+                        "fields": [
+                            {"name": "n", "type": "int"},
+                            {"name": "m", "type": "int"},
+                        ],
+                    },
+                    {
+                        "id": "edges",
+                        "kind": "edge_list",
+                        "count_from": "header.m",
+                        "fields": [
+                            {"name": "u", "type": "int"},
+                            {"name": "v", "type": "int"},
+                            {"name": "t", "type": "int"},
+                        ],
+                    },
+                ],
+            },
+            "constraints": [
+                {"kind": "range", "target": "header.n", "args": {"minimum": 1, "maximum": 1000}},
+                {"kind": "range", "target": "header.m", "args": {"minimum": 1, "maximum": 100000}},
+                {"kind": "range", "target": "edges.t", "args": {"minimum": 1, "maximum": 100000}},
             ],
+        }
+
+        normalized, _ = generate_generator_recipe(
+            FakeClient([provider_recipe]),
+            problem_id="generic-weighted-graph",
+            statement="Parallel roads and self-loops are harmless and allowed.",
+            contract=contract,
+            settings=SETTINGS,
+        )
+
+        for case in normalized["cases"]:
+            for family in case["families"]:
+                self.assertEqual(len(family["labels"]), 1)
+                self.assertEqual(
+                    family["labels"][0]["parameters"]["label_min"], 1
+                )
+                self.assertEqual(
+                    family["labels"][0]["parameters"]["label_max"], 100000
+                )
+        lower_structure = normalized["cases"][0]["families"][0]["structure"]
+        self.assertEqual(lower_structure["template_id"], "graph.self_loops")
+        self.assertEqual(lower_structure["parameters"]["n"], 1)
+        repaired = normalized["cases"][1]["families"][-1]["structure"]["parameters"]
+        self.assertEqual(repaired["n_min"], 5)
+        self.assertEqual(repaired["m_min"], 7)
+        self.assertEqual(repaired["m_max"], 10)
+        repaired_components = normalized["cases"][1]["families"][1][
+            "structure"
+        ]["parameters"]
+        self.assertEqual(repaired_components["n_min"], 6)
+        self.assertEqual(repaired_components["n_max"], 8)
+        self.assertEqual(repaired_components["m_min"], 6)
+        self.assertEqual(repaired_components["m_max"], 6)
+
+    def test_static_recipe_preparation_composes_generator_without_cpp_request(self) -> None:
+        client = FakeClient([checked_in_static_recipe()])
+        prepared = prepare_stress(
+            client,
+            FakeCrawler({}),
+            platform="luogu",
+            problem_id="P1001",
+            title="A+B Problem",
+            statement="Input one integer n with 1 <= n <= 10.",
+            compare="token",
+            settings=SETTINGS,
+            include_reference_primary=False,
+            include_reference_secondary=False,
+            prepared_contract=static_recipe_contract_v3(),
+            require_complete_probes=False,
+        )
+
+        self.assertIsNotNone(prepared.generator)
+        self.assertEqual(prepared.generator.origin, "ai_recipe_composed")
+        self.assertIn("// ACM_LOCAL_RECIPE_GENERATOR_V1", prepared.generator.code)
+        self.assertEqual(prepared.generation_metadata["generator_engine"], "local_templates_v1")
+        self.assertEqual(len(client.prompts), 1)
+        self.assertEqual(
+            json.loads(client.prompts[0][-1]["content"])["type"],
+            "acm_stress_generator_recipe_v1",
+        )
+
+    def test_generator_recipe_prompt_rejects_unknown_local_type(self) -> None:
+        with self.assertRaises(StressPreparationError) as caught:
+            _generator_recipe_prompt_content({"templates": [{"bad": object()}]})
+
+        self.assertEqual(
+            caught.exception.code, "stress_recipe_prompt_serialization_failed"
+        )
+        self.assertEqual(caught.exception.details["category"], "internal")
+        self.assertEqual(
+            caught.exception.details["substage"], "recipe_prompt_serialization"
+        )
+        self.assertEqual(caught.exception.details["cause_type"], "object")
+        self.assertEqual(caught.exception.details["path"], "$.templates[0].bad")
+
+    def test_recipe_prompt_serialization_keeps_internal_root_cause(self) -> None:
+        serialization_error = StressPreparationError(
+            "stress_recipe_prompt_serialization_failed",
+            "generator recipe prompt JSON 编码失败",
+            details={
+                "category": "internal",
+                "failure_phase": "preparation",
+                "stage": "prepare_generator",
+                "substage": "recipe_prompt_serialization",
+                "cause_type": "TypeError",
+                "path": "$.templates",
+            },
+        )
+        with mock.patch(
+            "tools.acm_agent.stress_ai._generator_recipe_prompt_content",
+            side_effect=serialization_error,
+        ):
+            with self.assertRaises(StressPreparationError) as caught:
+                prepare_stress(
+                    FakeClient([]),
+                    FakeCrawler({}),
+                    platform="luogu",
+                    problem_id="P1001",
+                    title="A+B Problem",
+                    statement="Input one integer n with 1 <= n <= 10.",
+                    compare="token",
+                    settings=SETTINGS,
+                    include_reference_primary=False,
+                    include_reference_secondary=False,
+                    prepared_contract=static_recipe_contract_v3(),
+                    require_complete_probes=False,
+                )
+
+        self.assertEqual(caught.exception.code, "stress_artifact_stage_failed")
+        failure = caught.exception.details["primary_failure"]
+        self.assertEqual(failure["role"], "generator")
+        self.assertEqual(
+            failure["code"], "stress_recipe_prompt_serialization_failed"
+        )
+        self.assertEqual(failure["category"], "internal")
+        self.assertEqual(failure["cause_type"], "TypeError")
+        self.assertEqual(failure["substage"], "recipe_prompt_serialization")
+        self.assertIn("generator recipe 本地准备失败", str(caught.exception))
+        self.assertNotIn("blueprint 校验失败", str(caught.exception))
+
+    def test_invalid_static_recipe_falls_back_to_legacy_generator(self) -> None:
+        invalid_recipe = json.loads(json.dumps(checked_in_static_recipe()))
+        invalid_recipe["unexpected"] = True
+        client = FakeClient(
             [
-                ("small", "lower_bound"),
-                ("small", "random"),
-                ("large", "upper_bound"),
-                ("large", "random"),
-            ],
+                invalid_recipe,
+                json.loads(json.dumps(VALID_BLUEPRINT)),
+                {"code": GENERATOR_SOURCE, "notes": "legacy fallback"},
+            ]
+        )
+        prepared = prepare_stress(
+            client,
+            FakeCrawler({}),
+            platform="luogu",
+            problem_id="P1001",
+            title="A+B Problem",
+            statement="Input one integer n with 1 <= n <= 10.",
+            compare="token",
+            settings=SETTINGS,
+            include_reference_primary=False,
+            include_reference_secondary=False,
+            prepared_contract=static_recipe_contract_v3(),
+            require_complete_probes=False,
+            blueprint_repair_limit=0,
+        )
+
+        self.assertEqual(prepared.generator.origin, "ai_generated")
+        self.assertTrue(
+            prepared.generation_metadata["generator_engine"].startswith(
+                "legacy_ai_cpp:recipe_validation_failed"
+            )
+        )
+        self.assertEqual(
+            prepared.generation_metadata["recipe_fallback_reason"],
+            "recipe_validation_failed",
         )
 
     def test_code_only_transport_returns_plain_cpp_and_keeps_role_isolated(self) -> None:
@@ -2482,16 +3446,16 @@ class StressAITests(unittest.TestCase):
             settings=SETTINGS,
             generation_mode="hybrid",
             include_generator=False,
-            include_brute=False,
-            include_reference=False,
+            include_reference_primary=False,
+            include_reference_secondary=False,
             include_validator=True,
             prepared_contract={**V2_CONTRACT, "profile_version": 2},
         )
         self.assertIsNotNone(prepared.validator)
         self.assertEqual(prepared.validator.kind, "validator")
         self.assertIsNone(prepared.generator)
-        self.assertIsNone(prepared.brute)
-        self.assertIsNone(prepared.reference)
+        self.assertIsNone(prepared.reference_primary)
+        self.assertIsNone(prepared.reference_secondary)
         self.assertEqual(
             prepared.generation_metadata["requests"]["validator"],
             {"thinking": False, "max_tokens": 6144},
@@ -3027,6 +3991,42 @@ class StressAITests(unittest.TestCase):
         self.assertEqual(pool, [first, second])
         self.assertEqual(crawler.calls, ["cnblogs"])
 
+    def test_search_collects_two_references_with_distinct_url_and_source_hash(self) -> None:
+        first = SourceCandidate(
+            "c1", "cnblogs", "https://www.cnblogs.com/x/p/1", "first", "",
+            "#include <iostream>\nint main(){return 1;}\n", "a" * 64, True,
+        )
+        duplicate_url = SourceCandidate(
+            "c2", "cnblogs", first.url, "same url", "",
+            "#include <iostream>\nint main(){return 2;}\n", "b" * 64, True,
+        )
+        duplicate_code = SourceCandidate(
+            "c3", "cnblogs", "https://www.cnblogs.com/x/p/3", "same code", "",
+            first.code, "c" * 64, True,
+        )
+        second = SourceCandidate(
+            "c4", "csdn", "https://blog.csdn.net/x/article/details/4", "second", "",
+            "#include <iostream>\nint main(){return 4;}\n", "d" * 64, True,
+        )
+        pool: list[SourceCandidate] = []
+        crawler = FakeCrawler(
+            {"cnblogs": [first, duplicate_url, duplicate_code], "csdn": [second]}
+        )
+        selected, _ = search_reference(
+            FakeClient([]),
+            crawler,
+            platform="luogu",
+            problem_id="P1",
+            title="problem",
+            statement="statement",
+            contract={},
+            settings=SETTINGS,
+            candidate_pool=pool,
+        )
+        self.assertEqual(selected, first)
+        self.assertEqual(pool, [first, second])
+        self.assertEqual(crawler.calls, ["cnblogs", "luogu_solutions", "csdn"])
+
     def test_search_can_defer_luogu_ai_audit_to_executable_gates(self) -> None:
         candidate = SourceCandidate(
             "l1", "luogu_solutions", "https://www.luogu.com.cn/article/l1",
@@ -3209,6 +4209,64 @@ class StressAITests(unittest.TestCase):
         self.assertEqual(selected.candidate_id, "good")
         self.assertEqual(len(client.prompts), 1)
 
+    def test_search_with_only_incomplete_material_returns_none_for_ai_fallback(self) -> None:
+        incomplete = SourceCandidate(
+            "explanation-only",
+            "luogu_solutions",
+            "https://www.luogu.com.cn/article/explanation-only",
+            "Explanation without full source",
+            "P1",
+            None,
+            None,
+            False,
+        )
+        selected, usage = search_reference(
+            FakeClient([]),
+            FakeCrawler({"luogu_solutions": [incomplete]}),
+            platform="luogu",
+            problem_id="P1",
+            title="P1",
+            statement="statement",
+            contract={},
+            settings=SETTINGS,
+        )
+        self.assertIsNone(selected)
+        self.assertEqual(usage, {})
+
+    def test_minimal_policy_can_disable_unaudited_external_references(self) -> None:
+        external = SourceCandidate(
+            "external",
+            "luogu_solutions",
+            "https://www.luogu.com.cn/article/external",
+            "External",
+            "P1",
+            "#include <iostream>\nint main(){std::cout<<0;}",
+            "a" * 64,
+            True,
+        )
+        client = FakeClient(
+            [{"code": "#include <iostream>\nint main(){std::cout<<1;}", "notes": "ai"}]
+        )
+        prepared = prepare_stress(
+            client,
+            FakeCrawler({"luogu_solutions": [external]}),
+            platform="luogu",
+            problem_id="P1",
+            title="P1",
+            statement="Input one integer n with 1 <= n <= 10.",
+            compare="token",
+            settings=SETTINGS,
+            include_generator=False,
+            include_reference_primary=True,
+            include_reference_secondary=False,
+            allow_external_references=False,
+            prepared_contract=contract_v3(),
+            require_complete_probes=False,
+        )
+        self.assertEqual(prepared.reference_primary.origin, "ai_generated")
+        self.assertIsNone(prepared.reference_primary.source_url)
+        self.assertEqual(len(client.prompts), 1)
+
     def test_prepare_uses_independent_prompts_and_direct_complete_reference(self) -> None:
         reference = SourceCandidate(
             "r1",
@@ -3225,7 +4283,7 @@ class StressAITests(unittest.TestCase):
                 dict(V2_CONTRACT),
                 json.loads(json.dumps(VALID_BLUEPRINT)),
                 {"code": GENERATOR_SOURCE, "notes": "gen"},
-                {"code": "#include <iostream>\nint main(){return 0;}", "notes": "bf"},
+                {"code": "#include <iostream>\nint main(){return 1;}", "notes": "ref2"},
                 AUDIT_ACCEPT,
             ]
         )
@@ -3242,14 +4300,22 @@ class StressAITests(unittest.TestCase):
                 (stage, label, step, total)
             ),
         )
-        self.assertEqual(prepared.reference.origin, "luogu_solution")
-        self.assertEqual(prepared.reference.source_url, reference.url)
-        self.assertIsNone(prepared.reference.static_audit)
+        self.assertEqual(prepared.reference_primary.origin, "luogu_solution")
+        self.assertEqual(prepared.reference_primary.source_url, reference.url)
+        self.assertIsNone(prepared.reference_primary.static_audit)
+        self.assertEqual(prepared.reference_secondary.kind, "reference_secondary")
+        self.assertEqual(prepared.reference_secondary.origin, "ai_generated")
         prompts = json.dumps(client.prompts, ensure_ascii=False)
         self.assertNotIn("user solution", prompts)
+        self.assertNotIn('"artifact_kind": "brute"', prompts)
+        self.assertIn("最大约束", prompts)
+        self.assertIn("不得使用只适用于小数据的暴力", prompts)
         self.assertEqual(prepared.usage["total_tokens"], 4)
         self.assertEqual(prepared.generator_blueprint["schema_version"], 1)
-        self.assertEqual(prepared.generation_metadata["mode"], "fast")
+        # SETTINGS carries no mode key, so this exercises the library fallback,
+        # which now matches the declared product default (config.py's
+        # STRESS_GENERATION_MODE_DEFAULT) instead of diverging to "fast".
+        self.assertEqual(prepared.generation_metadata["mode"], "hybrid")
         self.assertEqual(prepared.generation_metadata["blueprint_repairs_used"], 0)
         self.assertEqual(
             [item[0] for item in client.progress],
@@ -3257,12 +4323,88 @@ class StressAITests(unittest.TestCase):
                 "extract_contract",
                 "generate_generator",
                 "generate_generator",
-                "generate_brute",
-                "prepare_reference",
+                "prepare_reference_primary",
+                "prepare_reference_secondary",
             ],
         )
-        self.assertEqual([item[2] for item in client.progress], [2, 3, 3, 4, 6])
-        self.assertIn("搜索或生成对拍代码", client.progress[-1][1])
+        self.assertEqual([item[2] for item in client.progress], [2, 3, 3, 5, 6])
+        self.assertIn("secondary reference", client.progress[-1][1])
+
+    def test_prepare_retries_one_generated_reference_once_on_duplicate_source(self) -> None:
+        class DuplicateReferenceClient:
+            def __init__(self) -> None:
+                self.lock = threading.Lock()
+                self.calls: list[str] = []
+                self.secondary_calls = 0
+
+            def chat_json(self, messages, **kwargs):
+                request = json.loads(messages[-1]["content"])
+                role = str(request.get("artifact_kind") or "")
+                with self.lock:
+                    self.calls.append(role)
+                    if role == "reference_secondary":
+                        self.secondary_calls += 1
+                        attempt = self.secondary_calls
+                    else:
+                        attempt = 1
+                code = "#include <iostream>\nint main(){return 0;}\n"
+                if role == "reference_secondary" and attempt == 2:
+                    code = "#include <iostream>\nint main(){return 1;}\n"
+                return Result(data={"code": code, "notes": role})
+
+        client = DuplicateReferenceClient()
+        prepared = prepare_stress(
+            client,
+            FakeCrawler({}),
+            platform="luogu",
+            problem_id="P1",
+            title="problem",
+            statement="statement",
+            compare="token",
+            settings=SETTINGS,
+            include_generator=False,
+            prepared_contract={**V2_CONTRACT, "profile_version": 2},
+        )
+        self.assertEqual(client.secondary_calls, 2)
+        self.assertNotEqual(
+            prepared.reference_primary.code,
+            prepared.reference_secondary.code,
+        )
+        self.assertNotIn("brute", client.calls)
+
+    def test_prepare_fails_closed_when_generated_references_remain_duplicates(self) -> None:
+        class AlwaysDuplicateClient:
+            def __init__(self) -> None:
+                self.roles: list[str] = []
+
+            def chat_json(self, messages, **kwargs):
+                request = json.loads(messages[-1]["content"])
+                role = str(request.get("artifact_kind") or "")
+                self.roles.append(role)
+                return Result(
+                    data={
+                        "code": "#include <iostream>\nint main(){return 0;}\n",
+                        "notes": role,
+                    }
+                )
+
+        client = AlwaysDuplicateClient()
+        with self.assertRaises(StressPreparationError) as caught:
+            prepare_stress(
+                client,
+                FakeCrawler({}),
+                platform="luogu",
+                problem_id="P1",
+                title="problem",
+                statement="statement",
+                compare="token",
+                settings=SETTINGS,
+                include_generator=False,
+                prepared_contract={**V2_CONTRACT, "profile_version": 2},
+            )
+        self.assertEqual(caught.exception.code, "stress_reference_duplicate")
+        self.assertEqual(client.roles.count("reference_secondary"), 2)
+        self.assertNotIn("brute", client.roles)
 
     def test_prepare_exposes_blueprint_repairs_and_shares_cancel_scope(self) -> None:
         invalid = json.loads(json.dumps(VALID_BLUEPRINT))
@@ -3288,8 +4430,8 @@ class StressAITests(unittest.TestCase):
             compare="token",
             settings=SETTINGS,
             generation_mode="hybrid",
-            include_brute=False,
-            include_reference=False,
+            include_reference_primary=False,
+            include_reference_secondary=False,
             prepared_contract={**V2_CONTRACT, "profile_version": 2},
             blueprint_repair_limit=1,
             cancel_scope=scope,
@@ -3318,8 +4460,8 @@ class StressAITests(unittest.TestCase):
             statement="statement",
             compare="token",
             settings=SETTINGS,
-            include_brute=False,
-            include_reference=False,
+            include_reference_primary=False,
+            include_reference_secondary=False,
             prepared_contract={**V2_CONTRACT, "profile_version": 2},
             prepared_generator_blueprint=VALID_BLUEPRINT,
             initial_usage={"blueprint_repairs_used": 7},
@@ -3347,8 +4489,8 @@ class StressAITests(unittest.TestCase):
                 statement="statement",
                 compare="token",
                 settings=SETTINGS,
-                include_brute=False,
-                include_reference=False,
+                include_reference_primary=False,
+                include_reference_secondary=False,
                 prepared_contract={**V2_CONTRACT, "profile_version": 2},
                 blueprint_repair_limit=2,
                 cancel_scope=scope,
@@ -3402,8 +4544,8 @@ class StressAITests(unittest.TestCase):
             compare="token",
             settings=SETTINGS,
             include_generator=False,
-            include_brute=False,
-            include_reference=False,
+            include_reference_primary=False,
+            include_reference_secondary=False,
             progress_callback=lambda stage, label, step, total: client.progress.append(
                 (stage, label, step, total)
             ),

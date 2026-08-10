@@ -318,7 +318,10 @@ class AIConversationSwitchFrontendTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         static = REPO_ROOT / "tools/acm_agent/web_static"
         cls.html = (static / "index.html").read_text(encoding="utf-8")
-        cls.script = (static / "app.js").read_text(encoding="utf-8")
+        cls.script = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted(static.glob("*.js"))
+        )
 
     def test_workbench_switches_by_problem_and_exposes_clear_action(self) -> None:
         self.assertIn('id="ai-chat-clear"', self.html)

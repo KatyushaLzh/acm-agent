@@ -37,6 +37,18 @@ class FakeCoordinator:
         }
 
 
+class FailingCoordinator(FakeCoordinator):
+    def start(self, **kwargs):
+        self.started.append(kwargs)
+        raise RuntimeError("validator probe certification failed")
+
+
+class RawTypeFailingCoordinator(FakeCoordinator):
+    def start(self, **kwargs):
+        self.started.append(kwargs)
+        raise TypeError("Object of type mappingproxy is not JSON serializable")
+
+
 class StressServiceTests(unittest.TestCase):
     def test_stress_client_can_use_long_request_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -89,6 +101,8 @@ class StressServiceTests(unittest.TestCase):
             self.assertEqual(sent["generation_mode"], "hybrid")
             self.assertEqual(sent["statement"], "题面正文与约束")
             self.assertFalse(sent["include_large"])
+            self.assertFalse(sent["include_validator"])
+            self.assertTrue(sent["allow_validator_degradation"])
             with Database(service.paths.database) as db:
                 row = db.connection.execute(
                     "SELECT request_summary_json,usage_json,preparation_meta_json FROM ai_runs WHERE id=?",
@@ -100,6 +114,9 @@ class StressServiceTests(unittest.TestCase):
             self.assertFalse(summary["large"])
             self.assertEqual(summary["profile_version"], 2)
             self.assertEqual(summary["generation_mode"], "hybrid")
+            self.assertFalse(summary["validator"])
+            self.assertFalse(summary["validator_strict"])
+            self.assertFalse(summary["minimal_verification"])
             self.assertNotIn("private-handle", serialized)
             self.assertNotIn("4242", serialized)
             self.assertNotIn(str(root), serialized)
@@ -108,6 +125,54 @@ class StressServiceTests(unittest.TestCase):
                 json.loads(row["preparation_meta_json"])["generation_mode"],
                 "hybrid",
             )
+
+    def test_strict_validator_is_forwarded_and_failure_is_marked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            service = AcmService(
+                root,
+                deepseek_client_factory=KeyClient,
+                problem_context_fetcher=lambda ref: (
+                    "statement",
+                    "https://example.test",
+                ),
+            )
+            service.setup("handle", "4242", skip_validate=True)
+            service.start("CF1A")
+            fake = FailingCoordinator()
+            service._stress = fake
+
+            with self.assertRaises(Exception) as caught:
+                service.ai_stress_start(
+                    "CF1A",
+                    include_validator=True,
+                    allow_validator_degradation=False,
+                    unvalidated_large=False,
+                )
+
+            sent = fake.started[0]
+            self.assertTrue(sent["include_validator"])
+            self.assertFalse(sent["allow_validator_degradation"])
+            self.assertFalse(sent["unvalidated_large"])
+            self.assertTrue(
+                caught.exception.details["validator_strict_certification_failed"]
+            )
+            with Database(service.paths.database) as db:
+                row = db.connection.execute(
+                    "SELECT request_summary_json,error_json,status FROM ai_runs "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
+            summary = json.loads(row["request_summary_json"])
+            failure = json.loads(row["error_json"])
+            self.assertTrue(summary["validator"])
+            self.assertTrue(summary["validator_strict"])
+            self.assertEqual(row["status"], "failed")
+            self.assertEqual(failure["code"], "stress_internal_error")
+            self.assertEqual(failure["root_cause_code"], "stress_internal_error")
+            self.assertEqual(failure["category"], "internal")
+            self.assertEqual(failure["cause_type"], "RuntimeError")
+            self.assertEqual(failure["failure_phase"], "preparation")
+            self.assertNotEqual(failure["code"], "stress_setup_failed")
 
     def test_generation_mode_reads_config_and_explicit_override(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -148,6 +213,36 @@ class StressServiceTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "stress_generation_mode"):
                 service.ai_stress_start("CF1A", generation_mode="full-thinking")
+
+    def test_non_strict_unstructured_failure_is_normalized_and_propagated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = AcmService(
+                Path(temp),
+                deepseek_client_factory=KeyClient,
+                problem_context_fetcher=lambda ref: (
+                    "statement",
+                    "https://example.test",
+                ),
+            )
+            service.setup("handle", "4242", skip_validate=True)
+            service.start("CF1A")
+            service._stress = RawTypeFailingCoordinator()
+
+            with self.assertRaises(Exception) as caught:
+                service.ai_stress_start("CF1A")
+
+            self.assertEqual(getattr(caught.exception, "code", ""), "stress_internal_error")
+            self.assertEqual(caught.exception.details["root_cause_code"], "stress_internal_error")
+            self.assertEqual(caught.exception.details["category"], "internal")
+            self.assertEqual(caught.exception.details["cause_type"], "TypeError")
+            with Database(service.paths.database) as db:
+                row = db.connection.execute(
+                    "SELECT error_json FROM ai_runs ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
+            failure = json.loads(row["error_json"])
+            self.assertEqual(failure["code"], "stress_internal_error")
+            self.assertEqual(failure["category"], "internal")
+            self.assertNotIn("stress_setup_failed", json.dumps(failure))
 
     def test_custom_timeout_is_forwarded_and_active_setup_blocks_before_client(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

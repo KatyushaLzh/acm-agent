@@ -86,6 +86,78 @@ class StressCheckpointIdentityTests(unittest.TestCase):
                     baseline,
                 )
 
+    def test_certification_identity_accepts_missing_validator(self) -> None:
+        def candidate(role: str) -> dict[str, str]:
+            return {
+                "id": f"candidate-{role}",
+                "role": role,
+                "source_hash": (role[0] + "0" * 63),
+            }
+
+        common = {
+            "generator": candidate("generator"),
+            "brute": candidate("brute"),
+            "reference": candidate("reference"),
+            "compiler": {"fingerprint": "g++-14"},
+            "sandbox": {"backend": "appcontainer", "policy": 3},
+            "samples": [{"input": "1 2\n", "output": "3\n"}],
+            "protocol": {"generator": "profile-v2", "manifest": 2},
+            "gate": {"preflight": 3, "unvalidated": True},
+        }
+        unvalidated_identity = certification_identity(**common, validator=None)
+        self.assertEqual(
+            unvalidated_identity["validator"],
+            {"candidate_id": "unvalidated", "source_sha256": "none"},
+        )
+        self.assertEqual(
+            certification_identity(**common, validator=None),
+            unvalidated_identity,
+        )
+        self.assertNotEqual(
+            certification_identity(**common, validator=candidate("validator")),
+            unvalidated_identity,
+        )
+        with self.assertRaises(ValueError):
+            certification_identity(**common, validator=candidate("brute"))
+
+    def test_dual_reference_identity_is_protocol_scoped_and_rejects_mixing(self) -> None:
+        def candidate(role: str) -> dict[str, str]:
+            return {
+                "id": f"candidate-{role}",
+                "role": role,
+                "source_hash": (role[0] + "0" * 63),
+            }
+
+        common = {
+            "generator": candidate("generator"),
+            "reference_primary": candidate("reference_primary"),
+            "reference_secondary": candidate("reference_secondary"),
+            "validator": None,
+            "compiler": "g++-14",
+            "sandbox": "appcontainer-v3",
+            "samples": [],
+            "protocol": {"profile": 2},
+        }
+        identity = certification_identity(**common)
+        self.assertEqual(identity["oracle_protocol"], "dual_reference_v1")
+        self.assertEqual(
+            set(identity["helpers"]),
+            {"generator", "reference_primary", "reference_secondary"},
+        )
+        legacy = certification_identity(
+            generator=candidate("generator"),
+            brute=candidate("brute"),
+            reference=candidate("reference"),
+            validator=None,
+            compiler="g++-14",
+            sandbox="appcontainer-v3",
+            samples=[],
+            protocol={"profile": 2},
+        )
+        self.assertNotEqual(certification_key(identity), certification_key(legacy))
+        with self.assertRaises(ValueError):
+            certification_identity(**common, brute=candidate("brute"))
+
 
 class StressCheckpointStoreTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -165,13 +237,61 @@ class StressCheckpointStoreTests(unittest.TestCase):
         self.assertEqual(
             stored_identity["validator"]["candidate_id"], candidates["validator"].id
         )
+
+    def test_exact_trio_certification_persists_missing_validator_marker(self) -> None:
+        generator = self._candidate("generator")
+        brute = self._candidate("brute")
+        reference = self._candidate("reference")
+        certification = self.store.save_exact_trio_certification(
+            generator=generator,
+            brute=brute,
+            reference=reference,
+            validator=None,
+            compiler={"fingerprint": "g++-14"},
+            sandbox={"backend": "appcontainer", "policy": 3},
+            samples=[{"input": "1\n", "output": "1\n"}],
+            protocol={"profile": 2, "manifest": 2},
+            gate={"preflight": 3, "unvalidated": True, "degraded_reason": "probe"},
+            scope={"small": 16, "large": 0},
+            preflight={"passed": True},
+        )
+        stored_identity = json.loads(certification["certification_identity_json"])
+        self.assertEqual(
+            stored_identity["validator"],
+            {"candidate_id": "unvalidated", "source_sha256": "none"},
+        )
+        stored_gate = json.loads(certification["scope_json"])
+        self.assertEqual(stored_gate["large"], 0)
         self.assertEqual(
             {
                 certification["generator_candidate_id"],
                 certification["brute_candidate_id"],
                 certification["reference_candidate_id"],
             },
-            {candidates[role].id for role in ("generator", "brute", "reference")},
+            {generator.id, brute.id, reference.id},
+        )
+
+    def test_dual_reference_certification_persists_new_roles(self) -> None:
+        generator = self._candidate("generator")
+        primary = self._candidate("reference_primary")
+        secondary = self._candidate("reference_secondary")
+        certification = self.store.save_dual_reference_certification(
+            generator=generator,
+            reference_primary=primary,
+            reference_secondary=secondary,
+            validator=None,
+            compiler="g++-14",
+            sandbox="appcontainer-v3",
+            samples=[],
+            protocol={"profile": 2},
+            scope={"small": 16, "large": 0},
+        )
+        self.assertEqual(certification["oracle_protocol"], "dual_reference_v1")
+        self.assertIsNone(certification["brute_candidate_id"])
+        self.assertIsNone(certification["reference_candidate_id"])
+        self.assertEqual(certification["reference_primary_candidate_id"], primary.id)
+        self.assertEqual(
+            certification["reference_secondary_candidate_id"], secondary.id
         )
 
     def test_failed_cold_run_never_publishes_or_replaces_alias(self) -> None:

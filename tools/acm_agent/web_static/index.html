@@ -132,11 +132,25 @@
           <article class="panel">
             <div class="panel-heading"><div><p class="eyebrow">START</p><h2>开始做题</h2></div></div>
             <form id="start-form" class="stack-form">
-              <label>题号或题目 URL<input name="problem" required autocomplete="off" placeholder="CF1234A 或 P1000"></label>
+              <label>题号或题目 URL<input name="problem" required autocomplete="off" placeholder="CF1234A、P1000 或任意自定义题号"></label>
               <label class="check"><input name="with_stress" type="checkbox">同时创建暴力和数据生成器</label>
               <button class="button primary" type="submit">创建 / 复用源码并开始计时</button>
             </form>
             <div id="start-result" class="result-box hidden"></div>
+            <section class="template-editor" aria-labelledby="template-title">
+              <div class="template-editor-head">
+                <div><p class="eyebrow">TEMPLATE</p><h3 id="template-title">缺省源</h3></div>
+                <span id="template-state" class="subtle">正在读取…</span>
+              </div>
+              <p class="subtle">创建 / 复用题号 .cpp 时使用；编辑内容随「创建 / 复用源码并开始计时」一并保存为全局缺省源。当日目录存在 template.cpp 时优先于缺省源。</p>
+              <div class="code-editor">
+                <pre id="template-highlight" aria-hidden="true"></pre>
+                <textarea id="template-source" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off" aria-label="缺省 C++ 源码"></textarea>
+              </div>
+              <div class="card-actions template-actions">
+                <button id="template-reset" class="button secondary" type="button">恢复内置默认</button>
+              </div>
+            </section>
           </article>
           <article class="panel">
             <div class="panel-heading"><div><p class="eyebrow">VERIFY</p><h2>本地验证</h2></div></div>
@@ -161,9 +175,10 @@
                 <fieldset id="ai-stress-options" class="ai-stress-options" disabled>
                   <div class="ai-stress-checks">
                     <label class="check"><input name="generate_generator" type="checkbox" checked>补全数据生成器</label>
-                    <label class="check"><input name="generate_brute" type="checkbox" checked>补全小规模暴力</label>
-                    <label class="check"><input name="prepare_reference" type="checkbox" checked>搜索 / 生成对拍代码</label>
-                    <label class="check"><input name="large_profile" type="checkbox" checked>启用极限大数据（不运行 brute）</label>
+                    <label class="check"><input name="prepare_reference_primary" type="checkbox" checked>搜索 / 生成第一份 reference</label>
+                    <label class="check"><input name="prepare_reference_secondary" type="checkbox" checked>搜索 / 生成第二份 reference</label>
+                    <label class="check"><input name="large_profile" type="checkbox" checked>启用极限大数据（双 reference 同时运行）</label>
+                    <label class="check"><input name="include_validator" type="checkbox">启用 validator（启用后升级为完整严格认证，正确性更高但生成成功率显著下降）</label>
                   </div>
                   <span class="subtle">取消前三项时会复用对应的现有 helper；文件不存在则安全停止准备。</span>
                   <div class="form-row">
@@ -172,16 +187,38 @@
                   </div>
                   <div class="form-row">
                     <label>对拍代码最长运行时间（秒）<input name="timeout" type="number" min="0.1" max="60" step="0.1" value="2"></label>
-                    <label>对拍暴力代码最长运行时间（秒）<input name="brute_timeout" type="number" min="0.1" max="60" step="0.1" value="5"></label>
+                    <label>第二份 reference 最长运行时间（秒）<input name="reference_secondary_timeout" type="number" min="0.1" max="60" step="0.1" value="5"></label>
                   </div>
                   <div class="form-row">
                     <label>准备耗时上限（秒）<input name="preparation_timeout_seconds" type="number" min="60" max="1800" step="1" value="600"></label>
                     <label>helper 生成模式<select name="generation_mode"><option value="fast">Fast（非 thinking）</option><option value="hybrid" selected>Hybrid（默认）</option><option value="full_thinking">Full thinking</option></select></label>
                   </div>
                   <label>缓存模式<select name="cache_mode"><option value="reuse" selected>Reuse（复用已认证结果）</option><option value="refresh_helpers">Refresh helpers（保留 contract/recipe）</option><option value="cold">Cold（不读取任何本地生成缓存）</option></select></label>
+                  <div class="form-row">
+                    <div class="file-picker-field" data-file-picker-field="generator_file" role="group" aria-labelledby="generator-file-label">
+                      <span id="generator-file-label" class="file-picker-label">手动 generator 文件（可选）</span>
+                      <input name="generator_file" type="hidden">
+                      <div class="file-picker-actions"><button class="button secondary" type="button" data-file-picker="generator_file" data-kind="cpp">选择文件</button><button class="button secondary" type="button" data-file-clear="generator_file">清除</button></div>
+                      <output id="generator-file-status" class="file-picker-status" aria-live="polite">未选择</output>
+                    </div>
+                    <div class="file-picker-field" data-file-picker-field="reference_primary_file" role="group" aria-labelledby="reference-primary-file-label">
+                      <span id="reference-primary-file-label" class="file-picker-label">第一份 reference（可选）</span>
+                      <input name="reference_primary_file" type="hidden">
+                      <div class="file-picker-actions"><button class="button secondary" type="button" data-file-picker="reference_primary_file" data-kind="cpp">选择文件</button><button class="button secondary" type="button" data-file-clear="reference_primary_file">清除</button></div>
+                      <output id="reference-primary-file-status" class="file-picker-status" aria-live="polite">未选择</output>
+                    </div>
+                  </div>
+                  <div class="form-row">
+                    <div class="file-picker-field" data-file-picker-field="reference_secondary_file" role="group" aria-labelledby="reference-secondary-file-label">
+                      <span id="reference-secondary-file-label" class="file-picker-label">第二份 reference（可选）</span>
+                      <input name="reference_secondary_file" type="hidden">
+                      <div class="file-picker-actions"><button class="button secondary" type="button" data-file-picker="reference_secondary_file" data-kind="cpp">选择文件</button><button class="button secondary" type="button" data-file-clear="reference_secondary_file">清除</button></div>
+                      <output id="reference-secondary-file-status" class="file-picker-status" aria-live="polite">未选择</output>
+                    </div>
+                  </div>
                   <span id="ai-stress-generation-mode-hint" class="subtle">默认按 10 分钟预算设计；第 8 分钟硬停止 provider，为本地验证保留 110 秒、清理保留 10 秒。Hybrid 初次使用 Fast，仅在收到明确机器诊断后启用 thinking。</span>
                   <div class="ai-stress-safety">
-                    <span>small：2 MiB 输入输出 · large：32 MiB 输入、16 MiB 输出 · 来源顺序：官方题解 → 博客园 → CSDN → AI 生成</span>
+                    <span>small：2 MiB 输入输出 · large：32 MiB 输入、16 MiB 输出 · 两份 reference 均执行 · 来源顺序：官方题解 → 博客园 → CSDN → AI 生成</span>
                     <span id="ai-stress-isolation" class="badge neutral">正在检查隔离环境</span>
                   </div>
                   <button class="button primary" type="submit">AI 准备并开始持续对拍</button>
@@ -218,6 +255,7 @@
             <label>提示等级<select id="ai-hint-level"><option value="1">1 — 反例提问</option><option value="2">2 — 关键性质</option><option value="3">3 — 转化 / 伪代码</option></select></label>
             <button id="ai-context-button" class="button secondary" type="button">读取 / 抓取题面</button>
           </div>
+          <p id="ai-problem-hint" class="subtle hidden" role="status"></p>
           <details class="ai-statement-editor"><summary>题面上下文</summary><textarea id="ai-statement" rows="8" maxlength="131072" placeholder="自动抓取失败时可粘贴题面；保存后人工版本优先。"></textarea><div class="card-actions"><button id="ai-statement-save" class="button secondary" type="button">保存人工题面</button><button id="ai-statement-restore" class="button secondary" type="button">恢复自动题面</button><span id="ai-context-source" class="subtle">尚未读取</span></div></details>
           <div id="ai-chat-messages" class="ai-chat-messages empty-state compact">开始题目后可在这里请求分级提示或代码诊断。</div>
           <form id="ai-chat-form" class="ai-chat-form">
@@ -242,7 +280,12 @@
               <div class="knowledge-target-grid">
                 <label>已保存目标<select id="knowledge-target" name="knowledge_target"><option value="">请选择或注册目标文件</option></select></label>
                 <label>Schema 模式<select id="knowledge-schema-mode" name="knowledge_schema_mode"><option value="infer">自动推断</option><option value="stored">使用目标已保存 schema</option><option value="custom">自定义 schema</option><option value="ai">AI 判断</option></select></label>
-                <label class="span-2">新增本机 Markdown 绝对路径<input id="knowledge-path" name="knowledge_path" autocomplete="off" placeholder="D:\notes\algorithms.md"></label>
+                <div class="file-picker-field span-2" data-file-picker-field="knowledge_path" role="group" aria-labelledby="knowledge-path-label">
+                  <span id="knowledge-path-label" class="file-picker-label">新增本机 Markdown 文件</span>
+                  <input id="knowledge-path" name="knowledge_path" type="hidden">
+                  <div class="file-picker-actions"><button id="knowledge-path-pick" class="button secondary" type="button" data-file-picker="knowledge_path" data-kind="markdown">选择文件</button><button id="knowledge-path-clear" class="button secondary" type="button" data-file-clear="knowledge_path">清除</button></div>
+                  <output id="knowledge-path-status" class="file-picker-status" aria-live="polite">未选择</output>
+                </div>
                 <label>目标名称<input id="knowledge-target-name" name="knowledge_target_name" maxlength="80" placeholder="例如：算法知识库"></label>
                 <div class="card-actions"><button id="knowledge-target-add" class="button secondary" type="button">检查并保存目标</button><button id="knowledge-target-remove" class="button danger" type="button">取消注册</button></div>
                 <label id="knowledge-custom-schema-wrap" class="span-2 hidden">summary-schema-v1<textarea id="knowledge-custom-schema" name="knowledge_custom_schema" rows="7" placeholder='{"version":"summary-schema-v1","name":"自定义总结","category_heading_level":1,"entry_heading_level":2,"toc":"preserve","fields":[{"key":"insight","label":"Insight","required":true,"layout":"bullet","instruction":"记录可复用启发"}]}'></textarea></label>
@@ -365,6 +408,6 @@
   <template id="toast-template"><div class="toast"><strong></strong><p></p></div></template>
   <script src="/static/vendor/katex/katex.min.js" defer></script>
   <script src="/static/vendor/katex/contrib/auto-render.min.js" defer></script>
-  <script src="/static/app.js" defer></script>
+  <script type="module" src="/static/app.js"></script>
 </body>
 </html>

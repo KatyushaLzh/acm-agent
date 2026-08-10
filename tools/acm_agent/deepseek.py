@@ -19,6 +19,7 @@ import json
 import http.client
 import math
 import os
+import random as _random
 import re
 import socket
 import threading
@@ -27,15 +28,30 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
+
+from .ai_policy import (
+    ALLOWED_MODELS,
+    ALLOWED_REASONING_EFFORTS,
+    DEFAULT_MODEL,
+    DEFAULT_REASONING_EFFORT,
+)
+from .usage import merge_usage, normalize_usage
 
 
 DEEPSEEK_ENDPOINT = "https://api.deepseek.com/chat/completions"
-ALLOWED_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
-DEFAULT_MODEL = "deepseek-v4-flash"
-ALLOWED_REASONING_EFFORTS = frozenset({"high", "max"})
-RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 503})
-MAX_PROVIDER_REQUEST_SECONDS = 300.0
+RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+MAX_RETRY_BACKOFF_SECONDS = 30.0
+MAX_RETRY_AFTER_SECONDS = 60.0
+_CANCELLABLE_SLEEP_SLICE_SECONDS = 0.1
+# Transport-level ceiling for a single HTTP request.  This is deliberately
+# looser than the stress preparation policy caps in stress_budget
+# (MAX_THINKING_REQUEST_SECONDS / MAX_NON_THINKING_REQUEST_SECONDS /
+# MAX_AUDIT_REQUEST_SECONDS), which clamp the value before it ever reaches this
+# client.  Keep the names distinct: this one bounds the socket, those bound the
+# preparation budget.
+MAX_TRANSPORT_REQUEST_SECONDS = 300.0
 _READ_CHUNK_BYTES = 64 * 1024
 _NETWORK_EXCEPTIONS = (
     urllib.error.URLError,
@@ -228,6 +244,8 @@ class DeepSeekCancelScope:
 
     @property
     def cancellation_event(self) -> threading.Event:
+        """Deprecated compatibility alias for :attr:`event`."""
+
         return self._cancelled
 
     def cancel(self) -> None:
@@ -270,7 +288,8 @@ class DeepSeekCancelScope:
         _abort_response(response)
 
 
-# Short aliases keep call sites readable without creating global cancellation.
+# Deprecated compatibility aliases.  Keep them for one transition cycle so
+# embedders importing the old names do not break during the cleanup release.
 CancellationScope = DeepSeekCancelScope
 CancelScope = DeepSeekCancelScope
 CancellationToken = DeepSeekCancelScope
@@ -307,13 +326,16 @@ def _sanitize(value: Any, secret: str | None = None) -> str:
 
 def _error_code_for_status(status: int) -> str:
     return {
+        408: "timeout",
         400: "invalid_request",
         401: "authentication_failed",
         402: "insufficient_balance",
         422: "invalid_request",
         429: "rate_limited",
         500: "server_error",
+        502: "server_error",
         503: "server_error",
+        504: "server_error",
     }.get(status, "http_error")
 
 
@@ -329,12 +351,49 @@ def _provider_message(body: bytes, status: int) -> str:
     return f"DeepSeek request failed with HTTP {status}"
 
 
-def _http_error(status: int, body: bytes, secret: str | None) -> DeepSeekError:
+def _retry_after_seconds(response: Any, *, now: float) -> float | None:
+    headers = getattr(response, "headers", None)
+    raw: Any = None
+    if headers is not None:
+        getter = getattr(headers, "get", None)
+        if callable(getter):
+            raw = getter("Retry-After")
+    if raw is None:
+        getter = getattr(response, "getheader", None)
+        if callable(getter):
+            raw = getter("Retry-After")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    try:
+        seconds = float(text)
+    except ValueError:
+        try:
+            parsed = parsedate_to_datetime(text)
+            seconds = parsed.timestamp() - float(now)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if not math.isfinite(seconds):
+        return None
+    return min(MAX_RETRY_AFTER_SECONDS, max(0.0, seconds))
+
+
+def _http_error(
+    status: int,
+    body: bytes,
+    secret: str | None,
+    *,
+    retry_after_seconds: float | None = None,
+) -> DeepSeekError:
+    protocol_details: dict[str, Any] = {}
+    if retry_after_seconds is not None:
+        protocol_details["retry_after_seconds"] = float(retry_after_seconds)
     return DeepSeekError(
         _error_code_for_status(status),
         _sanitize(_provider_message(body, status), secret),
         status=status,
         retryable=status in RETRYABLE_HTTP_STATUSES,
+        protocol_details=protocol_details,
     )
 
 
@@ -372,63 +431,13 @@ def _response_status(response: Any) -> int:
     return int(status or 200)
 
 
-def _normalize_usage(source: Mapping[str, Any]) -> dict[str, Any]:
-    """Keep provider usage recursively and expose nested reasoning tokens."""
-
-    def copy_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
-        copied: dict[str, Any] = {}
-        for raw_key, item in value.items():
-            key = str(raw_key)
-            # reasoning_content is protocol state, never usage/telemetry.
-            if key.casefold() == "reasoning_content":
-                continue
-            if isinstance(item, Mapping):
-                copied[key] = copy_mapping(item)
-            elif isinstance(item, (str, int, float, bool)) or item is None:
-                copied[key] = item
-        return copied
-
-    normalized = copy_mapping(source)
-    direct = normalized.get("reasoning_tokens")
-    if not isinstance(direct, (int, float)) or isinstance(direct, bool):
-        nested_total = 0
-
-        def collect(value: Mapping[str, Any]) -> None:
-            nonlocal nested_total
-            for key, item in value.items():
-                if key == "reasoning_tokens" and isinstance(item, (int, float)) and not isinstance(item, bool):
-                    nested_total += item
-                elif isinstance(item, Mapping):
-                    collect(item)
-
-        collect(normalized)
-        if nested_total:
-            normalized["reasoning_tokens"] = nested_total
-    return normalized
-
-
-def _merge_usage(target: dict[str, Any], source: Mapping[str, Any]) -> None:
-    """Recursively accumulate numeric usage while retaining provider fields."""
-    for key, value in _normalize_usage(source).items():
-        if isinstance(value, Mapping):
-            previous = target.get(key)
-            nested = dict(previous) if isinstance(previous, Mapping) else {}
-            _merge_usage(nested, value)
-            target[key] = nested
-        elif isinstance(value, (int, float)) and not isinstance(value, bool):
-            previous = target.get(key, 0)
-            target[key] = previous + value if isinstance(previous, (int, float)) and not isinstance(previous, bool) else value
-        else:
-            target[key] = value
-
-
 def _response_error_details(data: Any) -> dict[str, Any]:
     if not isinstance(data, Mapping):
         return {}
     details: dict[str, Any] = {}
     usage = data.get("usage")
     if isinstance(usage, Mapping):
-        details["usage"] = _normalize_usage(usage)
+        details["usage"] = normalize_usage(usage)
     if data.get("model") is not None:
         details["model"] = str(data["model"])
     if data.get("id") is not None:
@@ -475,6 +484,8 @@ class DeepSeekClient:
         retries: int = 2,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        wall_time: Callable[[], float] = time.time,
+        random_value: Callable[[], float] = _random.random,
     ) -> None:
         self._api_key = (
             str(api_key).strip()
@@ -486,6 +497,8 @@ class DeepSeekClient:
         self.retries = max(0, int(retries))
         self._sleep = sleep
         self._monotonic = monotonic
+        self._wall_time = wall_time
+        self._random_value = random_value
         self._request_count = 0
         self._request_count_lock = threading.Lock()
 
@@ -613,7 +626,7 @@ class DeepSeekClient:
             raise DeepSeekConfigurationError(
                 "invalid_timeout", "request_timeout must be positive and finite"
             )
-        timeout = min(MAX_PROVIDER_REQUEST_SECONDS, configured)
+        timeout = min(MAX_TRANSPORT_REQUEST_SECONDS, configured)
         remaining = self._remaining(deadline)
         if remaining is not None:
             if remaining <= 0:
@@ -657,37 +670,26 @@ class DeepSeekClient:
 
         chunks: list[bytes] = []
 
-        def deadline_with_available_details(extra: Any = None) -> DeepSeekError:
+        def available_details(extra: Any = None) -> dict[str, Any]:
             available = list(chunks)
             if isinstance(extra, str):
                 available.append(extra.encode("utf-8"))
             elif isinstance(extra, (bytes, bytearray, memoryview)):
                 available.append(bytes(extra))
-            details: dict[str, Any] = {}
             if available:
                 try:
                     decoded = json.loads(b"".join(available).decode("utf-8-sig"))
                 except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
-                    pass
+                    return {}
                 else:
-                    details = _response_error_details(decoded)
-            return self._deadline_error(status=status, **details)
+                    return _response_error_details(decoded)
+            return {}
+
+        def deadline_with_available_details(extra: Any = None) -> DeepSeekError:
+            return self._deadline_error(status=status, **available_details(extra))
 
         def cancelled_with_available_details(extra: Any = None) -> DeepSeekCancelledError:
-            available = list(chunks)
-            if isinstance(extra, str):
-                available.append(extra.encode("utf-8"))
-            elif isinstance(extra, (bytes, bytearray, memoryview)):
-                available.append(bytes(extra))
-            details: dict[str, Any] = {}
-            if available:
-                try:
-                    decoded = json.loads(b"".join(available).decode("utf-8-sig"))
-                except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
-                    pass
-                else:
-                    details = _response_error_details(decoded)
-            return self._cancelled_error(**details)
+            return self._cancelled_error(**available_details(extra))
 
         try:
             while True:
@@ -835,6 +837,7 @@ class DeepSeekClient:
         try:
             response = self._transport(request, timeout)
         except urllib.error.HTTPError as exc:
+            retry_after = _retry_after_seconds(exc, now=self._wall_time())
             if cancel_scope is not None:
                 cancel_scope._register(exc)
             try:
@@ -852,7 +855,12 @@ class DeepSeekClient:
                 self._close_response(exc)
                 if cancel_scope is not None:
                     cancel_scope._unregister(exc)
-            raise _http_error(int(exc.code), body, self._api_key) from None
+            raise _http_error(
+                int(exc.code),
+                body,
+                self._api_key,
+                retry_after_seconds=retry_after,
+            ) from None
         except _NETWORK_EXCEPTIONS as exc:
             self._check_cancel(cancel_scope)
             remaining = self._remaining(deadline)
@@ -876,6 +884,7 @@ class DeepSeekClient:
         status = _response_status(response)
         self._check_cancel(cancel_scope)
         if status >= 400:
+            retry_after = _retry_after_seconds(response, now=self._wall_time())
             with _managed_response(response, cancel_scope) as opened:
                 try:
                     body = self._read_response_body(
@@ -888,7 +897,12 @@ class DeepSeekClient:
                     raise
                 except Exception:
                     body = b""
-            raise _http_error(status, body, self._api_key)
+            raise _http_error(
+                status,
+                body,
+                self._api_key,
+                retry_after_seconds=retry_after,
+            )
         return response
 
     def _sleep_before_retry(
@@ -900,10 +914,26 @@ class DeepSeekClient:
         retry_limit: int | None = None,
         deadline: float | None = None,
         cancel_scope: DeepSeekCancelScope | None = None,
+        retry_after_seconds: float | None = None,
     ) -> None:
         self._check_cancel(cancel_scope)
         total = self.retries if retry_limit is None else int(retry_limit)
-        delay = float(2**attempt)
+        base_delay = min(MAX_RETRY_BACKOFF_SECONDS, float(2**attempt))
+        try:
+            random_value = float(self._random_value())
+        except Exception:
+            random_value = 0.5
+        if not math.isfinite(random_value):
+            random_value = 0.5
+        random_value = min(1.0, max(0.0, random_value))
+        delay = base_delay * (0.5 + random_value)
+        if retry_after_seconds is not None:
+            retry_after = min(
+                MAX_RETRY_AFTER_SECONDS,
+                max(0.0, float(retry_after_seconds)),
+            )
+            delay = max(delay, retry_after)
+        delay = min(MAX_RETRY_AFTER_SECONDS, delay)
         remaining = self._remaining(deadline)
         if remaining is not None:
             if remaining <= 0:
@@ -916,7 +946,18 @@ class DeepSeekClient:
                 # Observability callbacks must never change provider behavior.
                 pass
         self._check_cancel(cancel_scope)
-        self._sleep(delay)
+        if cancel_scope is None:
+            self._sleep(delay)
+        else:
+            sleep_deadline = self._monotonic() + delay
+            while True:
+                self._check_cancel(cancel_scope)
+                remaining_sleep = sleep_deadline - self._monotonic()
+                if remaining_sleep <= 0:
+                    break
+                self._sleep(
+                    min(_CANCELLABLE_SLEEP_SLICE_SECONDS, remaining_sleep)
+                )
         self._check_cancel(cancel_scope)
         remaining = self._remaining(deadline)
         if remaining is not None and remaining <= 0:
@@ -1005,6 +1046,9 @@ class DeepSeekClient:
                     retry_limit=retry_limit,
                     deadline=deadline,
                     cancel_scope=cancel_scope,
+                    retry_after_seconds=exc.protocol_details.get(
+                        "retry_after_seconds"
+                    ),
                 )
             except _NETWORK_EXCEPTIONS as exc:
                 self._check_cancel(cancel_scope)
@@ -1096,7 +1140,7 @@ class DeepSeekClient:
                 if choice.get("finish_reason") is not None
                 else None
             ),
-            usage=_normalize_usage(usage) if isinstance(usage, Mapping) else {},
+            usage=normalize_usage(usage) if isinstance(usage, Mapping) else {},
             model=str(data.get("model") or ""),
             response_id=str(data["id"]) if data.get("id") is not None else None,
         )
@@ -1107,7 +1151,7 @@ class DeepSeekClient:
         *,
         model: str = DEFAULT_MODEL,
         thinking: bool = False,
-        reasoning_effort: str = "high",
+        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         max_tokens: int | None = None,
         temperature: float | None = None,
         retry_callback: RetryCallback | None = None,
@@ -1145,7 +1189,7 @@ class DeepSeekClient:
         *,
         model: str = DEFAULT_MODEL,
         thinking: bool = False,
-        reasoning_effort: str = "high",
+        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         max_tokens: int | None = None,
         temperature: float | None = None,
         retry_callback: RetryCallback | None = None,
@@ -1193,7 +1237,7 @@ class DeepSeekClient:
             except DeepSeekError as exc:
                 if total_usage:
                     combined = dict(total_usage)
-                    _merge_usage(combined, exc.usage)
+                    merge_usage(combined, exc.usage)
                     exc.usage = combined
                 if last_result is not None:
                     if exc.finish_reason is None:
@@ -1205,7 +1249,7 @@ class DeepSeekClient:
                     exc.protocol_details.setdefault("json_attempts_completed", json_attempt)
                 raise
             last_result = result
-            _merge_usage(total_usage, result.usage)
+            merge_usage(total_usage, result.usage)
             try:
                 parsed = json.loads(result.content) if result.content.strip() else None
             except json.JSONDecodeError as exc:
@@ -1282,7 +1326,7 @@ class DeepSeekClient:
         tool_handler: Callable[[str, dict[str, Any]], Any],
         model: str = DEFAULT_MODEL,
         thinking: bool = False,
-        reasoning_effort: str = "high",
+        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         max_tokens: int | None = None,
         temperature: float | None = None,
         max_rounds: int = 6,
@@ -1339,7 +1383,7 @@ class DeepSeekClient:
                 )
             usage = data.get("usage")
             if isinstance(usage, Mapping):
-                _merge_usage(total_usage, usage)
+                merge_usage(total_usage, usage)
             if data.get("id") is not None:
                 response_id = str(data["id"])
             if data.get("model") is not None:
@@ -1436,7 +1480,7 @@ class DeepSeekClient:
         *,
         model: str = DEFAULT_MODEL,
         thinking: bool = True,
-        reasoning_effort: str = "high",
+        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         max_tokens: int | None = None,
         temperature: float | None = None,
         cancel_scope: DeepSeekCancelScope | None = None,
@@ -1497,7 +1541,7 @@ class DeepSeekClient:
                             response_id = str(chunk["id"])
                         chunk_usage = chunk.get("usage")
                         if isinstance(chunk_usage, Mapping):
-                            usage = _normalize_usage(chunk_usage)
+                            usage = normalize_usage(chunk_usage)
                             yield StreamEvent(
                                 "usage",
                                 usage=usage,
@@ -1547,6 +1591,9 @@ class DeepSeekClient:
                     attempt,
                     code=exc.code,
                     cancel_scope=cancel_scope,
+                    retry_after_seconds=exc.protocol_details.get(
+                        "retry_after_seconds"
+                    ),
                 )
             except _NETWORK_EXCEPTIONS as exc:
                 self._check_cancel(cancel_scope)

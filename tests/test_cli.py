@@ -372,13 +372,16 @@ class CliEndToEndTests(unittest.TestCase):
             self.assertEqual(start.call_args.args, ("CF1A",))
             self.assertEqual(start.call_args.kwargs["compare"], "exact")
             self.assertTrue(start.call_args.kwargs["generate_generator"])
-            self.assertTrue(start.call_args.kwargs["generate_brute"])
-            self.assertTrue(start.call_args.kwargs["prepare_reference"])
+            self.assertTrue(start.call_args.kwargs["prepare_reference_primary"])
+            self.assertTrue(start.call_args.kwargs["prepare_reference_secondary"])
             self.assertTrue(start.call_args.kwargs["large_profile"])
             self.assertEqual(start.call_args.kwargs["preparation_timeout_seconds"], 600)
             self.assertTrue(start.call_args.kwargs["force_regenerate"])
             self.assertEqual(start.call_args.kwargs["cache_mode"], "cold")
             self.assertEqual(start.call_args.kwargs["generation_mode"], "full_thinking")
+            self.assertFalse(start.call_args.kwargs["include_validator"])
+            self.assertTrue(start.call_args.kwargs["allow_validator_degradation"])
+            self.assertFalse(start.call_args.kwargs["unvalidated_large"])
 
             with mock.patch.object(
                 service_type,
@@ -402,6 +405,32 @@ class CliEndToEndTests(unittest.TestCase):
             self.assertFalse(start_without_large.call_args.kwargs["force_regenerate"])
             self.assertIsNone(start_without_large.call_args.kwargs["cache_mode"])
             self.assertIsNone(start_without_large.call_args.kwargs["generation_mode"])
+
+            with mock.patch.object(
+                service_type,
+                "ai_stress_start",
+                return_value={"ok": True, "run": {"id": "run-3", "status": "completed"}},
+                create=True,
+            ) as strict_start, mock.patch.object(
+                service_type,
+                "stress_run",
+                return_value={"ok": True, "run": {"id": "run-3", "status": "completed"}},
+                create=True,
+            ):
+                payload = self.run_json(
+                    root,
+                    "verify",
+                    "CF1A",
+                    "--ai-stress",
+                    "--validator",
+                    "--strict",
+                )
+            self.assertEqual(payload["run"]["id"], "run-3")
+            self.assertTrue(strict_start.call_args.kwargs["include_validator"])
+            self.assertFalse(
+                strict_start.call_args.kwargs["allow_validator_degradation"]
+            )
+            self.assertFalse(strict_start.call_args.kwargs["unvalidated_large"])
 
             calls = (
                 ("stress_run", ("stress", "status", "run-1")),

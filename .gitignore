@@ -1,6 +1,21 @@
 # ACM Agent local state: accounts, SQLite, caches, builds, reports and tokens
 .acm/
 
+# Personal practice solutions and materials (never published)
+/2023/
+/2025/
+/2026/
+/camp/
+/teaching/
+
+# Personal agent/ops documents
+agent.md
+AGENTS.md
+CLAUDE.md
+CODEX_AI_STRESS_HANDOFF.md
+OPENCODE_AI_STRESS_HANDOFF.md
+RECOVERY_README.md
+
 # Python
 __pycache__/
 *.py[cod]
@@ -22,12 +37,34 @@ Thumbs.db
 
 # Local agent/tool state
 .codex/
+.claude/
 .firecrawl/
 .learnings/
 /development/
 .tmp/
 tmp/
 
+# Credentials and local runtime files
+.env
+.env.*
+!.env.example
+credentials.json
+web-runtime.json
+
+# Private reliability corpora and benchmark runners
+/tests/fixtures/stress_live/
+/tests/manual/
+/tests/test_stress_benchmark.py
+/tests/test_stress_minimal_test.py
+/tests/test_stress_recipe_integration.py
+/tests/test_stress_user_batch.py
+/tools/acm_agent/stress_benchmark.py
+/tools/acm_agent/stress_minimal_test.py
+/tools/acm_agent/stress_user_batch.py
+
 # Local diagnostics
 *.log
 *.tmp
+
+# Throwaway experiment/probe scripts at the repo root
+/_*.py

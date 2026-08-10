@@ -1,0 +1,2799 @@
+{
+  "schema_version": 1,
+  "catalog_version": 1,
+  "engine": "local_templates_v1",
+  "namespace": "acm_recipe",
+  "inline_order": [
+    "cpp/rng.hpp",
+    "cpp/structures.hpp",
+    "cpp/labels.hpp",
+    "cpp/serializers.hpp"
+  ],
+  "provenance": [
+    "testlib",
+    "jngen"
+  ],
+  "templates": {
+    "rng.splitmix64": {
+      "kind": "rng",
+      "source": "cpp/rng.hpp",
+      "symbol": "acm_recipe::Rng",
+      "parameters": {
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "preconditions": [],
+      "invariants": [
+        "same seed and call sequence produce identical bytes",
+        "bounded sampling uses rejection and has no modulo bias"
+      ],
+      "complexity": "O(1) expected time per sample, O(1) memory",
+      "index_base": "not_applicable",
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib",
+        "jngen"
+      ]
+    },
+    "rng.unbiased_bounded": {
+      "kind": "rng",
+      "source": "cpp/rng.hpp",
+      "symbol": "acm_recipe::Rng::bounded",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "preconditions": [],
+      "invariants": [
+        "result is in [0,bound)",
+        "rejection sampling removes modulo bias"
+      ],
+      "complexity": "O(1) expected time, O(1) memory",
+      "index_base": "not_applicable",
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib",
+        "jngen"
+      ]
+    },
+    "rng.fisher_yates": {
+      "kind": "transform",
+      "source": "cpp/rng.hpp",
+      "symbol": "acm_recipe::Rng::shuffle",
+      "parameters": {
+        "length": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "preconditions": [
+        "iterator range is random-access"
+      ],
+      "invariants": [
+        "output preserves the input multiset",
+        "every permutation is equiprobable under uniform RNG samples"
+      ],
+      "complexity": "O(n) time, O(1) auxiliary memory",
+      "index_base": "inherited",
+      "self_loops": "preserved",
+      "parallel_edges": "preserved",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib",
+        "jngen"
+      ]
+    },
+    "array.uniform": {
+      "kind": "array",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::array_uniform",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi"
+      ],
+      "invariants": [
+        "size equals n",
+        "every value is in [lo, hi]"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "array.permutation": {
+      "kind": "array",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::array_permutation",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "base": {
+          "type": "integer"
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "base + n - 1 fits signed 64-bit"
+      ],
+      "invariants": [
+        "contains every integer in [base, base+n) exactly once"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib",
+        "jngen"
+      ]
+    },
+    "array.equal": {
+      "kind": "array",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::array_equal",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value": {
+          "type": "integer"
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [],
+      "invariants": [
+        "size equals n",
+        "all values are equal to value"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "array.few_values": {
+      "kind": "array",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::array_few_values",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi",
+        "value_count <= hi-lo+1"
+      ],
+      "invariants": [
+        "size equals n",
+        "at most value_count distinct values",
+        "all values are in [lo, hi]"
+      ],
+      "complexity": "O(n + value_count log value_count) expected time, O(n + value_count) memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "array.monotone": {
+      "kind": "array",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::array_monotone",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "nondecreasing": {
+          "type": "boolean"
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi"
+      ],
+      "invariants": [
+        "size equals n",
+        "values are sorted in the requested direction"
+      ],
+      "complexity": "O(n log n) time, O(n) memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "array.periodic": {
+      "kind": "array",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::array_periodic",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "period": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi"
+      ],
+      "invariants": [
+        "size equals n",
+        "a[i] equals a[i mod period] whenever both positions exist"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "array.runs": {
+      "kind": "array",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::array_runs",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "run_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "run_count <= n",
+        "lo <= hi"
+      ],
+      "invariants": [
+        "size equals n",
+        "output is constructed from exactly run_count nonempty constant segments before adjacent-equal segment coalescing"
+      ],
+      "complexity": "O(n) expected time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "array.extreme": {
+      "kind": "array",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::array_extreme",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi"
+      ],
+      "invariants": [
+        "every value equals lo or hi"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib"
+      ]
+    },
+    "string.uniform": {
+      "kind": "string",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::string_uniform",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "alphabet": {
+          "type": "string",
+          "minLength": 1
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "preconditions": [
+        "alphabet is nonempty"
+      ],
+      "invariants": [
+        "length equals n",
+        "every character occurs in alphabet"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib",
+        "jngen"
+      ]
+    },
+    "string.equal": {
+      "kind": "string",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::string_equal",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value": {
+          "type": "string"
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "preconditions": [],
+      "invariants": [
+        "length equals n",
+        "every character equals value"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "string.few_chars": {
+      "kind": "string",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::string_few_chars",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "alphabet": {
+          "type": "string",
+          "minLength": 1
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "distinct": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "preconditions": [
+        "distinct <= alphabet.length"
+      ],
+      "invariants": [
+        "length equals n",
+        "uses at most distinct characters selected from alphabet"
+      ],
+      "complexity": "O(n + alphabet.length) time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "string.monotone": {
+      "kind": "string",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::string_monotone",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "alphabet": {
+          "type": "string",
+          "minLength": 1
+        },
+        "nondecreasing": {
+          "type": "boolean"
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "preconditions": [],
+      "invariants": [
+        "length equals n",
+        "characters are sorted in the requested byte order"
+      ],
+      "complexity": "O(n log n) time, O(n) memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "string.permutation": {
+      "kind": "string",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::string_permutation",
+      "parameters": {
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pattern": {
+          "type": "string"
+        }
+      },
+      "preconditions": [],
+      "invariants": [
+        "output preserves the exact input character multiset"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib",
+        "jngen"
+      ]
+    },
+    "string.extreme": {
+      "kind": "string",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::string_extreme",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "alphabet": {
+          "type": "string",
+          "minLength": 1
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "preconditions": [],
+      "invariants": [
+        "every character equals the minimum or maximum byte in alphabet"
+      ],
+      "complexity": "O(n + alphabet.length) time and O(n) memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib"
+      ]
+    },
+    "string.periodic": {
+      "kind": "string",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::string_periodic",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pattern": {
+          "type": "string",
+          "minLength": 1
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "preconditions": [
+        "pattern is nonempty"
+      ],
+      "invariants": [
+        "length equals n",
+        "s[i] equals pattern[i mod pattern.length]"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "string.runs": {
+      "kind": "string",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::string_runs",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "run_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "alphabet": {
+          "type": "string",
+          "minLength": 1
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "preconditions": [
+        "run_count <= n",
+        "alphabet is nonempty"
+      ],
+      "invariants": [
+        "length equals n",
+        "constructed from run_count nonempty constant segments"
+      ],
+      "complexity": "O(n) expected time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "matrix.uniform": {
+      "kind": "matrix",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::matrix_uniform",
+      "parameters": {
+        "rows": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "rows_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rows_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi"
+      ],
+      "invariants": [
+        "rectangular rows by cols shape",
+        "every value is in [lo, hi]"
+      ],
+      "complexity": "O(rows*cols) time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "matrix.equal": {
+      "kind": "matrix",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::matrix_equal",
+      "parameters": {
+        "rows": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "value": {
+          "type": "integer"
+        },
+        "rows_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rows_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "rows*cols fits the local int cell-count bound"
+      ],
+      "invariants": [
+        "rectangular rows by cols shape",
+        "every cell equals value"
+      ],
+      "complexity": "O(rows*cols) time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "matrix.few_values": {
+      "kind": "matrix",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::matrix_few_values",
+      "parameters": {
+        "rows": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "value_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "rows_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rows_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "rows*cols fits the local int cell-count bound",
+        "lo <= hi",
+        "value_count <= hi-lo+1"
+      ],
+      "invariants": [
+        "rectangular rows by cols shape",
+        "at most value_count distinct cell values"
+      ],
+      "complexity": "O(rows*cols + value_count log value_count) expected time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "matrix.monotone": {
+      "kind": "matrix",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::matrix_monotone",
+      "parameters": {
+        "rows": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "nondecreasing": {
+          "type": "boolean"
+        },
+        "rows_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rows_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "rows*cols fits the local int cell-count bound",
+        "lo <= hi"
+      ],
+      "invariants": [
+        "row-major cell sequence is sorted in the requested direction"
+      ],
+      "complexity": "O(rows*cols*log(rows*cols)) time and O(rows*cols) memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "matrix.permutation": {
+      "kind": "matrix",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::matrix_permutation",
+      "parameters": {
+        "rows": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "base": {
+          "type": "integer"
+        },
+        "rows_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rows_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "rows*cols fits the local int cell-count bound",
+        "base + rows*cols - 1 fits signed 64-bit"
+      ],
+      "invariants": [
+        "row-major cells contain [base,base+rows*cols) exactly once"
+      ],
+      "complexity": "O(rows*cols) time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib",
+        "jngen"
+      ]
+    },
+    "matrix.periodic": {
+      "kind": "matrix",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::matrix_periodic",
+      "parameters": {
+        "rows": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "rows_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rows_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        },
+        "period": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "preconditions": [
+        "rows*cols fits the local int cell-count bound",
+        "lo <= hi"
+      ],
+      "invariants": [
+        "cells repeat with the requested row and column periods"
+      ],
+      "complexity": "O(rows*cols) time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "matrix.runs": {
+      "kind": "matrix",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::matrix_runs",
+      "parameters": {
+        "rows": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "run_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "rows_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rows_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "rows*cols fits the local int cell-count bound",
+        "run_count is zero iff the matrix is empty; otherwise 1 <= run_count <= rows*cols",
+        "lo <= hi"
+      ],
+      "invariants": [
+        "row-major cells are constructed from run_count nonempty constant segments before coalescing"
+      ],
+      "complexity": "O(rows*cols) expected time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "matrix.extreme": {
+      "kind": "matrix",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::matrix_extreme",
+      "parameters": {
+        "rows": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "rows_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rows_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cols_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "rows*cols fits the local int cell-count bound",
+        "lo <= hi"
+      ],
+      "invariants": [
+        "every cell equals lo or hi"
+      ],
+      "complexity": "O(rows*cols) time and memory",
+      "index_base": 0,
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib"
+      ]
+    },
+    "interval.random": {
+      "kind": "interval",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::intervals_random",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi"
+      ],
+      "invariants": [
+        "exactly n closed intervals",
+        "lo <= l <= r <= hi"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": "not_applicable",
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib"
+      ]
+    },
+    "interval.points": {
+      "kind": "interval",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::intervals_points",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi"
+      ],
+      "invariants": [
+        "exactly n intervals",
+        "l equals r for every interval"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": "not_applicable",
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib"
+      ]
+    },
+    "interval.nested": {
+      "kind": "interval",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::intervals_nested",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi",
+        "hi-lo >= 2*(n-1)"
+      ],
+      "invariants": [
+        "each later interval is contained in every earlier interval"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": "not_applicable",
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "interval.disjoint": {
+      "kind": "interval",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::intervals_disjoint",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi",
+        "hi-lo+1 >= n"
+      ],
+      "invariants": [
+        "all intervals are pairwise disjoint point intervals"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": "not_applicable",
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "interval.high_overlap": {
+      "kind": "interval",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::intervals_high_overlap",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi"
+      ],
+      "invariants": [
+        "all intervals contain one common sampled pivot"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": "not_applicable",
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "interval.endpoint_heavy": {
+      "kind": "interval",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::intervals_endpoint_heavy",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi"
+      ],
+      "invariants": [
+        "endpoints are selected only from lo, hi and their immediate inward neighbors"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": "not_applicable",
+      "self_loops": "not_applicable",
+      "parallel_edges": "not_applicable",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib"
+      ]
+    },
+    "tree.path": {
+      "kind": "tree",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::tree_path",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "preconditions": [],
+      "invariants": [
+        "connected",
+        "acyclic",
+        "n-1 edges",
+        "maximum degree at most 2"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 1,
+      "self_loops": "forbidden",
+      "parallel_edges": "forbidden",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "tree.star": {
+      "kind": "tree",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::tree_star",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "preconditions": [],
+      "invariants": [
+        "connected",
+        "acyclic",
+        "n-1 edges",
+        "vertex 1 has degree n-1"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 1,
+      "self_loops": "forbidden",
+      "parallel_edges": "forbidden",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "tree.caterpillar": {
+      "kind": "tree",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::tree_caterpillar",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "spine_length": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "spine": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "preconditions": [
+        "spine_length <= n"
+      ],
+      "invariants": [
+        "connected",
+        "acyclic",
+        "n-1 edges",
+        "removing leaves leaves a path"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 1,
+      "self_loops": "forbidden",
+      "parallel_edges": "forbidden",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "tree.prufer": {
+      "kind": "tree",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::tree_prufer",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "preconditions": [],
+      "invariants": [
+        "connected",
+        "acyclic",
+        "n-1 edges",
+        "uniform over labeled trees when RNG words are uniform"
+      ],
+      "complexity": "O(n log n) time, O(n) memory",
+      "index_base": 1,
+      "self_loops": "forbidden",
+      "parallel_edges": "forbidden",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "tree.binary": {
+      "kind": "tree",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::tree_binary",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "preconditions": [],
+      "invariants": [
+        "connected",
+        "acyclic",
+        "n-1 edges",
+        "each vertex has at most two children"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 1,
+      "self_loops": "forbidden",
+      "parallel_edges": "forbidden",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "tree.kary": {
+      "kind": "tree",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::tree_kary",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "k": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "preconditions": [],
+      "invariants": [
+        "connected",
+        "acyclic",
+        "n-1 edges",
+        "each vertex has at most k children"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 1,
+      "self_loops": "forbidden",
+      "parallel_edges": "forbidden",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "tree.prim_biased": {
+      "kind": "tree",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::tree_prim_biased",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "elongation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        }
+      },
+      "preconditions": [],
+      "invariants": [
+        "connected",
+        "acyclic",
+        "n-1 edges",
+        "elongation percent attachment bias toward the growth frontier"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 1,
+      "self_loops": "forbidden",
+      "parallel_edges": "forbidden",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "graph.random_simple": {
+      "kind": "graph",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::graph_random_simple",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "m": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "m_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "m_max": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "preconditions": [
+        "m <= n*(n-1)/2"
+      ],
+      "invariants": [
+        "exactly n vertices and m undirected edges",
+        "simple graph"
+      ],
+      "complexity": "O(m) expected time and memory away from complete-graph saturation",
+      "index_base": 1,
+      "self_loops": "forbidden",
+      "parallel_edges": "forbidden",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "transform.vertex_relabel": {
+      "kind": "transform",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::relabel_vertices",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "preconditions": [
+        "every edge endpoint is in [1,n]"
+      ],
+      "invariants": [
+        "applies one bijection to all endpoints",
+        "preserves adjacency, loops, parallelism, weights, and record order"
+      ],
+      "complexity": "O(n+m) time and O(n) memory",
+      "index_base": 1,
+      "self_loops": "preserved",
+      "parallel_edges": "preserved",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib",
+        "jngen"
+      ]
+    },
+    "transform.record_shuffle": {
+      "kind": "transform",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::shuffle_edges",
+      "parameters": {},
+      "preconditions": [],
+      "invariants": [
+        "preserves the exact edge-record multiset",
+        "does not change endpoint orientation or weights"
+      ],
+      "complexity": "O(m) time and O(1) auxiliary memory",
+      "index_base": "inherited",
+      "self_loops": "preserved",
+      "parallel_edges": "preserved",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib",
+        "jngen"
+      ]
+    },
+    "graph.connected": {
+      "kind": "graph",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::graph_connected",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "m": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "m_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "m_max": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "preconditions": [
+        "n-1 <= m <= n*(n-1)/2"
+      ],
+      "invariants": [
+        "connected",
+        "simple",
+        "exactly m edges"
+      ],
+      "complexity": "O(n+m) expected time and O(m) memory away from saturation",
+      "index_base": 1,
+      "self_loops": "forbidden",
+      "parallel_edges": "forbidden",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "graph.components": {
+      "kind": "graph",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::graph_components",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "m": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "component_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "m_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "m_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "components": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "preconditions": [
+        "component_count <= n",
+        "n-component_count <= m",
+        "m does not exceed balanced-partition internal-edge capacity"
+      ],
+      "invariants": [
+        "exactly component_count connected components",
+        "simple",
+        "exactly m edges"
+      ],
+      "complexity": "O(n+m) expected time and O(m+n) memory away from saturation",
+      "index_base": 1,
+      "self_loops": "forbidden",
+      "parallel_edges": "forbidden",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "graph.bipartite": {
+      "kind": "graph",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::graph_bipartite",
+      "parameters": {
+        "n_left": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_right": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "m": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "m_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "m_max": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "preconditions": [
+        "m <= n_left*n_right"
+      ],
+      "invariants": [
+        "simple",
+        "every edge crosses the declared bipartition",
+        "exactly m edges"
+      ],
+      "complexity": "O(m) expected time and memory away from saturation",
+      "index_base": 1,
+      "self_loops": "forbidden",
+      "parallel_edges": "forbidden",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "graph.cycle": {
+      "kind": "graph",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::graph_cycle",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 3
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 3
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 3
+        },
+        "m_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "m_max": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "preconditions": [],
+      "invariants": [
+        "connected",
+        "exactly n edges",
+        "every vertex has degree two",
+        "exactly one cycle"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 1,
+      "self_loops": "forbidden",
+      "parallel_edges": "forbidden",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "graph.unicyclic": {
+      "kind": "graph",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::graph_unicyclic",
+      "parameters": {
+        "n": {
+          "type": "integer",
+          "minimum": 3
+        },
+        "n_min": {
+          "type": "integer",
+          "minimum": 3
+        },
+        "n_max": {
+          "type": "integer",
+          "minimum": 3
+        },
+        "m_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "m_max": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "preconditions": [],
+      "invariants": [
+        "connected",
+        "simple",
+        "exactly n edges",
+        "exactly one cycle"
+      ],
+      "complexity": "O(n) time and memory",
+      "index_base": 1,
+      "self_loops": "forbidden",
+      "parallel_edges": "forbidden",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "graph.self_loops": {
+      "kind": "graph",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::graph_self_loops",
+      "parameters": {
+        "n": {"type": "integer", "minimum": 1},
+        "m": {"type": "integer", "minimum": 1},
+        "n_min": {"type": "integer", "minimum": 1},
+        "n_max": {"type": "integer", "minimum": 1},
+        "m_min": {"type": "integer", "minimum": 1},
+        "m_max": {"type": "integer", "minimum": 1}
+      },
+      "preconditions": ["n >= 1", "m >= 1"],
+      "invariants": ["exactly m edges", "contains at least one self-loop"],
+      "complexity": "O(m) time and memory",
+      "index_base": 1,
+      "self_loops": "required",
+      "parallel_edges": "allowed",
+      "profiles": ["small", "large"],
+      "upstreams": ["jngen"]
+    },
+    "graph.parallel_edges": {
+      "kind": "graph",
+      "source": "cpp/structures.hpp",
+      "symbol": "acm_recipe::graph_parallel_edges",
+      "parameters": {
+        "n": {"type": "integer", "minimum": 2},
+        "m": {"type": "integer", "minimum": 2},
+        "n_min": {"type": "integer", "minimum": 2},
+        "n_max": {"type": "integer", "minimum": 2},
+        "m_min": {"type": "integer", "minimum": 2},
+        "m_max": {"type": "integer", "minimum": 2}
+      },
+      "preconditions": ["n >= 2", "m >= 2"],
+      "invariants": ["exactly m edges", "contains at least one parallel-edge pair"],
+      "complexity": "O(m) time and memory",
+      "index_base": 1,
+      "self_loops": "forbidden",
+      "parallel_edges": "required",
+      "profiles": ["small", "large"],
+      "upstreams": ["jngen"]
+    },
+    "label.uniform": {
+      "kind": "label",
+      "source": "cpp/labels.hpp",
+      "symbol": "acm_recipe::label_values",
+      "parameters": {
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "policy": {
+          "const": "uniform"
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        },
+        "label_min": {
+          "type": "integer"
+        },
+        "label_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi"
+      ],
+      "invariants": [
+        "count labels in [lo, hi]"
+      ],
+      "complexity": "O(count) time and memory",
+      "index_base": 0,
+      "self_loops": "preserved from structure",
+      "parallel_edges": "preserved from structure",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib",
+        "jngen"
+      ]
+    },
+    "label.equal": {
+      "kind": "label",
+      "source": "cpp/labels.hpp",
+      "symbol": "acm_recipe::label_values",
+      "parameters": {
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "policy": {
+          "const": "equal"
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        },
+        "label_min": {
+          "type": "integer"
+        },
+        "label_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi"
+      ],
+      "invariants": [
+        "all labels are equal and in [lo, hi]"
+      ],
+      "complexity": "O(count) time and memory",
+      "index_base": 0,
+      "self_loops": "preserved from structure",
+      "parallel_edges": "preserved from structure",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "label.distinct": {
+      "kind": "label",
+      "source": "cpp/labels.hpp",
+      "symbol": "acm_recipe::label_values",
+      "parameters": {
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "policy": {
+          "const": "distinct"
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        },
+        "label_min": {
+          "type": "integer"
+        },
+        "label_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi",
+        "count <= hi-lo+1"
+      ],
+      "invariants": [
+        "labels are distinct, sorted, and in [lo, hi]"
+      ],
+      "complexity": "O(domain + count log count) for domains up to 1e6; expected O(count log count) otherwise",
+      "index_base": 0,
+      "self_loops": "preserved from structure",
+      "parallel_edges": "preserved from structure",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib"
+      ]
+    },
+    "label.layered": {
+      "kind": "label",
+      "source": "cpp/labels.hpp",
+      "symbol": "acm_recipe::label_values",
+      "parameters": {
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "policy": {
+          "const": "layered"
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        },
+        "label_min": {
+          "type": "integer"
+        },
+        "label_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi"
+      ],
+      "invariants": [
+        "uses up to four evenly spaced levels in [lo, hi]",
+        "level multiplicities differ by at most one"
+      ],
+      "complexity": "O(count) time and memory",
+      "index_base": 0,
+      "self_loops": "preserved from structure",
+      "parallel_edges": "preserved from structure",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "edge_time.layered": {
+      "kind": "label",
+      "source": "cpp/labels.hpp",
+      "symbol": "acm_recipe::label_edges",
+      "alias_of": "label.layered",
+      "parameters": {
+        "policy": {
+          "const": "layered"
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        },
+        "label_min": {
+          "type": "integer"
+        },
+        "label_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi"
+      ],
+      "invariants": [
+        "every edge receives one of up to four balanced time levels"
+      ],
+      "complexity": "O(m) time and memory",
+      "index_base": "inherited",
+      "self_loops": "preserved from structure",
+      "parallel_edges": "preserved from structure",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "label.monotone": {
+      "kind": "label",
+      "source": "cpp/labels.hpp",
+      "symbol": "acm_recipe::label_values",
+      "parameters": {
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "policy": {
+          "const": "monotone"
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        },
+        "label_min": {
+          "type": "integer"
+        },
+        "label_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi"
+      ],
+      "invariants": [
+        "labels are nondecreasing and in [lo, hi]"
+      ],
+      "complexity": "O(count log count) time, O(count) memory",
+      "index_base": 0,
+      "self_loops": "preserved from structure",
+      "parallel_edges": "preserved from structure",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "jngen"
+      ]
+    },
+    "label.extreme": {
+      "kind": "label",
+      "source": "cpp/labels.hpp",
+      "symbol": "acm_recipe::label_values",
+      "parameters": {
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "policy": {
+          "const": "extreme"
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        },
+        "label_min": {
+          "type": "integer"
+        },
+        "label_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi"
+      ],
+      "invariants": [
+        "every label equals lo or hi"
+      ],
+      "complexity": "O(count) time and memory",
+      "index_base": 0,
+      "self_loops": "preserved from structure",
+      "parallel_edges": "preserved from structure",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib"
+      ]
+    },
+    "label.permutation": {
+      "kind": "label",
+      "source": "cpp/labels.hpp",
+      "symbol": "acm_recipe::label_values",
+      "parameters": {
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "policy": {
+          "const": "permutation"
+        },
+        "lo": {
+          "type": "integer"
+        },
+        "hi": {
+          "type": "integer"
+        },
+        "value_min": {
+          "type": "integer"
+        },
+        "value_max": {
+          "type": "integer"
+        },
+        "label_min": {
+          "type": "integer"
+        },
+        "label_max": {
+          "type": "integer"
+        }
+      },
+      "preconditions": [
+        "lo <= hi",
+        "count <= hi-lo+1"
+      ],
+      "invariants": [
+        "labels are distinct, randomly ordered, and in [lo, hi]"
+      ],
+      "complexity": "O(domain + count) for domains up to 1e6; expected O(count log count) otherwise",
+      "index_base": 0,
+      "self_loops": "preserved from structure",
+      "parallel_edges": "preserved from structure",
+      "profiles": [
+        "small",
+        "large"
+      ],
+      "upstreams": [
+        "testlib",
+        "jngen"
+      ]
+    }
+  },
+  "serializers": {
+    "list_n": {
+      "kind": "serializer",
+      "source": "cpp/serializers.hpp",
+      "symbol": "acm_recipe::serialize_list_n",
+      "parameters": {},
+      "preconditions": [],
+      "invariants": [
+        "canonical single-space token separation",
+        "one trailing newline"
+      ],
+      "complexity": "O(n) time and output bytes, O(1) auxiliary memory",
+      "profiles": [
+        "small",
+        "large"
+      ]
+    },
+    "string_n": {
+      "kind": "serializer",
+      "source": "cpp/serializers.hpp",
+      "symbol": "acm_recipe::serialize_string_n",
+      "parameters": {},
+      "preconditions": [
+        "string contains no newline when token syntax is required"
+      ],
+      "invariants": [
+        "length line followed by exact string and trailing newline"
+      ],
+      "complexity": "O(n) time and output bytes, O(1) auxiliary memory",
+      "profiles": [
+        "small",
+        "large"
+      ]
+    },
+    "matrix_n_m": {
+      "kind": "serializer",
+      "source": "cpp/serializers.hpp",
+      "symbol": "acm_recipe::serialize_matrix_nm",
+      "parameters": {},
+      "preconditions": [
+        "matrix is rectangular"
+      ],
+      "invariants": [
+        "n m header",
+        "one canonical row per line"
+      ],
+      "complexity": "O(n*m) time and output bytes, O(1) auxiliary memory",
+      "profiles": [
+        "small",
+        "large"
+      ]
+    },
+    "intervals_n": {
+      "kind": "serializer",
+      "source": "cpp/serializers.hpp",
+      "symbol": "acm_recipe::serialize_intervals_n",
+      "parameters": {},
+      "preconditions": [],
+      "invariants": [
+        "n header",
+        "one l r record per line"
+      ],
+      "complexity": "O(n) time and output bytes, O(1) auxiliary memory",
+      "profiles": [
+        "small",
+        "large"
+      ]
+    },
+    "edge_list_n_m_u_v": {
+      "kind": "serializer",
+      "source": "cpp/serializers.hpp",
+      "symbol": "acm_recipe::serialize_edge_list_n_m",
+      "parameters": {},
+      "preconditions": [
+        "all endpoint labels are in the caller-declared vertex domain"
+      ],
+      "invariants": [
+        "n m header",
+        "one u v record per line"
+      ],
+      "complexity": "O(m) time and output bytes, O(1) auxiliary memory",
+      "profiles": [
+        "small",
+        "large"
+      ]
+    },
+    "edge_list_n_m_u_v_w": {
+      "kind": "serializer",
+      "source": "cpp/serializers.hpp",
+      "symbol": "acm_recipe::serialize_weighted_edge_list_n_m",
+      "parameters": {},
+      "preconditions": [
+        "all endpoint labels are in the caller-declared vertex domain"
+      ],
+      "invariants": [
+        "n m header",
+        "one u v w record per line"
+      ],
+      "complexity": "O(m) time and output bytes, O(1) auxiliary memory",
+      "profiles": [
+        "small",
+        "large"
+      ]
+    }
+  }
+}

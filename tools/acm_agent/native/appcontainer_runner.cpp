@@ -9,6 +9,7 @@
 #endif
 
 #include <algorithm>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -150,6 +151,21 @@ static std::wstring ArgValue(int argc, wchar_t **argv, const std::wstring &name)
     return L"";
 }
 
+// Collect every occurrence of a repeatable flag.  Scanning stops at the ``--``
+// separator so that arguments belonging to the untrusted child can never be
+// mistaken for launcher flags and inject environment entries.
+static std::vector<std::wstring> ArgValues(int argc, wchar_t **argv, const std::wstring &name) {
+    std::vector<std::wstring> values;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::wstring(argv[i]) == L"--") break;
+        if (std::wstring(argv[i]) == name) {
+            values.push_back(argv[i + 1]);
+            ++i;
+        }
+    }
+    return values;
+}
+
 static unsigned long long ParseNumber(const std::wstring &value, unsigned long long fallback) {
     try { return std::stoull(value); } catch (...) { return fallback; }
 }
@@ -211,10 +227,12 @@ int wmain(int argc, wchar_t **argv) {
     const std::wstring stdout_host = ArgValue(argc, argv, L"--stdout");
     const std::wstring stderr_host = ArgValue(argc, argv, L"--stderr");
     const std::wstring meta_host = ArgValue(argc, argv, L"--meta");
+    const std::wstring cancel_host = ArgValue(argc, argv, L"--cancel");
     const DWORD timeout_ms = static_cast<DWORD>(ParseNumber(ArgValue(argc, argv, L"--timeout-ms"), 2000));
     const SIZE_T memory_bytes = static_cast<SIZE_T>(ParseNumber(ArgValue(argc, argv, L"--memory"), 512ULL << 20));
     const size_t stdout_limit = static_cast<size_t>(ParseNumber(ArgValue(argc, argv, L"--stdout-limit"), 2ULL << 20));
     const size_t stderr_limit = static_cast<size_t>(ParseNumber(ArgValue(argc, argv, L"--stderr-limit"), 2ULL << 20));
+    const std::vector<std::wstring> extra_environment = ArgValues(argc, argv, L"--env");
     int command_index = -1;
     for (int i = 2; i < argc; ++i) if (std::wstring(argv[i]) == L"--") { command_index = i + 1; break; }
     if (stdin_host.empty() || stdout_host.empty() || stderr_host.empty() || meta_host.empty() || command_index < 0 || command_index >= argc) return 5;
@@ -265,13 +283,40 @@ int wmain(int argc, wchar_t **argv) {
     SetHandleInformation(stderr_handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
 
     SIZE_T attribute_size = 0;
-    InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_size);
+    InitializeProcThreadAttributeList(nullptr, 2, 0, &attribute_size);
     auto attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(HeapAlloc(GetProcessHeap(), 0, attribute_size));
-    if (!attributes || !InitializeProcThreadAttributeList(attributes, 1, 0, &attribute_size)) return 12;
+    // Every return past create_directories must remove run_dir: it holds a full
+    // copy of the target executable plus stdin/stdout/stderr inside the
+    // AppContainer profile folder, and nothing else ever reclaims it.  The two
+    // failures below need different attribute-list cleanup: if
+    // InitializeProcThreadAttributeList failed the list was never initialised,
+    // so only the raw heap block may be freed -- calling
+    // DeleteProcThreadAttributeList on it would be undefined.
+    if (!attributes || !InitializeProcThreadAttributeList(attributes, 2, 0, &attribute_size)) {
+        CloseHandle(stdin_handle); CloseHandle(stdout_handle); CloseHandle(stderr_handle);
+        if (attributes) HeapFree(GetProcessHeap(), 0, attributes);
+        fs::remove_all(run_dir); FreeSid(app_sid); return 12;
+    }
     SECURITY_CAPABILITIES capabilities{};
     capabilities.AppContainerSid = app_sid;
     if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-                                   &capabilities, sizeof(capabilities), nullptr, nullptr)) return 13;
+                                   &capabilities, sizeof(capabilities), nullptr, nullptr)) {
+        CloseHandle(stdin_handle); CloseHandle(stdout_handle); CloseHandle(stderr_handle);
+        DeleteProcThreadAttributeList(attributes); HeapFree(GetProcessHeap(), 0, attributes);
+        fs::remove_all(run_dir); FreeSid(app_sid); return 13;
+    }
+    // bInheritHandles is required for redirected stdio, but without an
+    // explicit handle list the target also inherits the launcher's own Python
+    // stdout/stderr pipes.  If cancellation lands before Job assignment, that
+    // orphaned suspended target keeps those pipes open and Popen.communicate()
+    // never returns.  Restrict inheritance to the three intended file handles.
+    HANDLE inherited_handles[] = {stdin_handle, stdout_handle, stderr_handle};
+    if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   inherited_handles, sizeof(inherited_handles), nullptr, nullptr)) {
+        CloseHandle(stdin_handle); CloseHandle(stdout_handle); CloseHandle(stderr_handle);
+        DeleteProcThreadAttributeList(attributes); HeapFree(GetProcessHeap(), 0, attributes);
+        fs::remove_all(run_dir); FreeSid(app_sid); return 14;
+    }
 
     STARTUPINFOEXW startup{};
     startup.StartupInfo.cb = sizeof(startup);
@@ -295,6 +340,28 @@ int wmain(int argc, wchar_t **argv) {
     environment.push_back(L'\0');
     environment += L"USERPROFILE=" + profile_folder.wstring();
     environment.push_back(L'\0');
+    // Caller-supplied entries are appended last but may never shadow the
+    // scrubbed names above: the confinement story depends on the child seeing
+    // only a minimal, launcher-controlled environment.  Entries without '=',
+    // with an empty key, or naming a reserved variable are dropped.
+    static const wchar_t *reserved[] = {
+        L"SYSTEMROOT", L"TEMP", L"TMP", L"LOCALAPPDATA", L"APPDATA", L"USERPROFILE",
+        L"PATH", L"COMSPEC", L"WINDIR",
+    };
+    for (const std::wstring &entry : extra_environment) {
+        const size_t separator = entry.find(L'=');
+        if (separator == std::wstring::npos || separator == 0) continue;
+        std::wstring key = entry.substr(0, separator);
+        std::wstring upper = key;
+        std::transform(upper.begin(), upper.end(), upper.begin(), ::towupper);
+        bool shadowed = false;
+        for (const wchar_t *name : reserved) {
+            if (upper == name) { shadowed = true; break; }
+        }
+        if (shadowed) continue;
+        environment += entry;
+        environment.push_back(L'\0');
+    }
     environment.push_back(L'\0');
 
     PROCESS_INFORMATION process{};
@@ -331,21 +398,35 @@ int wmain(int argc, wchar_t **argv) {
     DWORD returncode = 127;
     if (created && job && SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) &&
         AssignProcessToJobObject(job, process.hProcess)) {
-        ResumeThread(process.hThread);
-        const ULONGLONG deadline = GetTickCount64() + timeout_ms;
-        for (;;) {
-            const DWORD wait = WaitForSingleObject(process.hProcess, 20);
-            if (wait == WAIT_OBJECT_0) break;
-            std::error_code size_error;
-            const auto out_size = fs::file_size(stdout_path, size_error);
-            size_error.clear();
-            const auto err_size = fs::file_size(stderr_path, size_error);
-            if ((!size_error && (out_size > stdout_limit || err_size > stderr_limit)) ||
-                GetTickCount64() >= deadline) {
-                timed_out = GetTickCount64() >= deadline;
-                TerminateJobObject(job, timed_out ? 124 : 125);
-                WaitForSingleObject(process.hProcess, 2000);
-                break;
+        std::error_code cancel_error;
+        const bool cancelled_before_resume =
+            !cancel_host.empty() && fs::exists(cancel_host, cancel_error);
+        if (cancelled_before_resume) {
+            TerminateJobObject(job, 130);
+            WaitForSingleObject(process.hProcess, 2000);
+        } else {
+            ResumeThread(process.hThread);
+            const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+            for (;;) {
+                const DWORD wait = WaitForSingleObject(process.hProcess, 20);
+                if (wait == WAIT_OBJECT_0) break;
+                cancel_error.clear();
+                if (!cancel_host.empty() && fs::exists(cancel_host, cancel_error)) {
+                    TerminateJobObject(job, 130);
+                    WaitForSingleObject(process.hProcess, 2000);
+                    break;
+                }
+                std::error_code size_error;
+                const auto out_size = fs::file_size(stdout_path, size_error);
+                size_error.clear();
+                const auto err_size = fs::file_size(stderr_path, size_error);
+                if ((!size_error && (out_size > stdout_limit || err_size > stderr_limit)) ||
+                    GetTickCount64() >= deadline) {
+                    timed_out = GetTickCount64() >= deadline;
+                    TerminateJobObject(job, timed_out ? 124 : 125);
+                    WaitForSingleObject(process.hProcess, 2000);
+                    break;
+                }
             }
         }
         GetExitCodeProcess(process.hProcess, &returncode);

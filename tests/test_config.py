@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +17,24 @@ from tools.acm_agent.config import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_config_import_does_not_load_provider_transport(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; import tools.acm_agent.config; "
+                    "assert 'tools.acm_agent.deepseek' not in sys.modules"
+                ),
+            ],
+            cwd=repository,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_paths_stay_under_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = Paths.for_root(Path(directory))

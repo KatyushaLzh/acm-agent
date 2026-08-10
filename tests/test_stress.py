@@ -17,7 +17,11 @@ from tools.acm_agent.stress import (
     HelperSources,
     GeneratorCapabilityError,
     LayeredStressRunner,
+    MAX_LARGE_INPUT_BYTES,
+    MAX_STREAM_BYTES,
     SampleCase,
+    SMALL_INPUT_CEILING_BYTES,
+    SMALL_INPUT_INITIAL_BYTES,
     SandboxCapability,
     SandboxLimits,
     SandboxProcessResult,
@@ -28,10 +32,13 @@ from tools.acm_agent.stress import (
     StressError,
     StressRunConfig,
     WindowsAppContainerBackend,
+    classify_dual_reference,
     classify_three_way,
     compose_trusted_generator_harness,
+    cpp_compiler_fingerprint,
     probe_generator_v2,
     validate_cpp_source,
+    _derived_candidate_seed,
     _parse_validator_observation,
 )
 
@@ -73,6 +80,90 @@ def generator_manifest(
         "records": 1,
         "total_complexity": total_complexity,
     }
+
+
+# The declared escalation ladder for small inputs: the initial human-checkable
+# budget, then one jump straight to the stream ceiling.  Any additional rung
+# (an intermediate 200-byte step, say) would show up as an extra element here.
+SMALL_INPUT_LADDER = [str(SMALL_INPUT_INITIAL_BYTES), str(SMALL_INPUT_CEILING_BYTES)]
+
+
+class SmallInputSizingRecorder:
+    """Sandbox handler that records the small-input byte budget per run.
+
+    ``payload(profile, case_kind, seed, budget)`` returns the bytes the fake
+    generator wants to emit; the recorder then enforces the sandbox stdout limit
+    exactly as a real sandbox would, so a generator that wants more than the
+    current budget is reported as ``output_limited`` rather than silently
+    truncated.  ``validator`` decides whether a generated input is legal.
+    """
+
+    def __init__(self, payload, *, validator=None) -> None:
+        self._payload = payload
+        self._validator = validator
+        self.generator_runs: list[dict[str, object]] = []
+        self.validator_inputs: list[bytes] = []
+
+    def runs_for(self, profile: str) -> list[dict[str, object]]:
+        """Generator runs for one profile, in execution order."""
+
+        return [run for run in self.generator_runs if run["profile"] == profile]
+
+    def __call__(self, argv, input_data, env, limits):
+        stem = Path(argv[0]).stem.split(".")[0]
+        if stem == "sanitizer-probe":
+            return SandboxProcessResult(argv, 127, stderr=b"unavailable")
+        if stem == "generator":
+            profile = env["ACM_STRESS_PROFILE"]
+            case_kind = env["ACM_STRESS_CASE_KIND"]
+            seed = int(env["ACM_STRESS_SEED"])
+            # Recorded exactly as the generator would observe it: the raw env
+            # string, or absent entirely when no ceiling is advertised.
+            budget = env.get("ACM_STRESS_MAX_INPUT_BYTES")
+            self.generator_runs.append(
+                {
+                    "profile": profile,
+                    "case_kind": case_kind,
+                    "seed": seed,
+                    "budget": budget,
+                    "stdout_limit": limits.stdout_bytes,
+                }
+            )
+            payload = self._payload(
+                profile, case_kind, seed, None if budget is None else int(budget)
+            )
+            if len(payload) > limits.stdout_bytes:
+                # A real sandbox truncates at the limit and flags the run.
+                return SandboxProcessResult(
+                    argv, 0, payload[: limits.stdout_bytes], output_limited=True
+                )
+            return SandboxProcessResult(argv, 0, payload)
+        if stem == "validator":
+            generated = input_data or b""
+            self.validator_inputs.append(generated)
+            valid = self._validator is None or self._validator(generated)
+            observation = (
+                {
+                    "valid": True,
+                    "dimensions": {"bytes": len(generated)},
+                    "coverage_tags": [],
+                    "records": 1,
+                }
+                if valid
+                else {
+                    "valid": False,
+                    "dimensions": {},
+                    "coverage_tags": [],
+                    "records": 0,
+                }
+            )
+            return SandboxProcessResult(
+                argv,
+                0,
+                json.dumps(observation, separators=(",", ":")).encode(),
+                b"" if valid else b"ERR_TOO_SMALL",
+            )
+        return SandboxProcessResult(argv, 0, b"ok\n")
 
 
 class FakeSandbox:
@@ -159,7 +250,9 @@ class FakeSandbox:
             result = SandboxProcessResult(
                 argv, 0, f"{profile}:{case_kind}:{seed}\n".encode()
             )
-        elif Path(argv[0]).stem.split(".")[0] in {"brute", "reference"}:
+        elif Path(argv[0]).stem.split(".")[0] in {
+            "brute", "reference", "reference_primary", "reference_secondary"
+        }:
             result = SandboxProcessResult(argv, 0, b"ok\n")
         else:
             result = SandboxProcessResult(argv, 0)
@@ -173,6 +266,35 @@ class FakeSandbox:
         self.cancelled = True
 
 
+class CompilerFingerprintTests(unittest.TestCase):
+    def test_fingerprint_uses_resolved_fallback_driver_flags_and_file_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            compiler = Path(temp) / "clang++"
+            compiler.write_bytes(b"driver-v1")
+
+            def which(name: str) -> str | None:
+                return str(compiler) if name == "clang++" else None
+
+            completed = mock.Mock(stdout=b"clang version 20\n")
+            with mock.patch("tools.acm_agent.stress.shutil.which", side_effect=which), mock.patch(
+                "tools.acm_agent.stress.subprocess.run", return_value=completed
+            ) as run:
+                first = cpp_compiler_fingerprint(
+                    "g++", flag_sets=(("-O2", "-static"),)
+                )
+                changed_flags = cpp_compiler_fingerprint(
+                    "g++", flag_sets=(("-O0",),)
+                )
+                compiler.write_bytes(b"driver-v2-with-different-size")
+                changed_file = cpp_compiler_fingerprint(
+                    "g++", flag_sets=(("-O2", "-static"),)
+                )
+
+            self.assertEqual(run.call_args_list[0].args[0], [str(compiler), "--version"])
+            self.assertNotEqual(first, changed_flags)
+            self.assertNotEqual(first, changed_file)
+
+
 class SourceSafetyTests(unittest.TestCase):
     def test_trusted_harness_invokes_generated_adapter_without_model_main(self) -> None:
         adapter = (
@@ -181,7 +303,7 @@ class SourceSafetyTests(unittest.TestCase):
             "const std::string&,std::ostream&){}\n"
         )
         composed = compose_trusted_generator_harness(adapter)
-        self.assertIn("ACM_TRUSTED_GENERATOR_HARNESS_V2", composed)
+        self.assertIn("ACM_TRUSTED_GENERATOR_HARNESS_V3", composed)
         self.assertIn("acm_generate_case(seed", composed)
         self.assertNotIn("#define main acm_generated_main", composed)
 
@@ -235,11 +357,12 @@ class SourceSafetyTests(unittest.TestCase):
                     input_data=b"x" * (2 * 1024 * 1024 + 1),
                 )
 
-    def test_native_backend_closes_cancel_race_after_process_launch(self) -> None:
+    def test_native_backend_signals_cancel_race_after_process_launch(self) -> None:
         class RacingProcess:
             def __init__(self) -> None:
                 self.returncode: int | None = None
                 self.killed = False
+                self.cancel_seen = False
 
             def poll(self):
                 return self.returncode
@@ -249,6 +372,7 @@ class SourceSafetyTests(unittest.TestCase):
                 self.returncode = -9
 
             def communicate(self, timeout=None):
+                self.cancel_seen = any(root.glob(".*.cancel"))
                 return b"", b""
 
         with tempfile.TemporaryDirectory() as temp:
@@ -258,15 +382,31 @@ class SourceSafetyTests(unittest.TestCase):
             process = RacingProcess()
 
             def launch(*args, **kwargs):
-                # This is the previously lost interleaving: cancellation lands
-                # after Popen returns but before run publishes _active.
+                # Cancellation lands after Popen returns but before run
+                # publishes the marker path.  Killing the launcher here can
+                # orphan a suspended child before Job assignment, so the
+                # launcher must consume a marker instead.
                 backend.cancel()
                 return process
 
             with mock.patch("tools.acm_agent.stress.subprocess.Popen", side_effect=launch):
                 result = backend.run(["untrusted.exe"], cwd=root)
 
-            self.assertTrue(process.killed)
+            self.assertTrue(process.cancel_seen)
+            self.assertFalse(process.killed)
+            self.assertEqual(result.returncode, 130)
+
+    def test_native_backend_preserves_cancel_before_next_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            backend = WindowsAppContainerBackend(launcher=root / "runner.exe")
+            backend.probe = lambda: SandboxCapability(True, backend="fixture")
+            backend.cancel()
+
+            with mock.patch("tools.acm_agent.stress.subprocess.Popen") as launch:
+                result = backend.run(["untrusted.exe"], cwd=root)
+
+            launch.assert_not_called()
             self.assertEqual(result.returncode, 130)
 
 
@@ -389,21 +529,24 @@ class HelperBundleTests(unittest.TestCase):
                 primary,
                 HelperSources(
                     generator=SAFE_SOURCE.replace("return 0", "return 1"),
-                    brute=SAFE_SOURCE.replace("return 0", "return 2"),
-                    reference=SAFE_SOURCE.replace("return 0", "return 3"),
+                    reference_primary=SAFE_SOURCE.replace("return 0", "return 2"),
+                    reference_secondary=SAFE_SOURCE.replace("return 0", "return 3"),
                 ),
             )
             # Compilation stays trusted/local, while staged executables must
             # pass the sandboxed capability and oracle preflight before apply.
             self.assertTrue(backend.calls)
             self.assertIn("return 1", old_generator.read_text(encoding="utf-8"))
-            self.assertTrue(primary.with_name("CF1A.bf.cpp").is_file())
+            self.assertTrue(primary.with_name("CF1A.ref1.cpp").is_file())
+            self.assertTrue(primary.with_name("CF1A.ref2.cpp").is_file())
+            self.assertFalse(primary.with_name("CF1A.bf.cpp").exists())
+            self.assertFalse(primary.with_name("CF1A.ref.cpp").exists())
             self.assertTrue(Path(bundle.backup_dir, "manifest.json").is_file())
 
             HelperBundleManager(root, backend).revert(bundle)
             self.assertEqual(old_generator.read_text(encoding="utf-8"), "// old generator\n")
-            self.assertFalse(primary.with_name("CF1A.bf.cpp").exists())
-            self.assertFalse(primary.with_name("CF1A.ref.cpp").exists())
+            self.assertFalse(primary.with_name("CF1A.ref1.cpp").exists())
+            self.assertFalse(primary.with_name("CF1A.ref2.cpp").exists())
 
     def test_apply_requires_sandbox_capability(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -423,11 +566,11 @@ class HelperBundleTests(unittest.TestCase):
             bundle = manager.stage_and_apply(
                 primary, HelperSources(SAFE_SOURCE, SAFE_SOURCE, SAFE_SOURCE)
             )
-            primary.with_name("CF1A.bf.cpp").write_text("// user edit\n", encoding="utf-8")
+            primary.with_name("CF1A.ref1.cpp").write_text("// user edit\n", encoding="utf-8")
             with self.assertRaises(BundleConflictError):
                 manager.revert(bundle)
             self.assertEqual(
-                primary.with_name("CF1A.bf.cpp").read_text(encoding="utf-8"),
+                primary.with_name("CF1A.ref1.cpp").read_text(encoding="utf-8"),
                 "// user edit\n",
             )
 
@@ -443,7 +586,29 @@ class HelperBundleTests(unittest.TestCase):
                 )
             self.assertEqual(raised.exception.artifact, "generator")
             self.assertEqual(raised.exception.case_kind, "source_safety")
+            witness = raised.exception.details["source_safety"]
+            self.assertEqual(witness["rule_id"], "process_api")
+            self.assertEqual(witness["matched_token"], "system")
+            self.assertEqual((witness["line"], witness["column"]), (1, 12))
             self.assertEqual(backend.calls, [])
+
+    def test_source_safety_witness_is_bounded_and_redacts_literals(self) -> None:
+        source = (
+            "#include <cstdio>\n"
+            "int main() {\n"
+            "    freopen(\"private-input.txt\", \"r\", stdin);\n"
+            "}\n"
+        )
+        with self.assertRaises(SourceSafetyError) as caught:
+            validate_cpp_source(source)
+
+        witness = caught.exception.details
+        self.assertEqual(witness["rule_id"], "filesystem_api")
+        self.assertEqual(witness["matched_token"], "freopen")
+        self.assertEqual((witness["line"], witness["column"]), (3, 5))
+        self.assertIn("freopen", witness["excerpt"])
+        self.assertNotIn("private-input", witness["excerpt"])
+        self.assertLessEqual(len(str(witness["excerpt"])), 240)
 
     def test_stage_does_not_change_helpers_until_preflight_and_apply(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -464,7 +629,7 @@ class HelperBundleTests(unittest.TestCase):
             self.assertEqual(old.read_text(encoding="utf-8"), "// old generator\n")
             manager.apply(staged)
             applied = old.read_text(encoding="utf-8")
-            self.assertIn("ACM_TRUSTED_GENERATOR_HARNESS_V2", applied)
+            self.assertIn("ACM_TRUSTED_GENERATOR_HARNESS_V3", applied)
             self.assertIn("acm_generated_main", applied)
 
     def test_discard_removes_only_unapplied_staging(self) -> None:
@@ -525,25 +690,147 @@ class HelperBundleTests(unittest.TestCase):
             )
             # Two deterministic-generator probes precede the actual cases.
             actual = observed[2:]
-            self.assertEqual(actual[0][:2], ("small", "lower_bound"))
+            # small/lower_bound is optional and this blueprint does not declare
+            # it, so it must never be generated -- not at index 0, and nowhere
+            # else in the sequence either.
+            self.assertNotIn(
+                "lower_bound", [kind for _profile, kind, _seed in observed]
+            )
             self.assertEqual(
-                [item[:2] for item in actual[1:17]],
+                [item[:2] for item in actual[:16]],
                 [("small", "random")] * 16,
             )
-            self.assertEqual(actual[17][:2], ("large", "upper_bound"))
-            self.assertEqual(actual[18][:2], ("large", "random"))
+            self.assertEqual(actual[16][:2], ("large", "upper_bound"))
+            self.assertEqual(actual[17][:2], ("large", "random"))
+            self.assertEqual(len(actual), 18)
             executed_names = [Path(call[0][0]).stem for call in backend.calls]
             self.assertFalse(any(name.startswith("solution") for name in executed_names))
             sample_call = next(
                 index for index, call in enumerate(backend.calls)
                 if call[1] == b"sample input\n"
             )
-            lower_call = next(
+            # The official sample is still certified before any generated case.
+            first_generated_call = next(
                 index for index, call in enumerate(backend.calls)
-                if call[2].get("ACM_STRESS_CASE_KIND") == "lower_bound"
+                if call[2].get("ACM_STRESS_PROFILE") == "small"
+                and call[2].get("ACM_STRESS_CASE_KIND") == "random"
             )
-            self.assertLess(sample_call, lower_call)
+            self.assertLess(sample_call, first_generated_call)
             self.assertEqual(validation["small_random_cases"], 16)
+
+    def test_official_sample_reference_mismatch_carries_only_role_witness(self) -> None:
+        def handler(argv, input_data, env, limits):
+            stem = Path(argv[0]).stem
+            if stem == "sanitizer-probe":
+                return SandboxProcessResult(argv, 127, stderr=b"sanitizer unavailable")
+            if stem.startswith("generator") and argv[1:] == ["--capabilities"]:
+                return SandboxProcessResult(
+                    argv, 0,
+                    b'{"profile_version":2,"profiles":["small","large"],'
+                    b'"case_kinds":["lower_bound","upper_bound","random"]}',
+                )
+            if stem == "reference_primary.audit":
+                return SandboxProcessResult(argv, 0, b"actual-primary\n")
+            if stem == "reference_secondary.audit":
+                return SandboxProcessResult(argv, 0, b"sibling-output-must-not-appear\n")
+            return SandboxProcessResult(argv, 0, b"ok\n")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            primary = self._workspace(root)
+            manager = HelperBundleManager(root, FakeSandbox(handler))
+            staged = manager.stage(
+                primary, HelperSources(SAFE_SOURCE, SAFE_SOURCE, SAFE_SOURCE)
+            )
+            with self.assertRaises(HelperPreflightError) as caught:
+                manager.preflight(
+                    staged,
+                    HelperPreflightConfig(
+                        contract_hash="sample-witness",
+                        samples=[
+                            SampleCase(
+                                "official-1",
+                                b"private sample input\n",
+                                b"expected answer\n",
+                            )
+                        ],
+                    ),
+                )
+
+        exc = caught.exception
+        self.assertEqual(exc.code, "stress_reference_sample_mismatch")
+        self.assertEqual(exc.artifact, "reference_primary")
+        self.assertEqual(exc.details["sample_name"], "official-1")
+        self.assertEqual(exc.details["input_excerpt"], "private sample input\n")
+        self.assertEqual(exc.details["expected_stdout"], "expected answer\n")
+        self.assertEqual(exc.details["actual_stdout"], "actual-primary\n")
+        self.assertNotIn("sibling-output", json.dumps(exc.details))
+
+    def test_official_sample_reference_timeout_carries_repair_witness(self) -> None:
+        def handler(argv, input_data, env, limits):
+            stem = Path(argv[0]).stem
+            if stem == "sanitizer-probe":
+                return SandboxProcessResult(argv, 127, stderr=b"unavailable")
+            if stem == "reference_primary.audit":
+                return SandboxProcessResult(argv, -9, b"", b"timed out")
+            return SandboxProcessResult(argv, 0, b"expected\n")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manager = HelperBundleManager(root, FakeSandbox(handler))
+            staged = manager.stage(
+                self._workspace(root),
+                HelperSources(SAFE_SOURCE, SAFE_SOURCE, SAFE_SOURCE),
+            )
+            with self.assertRaises(HelperPreflightError) as caught:
+                manager.preflight(
+                    staged,
+                    HelperPreflightConfig(
+                        contract_hash="sample-timeout-witness",
+                        samples=[SampleCase("official-timeout", b"3 1\n", b"expected\n")],
+                    ),
+                )
+
+        exc = caught.exception
+        self.assertEqual(exc.artifact, "reference_primary")
+        self.assertEqual(exc.details["sample_name"], "official-timeout")
+        self.assertEqual(exc.details["input_excerpt"], "3 1\n")
+        self.assertEqual(exc.details["expected_stdout"], "expected\n")
+
+    def test_preflight_run_sizes_stdin_budget_to_generated_large_input(self) -> None:
+        observed: dict[str, int] = {}
+
+        class RecordingSandbox:
+            def run(self, command, *, cwd, input_data=None, env=None, limits=None):
+                observed["stdin_bytes"] = limits.stdin_bytes
+                observed["input_size"] = len(input_data or b"")
+                return SandboxProcessResult(
+                    [str(item) for item in command], 0, b"ok\n"
+                )
+
+            def probe(self):
+                return SandboxCapability(True, "", "fake")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manager = HelperBundleManager(root, RecordingSandbox())
+            large_input = b"x" * (3 * 1024 * 1024)
+            result = manager._preflight_run(
+                "validator.release.exe",
+                cwd=root,
+                artifact="validator",
+                profile="large",
+                case_kind="random",
+                seed=1,
+                timeout=2.0,
+                input_data=large_input,
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertGreaterEqual(
+                observed["stdin_bytes"], observed["input_size"]
+            )
+            self.assertLessEqual(observed["stdin_bytes"], MAX_LARGE_INPUT_BYTES)
+            self.assertGreater(MAX_LARGE_INPUT_BYTES, MAX_STREAM_BYTES)
 
     def test_preflight_manifest_coverage_is_bound_to_generated_inputs(self) -> None:
         def manifest_factory(seed, profile, case_kind, generated):
@@ -591,7 +878,8 @@ class HelperBundleTests(unittest.TestCase):
                 ),
             )
 
-            self.assertEqual(validation["preflight_version"], 5)
+            self.assertEqual(validation["preflight_version"], 9)
+            self.assertEqual(validation["oracle_protocol"], "dual_reference_v1")
             self.assertEqual(validation["generator_manifest_version"], 1)
             self.assertEqual(
                 validation["generator_coverage"]["small_random"]["observed_tags"],
@@ -606,7 +894,19 @@ class HelperBundleTests(unittest.TestCase):
                 for record in validation["cases"]
                 if record["profile"] in {"small", "large"}
             ]
-            self.assertEqual(len(generated_records), 19)
+            # This blueprint declares no cases, so the optional
+            # small/lower_bound case is not generated and owns no record.  The
+            # certified set is exactly the required cases: the small/random
+            # window plus large/upper_bound and large/random.
+            expected_generated = validation["small_random_cases"] + (
+                2 if validation["include_large"] else 0
+            )
+            self.assertEqual(expected_generated, 18)
+            self.assertEqual(len(generated_records), expected_generated)
+            self.assertNotIn(
+                ("small", "lower_bound"),
+                [(record["profile"], record["case_kind"]) for record in generated_records],
+            )
             self.assertTrue(
                 all("generator_manifest" in record for record in generated_records)
             )
@@ -615,15 +915,89 @@ class HelperBundleTests(unittest.TestCase):
                 for call in backend.calls
                 if len(call[0]) == 5 and call[0][1] == "--manifest"
             ]
-            self.assertEqual(len(manifest_calls), 19)
+            # Every certified record is manifest-bound, plus the two same-seed
+            # determinism probes that are run through the same certification
+            # path and therefore also request a manifest.
+            self.assertEqual(len(manifest_calls), expected_generated + 2)
             self.assertTrue(
                 all(
                     argv[2].isdigit()
                     and argv[3] in {"small", "large"}
-                    and argv[4] in {"lower_bound", "upper_bound", "random"}
+                    and argv[4] in {"upper_bound", "random"}
                     for argv in manifest_calls
                 )
             )
+
+    def test_local_recipe_treats_size_estimate_miss_as_bucket_fallback(self) -> None:
+        def handler(argv, input_data, env, limits):
+            stem = Path(argv[0]).stem.split(".")[0]
+            if stem == "sanitizer-probe":
+                return SandboxProcessResult(argv, 127, stderr=b"unavailable")
+            if stem == "generator":
+                seed = int(env["ACM_STRESS_SEED"])
+                return SandboxProcessResult(argv, 0, f"{seed % 10000:04d}\n".encode())
+            return SandboxProcessResult(argv, 0, b"ok\n")
+
+        def manifest_factory(seed, profile, case_kind, generated):
+            manifest = generator_manifest(
+                seed,
+                profile,
+                case_kind,
+                generated,
+                coverage_tags=["family:test.graph#0", "semantic:general"],
+            )
+            manifest["dimensions"] = {"scheduled_byte_bucket": 1}
+            return manifest
+
+        blueprint = {
+            "engine": "local_templates_v1",
+            "cases": [
+                {
+                    "profile": "small",
+                    "case_kind": "random",
+                    "families": [
+                        {
+                            "structure": {"template_id": "test.graph"},
+                            "labels": [],
+                            "semantic_goals": ["general"],
+                        }
+                    ],
+                    "byte_budget": {
+                        "hard_max": 100,
+                        "buckets": [[1, 9], [10, 20], [21, 100]],
+                        "active_buckets": [[10, 20]],
+                    },
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manager = HelperBundleManager(
+                root,
+                FakeSandbox(handler=handler, manifest_factory=manifest_factory),
+            )
+            staged = manager.stage(
+                self._workspace(root),
+                HelperSources(SAFE_SOURCE, SAFE_SOURCE, SAFE_SOURCE),
+            )
+            validation = manager.preflight(
+                staged,
+                HelperPreflightConfig(
+                    contract_hash="recipe-size-estimate-fallback",
+                    include_large=False,
+                    generator_blueprint=blueprint,
+                ),
+            )
+
+            distribution = next(
+                record
+                for record in validation["cases"]
+                if record["case_kind"] == "recipe_distribution"
+            )
+            self.assertGreater(
+                distribution["scheduled_byte_bucket_fallbacks"], 0
+            )
+            self.assertEqual(distribution["actual_byte_bucket_counts"], {"0": 16})
 
     def test_independent_validator_owns_manifest_observation(self) -> None:
         def handler(argv, input_data, env, limits):
@@ -637,7 +1011,6 @@ class HelperBundleTests(unittest.TestCase):
                 )
             if stem == "validator":
                 profile = env.get("ACM_STRESS_PROFILE", "small")
-                case_kind = env.get("ACM_STRESS_CASE_KIND", "random")
                 tags = ["small-required"] if profile == "small" else ["large-required"]
                 return SandboxProcessResult(
                     argv, 0,
@@ -719,7 +1092,9 @@ class HelperBundleTests(unittest.TestCase):
             error = raised.exception
             self.assertEqual(error.code, "stress_generator_coverage_failed")
             self.assertEqual(error.artifact, "generator")
-            self.assertEqual((error.profile, error.case_kind), ("small", "lower_bound"))
+            # small/random is the first required generated case, so it is the
+            # first case a forged manifest can be attributed to.
+            self.assertEqual((error.profile, error.case_kind), ("small", "random"))
             self.assertEqual(error.details["actual"], {"input_sha256": "0" * 64})
             self.assertIn("input_sha256", error.details["expected"])
 
@@ -747,7 +1122,7 @@ class HelperBundleTests(unittest.TestCase):
                 )
             error = raised.exception
             self.assertEqual(error.code, "stress_generator_coverage_failed")
-            self.assertEqual((error.profile, error.case_kind), ("small", "lower_bound"))
+            self.assertEqual((error.profile, error.case_kind), ("small", "random"))
             self.assertIn("records", error.details["expected"])
             self.assertNotIn("records", error.details["actual"])
 
@@ -917,7 +1292,8 @@ class HelperBundleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             primary = self._workspace(root)
-            manager = HelperBundleManager(root, FakeSandbox(handler))
+            backend = FakeSandbox(handler)
+            manager = HelperBundleManager(root, backend)
             staged = manager.stage(
                 primary,
                 HelperSources(SAFE_SOURCE, SAFE_SOURCE, SAFE_SOURCE, SAFE_SOURCE),
@@ -929,8 +1305,43 @@ class HelperBundleTests(unittest.TestCase):
                         contract_hash="seed-search", include_large=False
                     ),
                 )
-            self.assertEqual(raised.exception.code, "stress_generated_input_invalid")
-            self.assertEqual(raised.exception.details["seed_search"]["attempts"], 1)
+            error = raised.exception
+            self.assertEqual(error.code, "stress_generated_input_invalid")
+            # Original intent: the generator's own requested seed is certified
+            # as-is.  Seed substitution is disabled, so there is no seed_search
+            # bookkeeping and the failure must name the requested seed itself.
+            self.assertNotIn("seed_search", error.details)
+            failing_seed = error.details["seed"]
+            self.assertEqual(
+                error.details["actual"]["generated_input_excerpt"],
+                f"{failing_seed}\n",
+            )
+            generator_seeds = [
+                int(env["ACM_STRESS_SEED"])
+                for argv, _stdin, env in backend.calls
+                if Path(argv[0]).stem.startswith("generator")
+                and "ACM_STRESS_SEED" in env
+            ]
+            # The rejected seed is the one preflight asked for and the last one
+            # tried: nothing is generated after the rejection.
+            self.assertEqual(generator_seeds[-1], failing_seed)
+            # Every seed handed to the generator is a plain requested seed from
+            # the contiguous preflight window, never a derived substitute.
+            self.assertEqual(
+                sorted(set(generator_seeds)),
+                list(range(min(generator_seeds), failing_seed + 1)),
+            )
+            # The substitute that a seed search would have reached for is the
+            # exact value that must never appear.
+            self.assertNotIn(
+                _derived_candidate_seed(failing_seed, 1), generator_seeds
+            )
+            substitutes = {
+                _derived_candidate_seed(seed, attempt)
+                for seed in set(generator_seeds)
+                for attempt in range(1, 4)
+            }
+            self.assertEqual(substitutes.intersection(generator_seeds), set())
 
     def test_preflight_never_deletes_records_to_make_generated_input_valid(self) -> None:
         def handler(argv, input_data, env, limits):
@@ -1260,7 +1671,7 @@ int main(int argc,char**argv){
                 )
             if stem.startswith("generator"):
                 return SandboxProcessResult(argv, 0, b"1 1\n1\nInsert 3 -470992076\n")
-            if stem == "brute.audit":
+            if stem == "reference_primary.audit":
                 return SandboxProcessResult(
                     argv, 3, stderr=b"vector::insert invalid iterator assertion"
                 )
@@ -1277,20 +1688,280 @@ int main(int argc,char**argv){
                 manager.preflight(
                     staged, HelperPreflightConfig(contract_hash="illegal-insert")
                 )
-            self.assertEqual(raised.exception.artifact, "brute")
+            self.assertEqual(raised.exception.artifact, "reference_primary")
             self.assertEqual(raised.exception.profile, "small")
-            self.assertEqual(raised.exception.case_kind, "lower_bound")
+            # No blueprint declares small/lower_bound, so the first case that
+            # can abort the debug reference is small/random.
+            self.assertEqual(raised.exception.case_kind, "random")
             self.assertIn("invalid iterator", raised.exception.details["stderr"])
             self.assertFalse(primary.with_name("CF1A.gen.cpp").exists())
 
+    def test_small_input_budget_escalates_in_exactly_one_jump_to_the_ceiling(self) -> None:
+        # A legal generator that simply needs more than the initial
+        # human-checkable budget must be accommodated by a single escalation to
+        # the stream ceiling -- not by an incremental walk.
+        def payload(profile: str, case_kind: str, seed: int, budget: int | None) -> bytes:
+            if profile == "large":
+                return f"large {case_kind} {seed}\n".encode()
+            return (f"{seed} " + "9" * 400 + "\n").encode()
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            primary = self._workspace(root)
+            fake = SmallInputSizingRecorder(payload)
+            manager = HelperBundleManager(root, FakeSandbox(fake))
+            staged = manager.stage(
+                primary, HelperSources(SAFE_SOURCE, SAFE_SOURCE, SAFE_SOURCE)
+            )
+            validation = manager.preflight(
+                staged, HelperPreflightConfig(contract_hash="dynamic-sizing")
+            )
+
+            # The contract is a two-rung ladder with no intermediate step.
+            # An earlier draft spec had a 100 -> 200 rung; that was superseded.
+            self.assertEqual(SMALL_INPUT_LADDER, ["100", "2097152"])
+            self.assertEqual(SMALL_INPUT_CEILING_BYTES, MAX_STREAM_BYTES)
+
+            small_runs = fake.runs_for("small")
+            self.assertTrue(small_runs)
+            # Every small case spends exactly two generator runs: the initial
+            # budget, then one jump straight to the ceiling.
+            self.assertEqual(len(small_runs) % len(SMALL_INPUT_LADDER), 0)
+            self.assertEqual(
+                [run["budget"] for run in small_runs],
+                SMALL_INPUT_LADDER * (len(small_runs) // len(SMALL_INPUT_LADDER)),
+            )
+            self.assertNotIn("200", {run["budget"] for run in small_runs})
+            # The generator's stdout limit tracks the advertised budget, so the
+            # escalation actually buys the generator room to write.
+            for run in small_runs:
+                self.assertEqual(run["stdout_limit"], int(run["budget"]))
+
+            # The byte ceiling is a small-profile mechanism only; large cases
+            # keep their own, much larger, input budget and advertise nothing.
+            large_runs = fake.runs_for("large")
+            self.assertTrue(large_runs)
+            for run in large_runs:
+                self.assertIsNone(run["budget"])
+                self.assertEqual(run["stdout_limit"], MAX_LARGE_INPUT_BYTES)
+
+            small_records = [
+                record
+                for record in validation["cases"]
+                if record["profile"] == "small"
+            ]
+            self.assertTrue(small_records)
+            for record in small_records:
+                self.assertEqual(record["small_input_attempts"], 2)
+                self.assertEqual(record["max_input_bytes"], SMALL_INPUT_CEILING_BYTES)
+
+    def test_small_input_sizing_fails_closed_after_two_attempts(self) -> None:
+        # A generator that cannot produce a legal small input even at the
+        # ceiling must fail closed after exactly two runs.  This is the
+        # regression guard against an unbounded retry loop.
+        def payload(profile: str, case_kind: str, seed: int, budget: int | None) -> bytes:
+            return b"x" * (SMALL_INPUT_CEILING_BYTES + 1)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            primary = self._workspace(root)
+            fake = SmallInputSizingRecorder(payload)
+            manager = HelperBundleManager(root, FakeSandbox(fake))
+            staged = manager.stage(
+                primary, HelperSources(SAFE_SOURCE, SAFE_SOURCE, SAFE_SOURCE)
+            )
+            with self.assertRaises(HelperPreflightError) as raised:
+                manager.preflight(
+                    staged,
+                    HelperPreflightConfig(
+                        contract_hash="sizing-fail-closed", include_large=False
+                    ),
+                )
+            error = raised.exception
+            self.assertEqual(error.artifact, "generator")
+            self.assertEqual((error.profile, error.case_kind), ("small", "random"))
+            self.assertIn("generator_output_limit", str(error))
+            # The exhausted ladder is reported so the diagnostic names the real
+            # defect instead of a bare budget message.
+            self.assertEqual(error.details["small_input_attempts"], 2)
+            self.assertEqual(error.details["max_input_bytes"], SMALL_INPUT_CEILING_BYTES)
+            # Two runs total, and the second is the ceiling: no third attempt.
+            self.assertEqual(
+                [run["budget"] for run in fake.runs_for("small")],
+                [str(SMALL_INPUT_INITIAL_BYTES), str(SMALL_INPUT_CEILING_BYTES)],
+            )
+
+    def test_validator_rejection_reaches_the_same_single_escalation(self) -> None:
+        # Validator rejection of a too-cramped input is the second trigger for
+        # the same one-jump escalation, not a separate ladder.
+        def payload(profile: str, case_kind: str, seed: int, budget: int | None) -> bytes:
+            width = 8 if (budget or 0) <= SMALL_INPUT_INITIAL_BYTES else 160
+            return (f"{seed} " + "7" * width + "\n").encode()
+
+        def validator(input_data: bytes) -> bool:
+            return len(input_data) >= 100
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            primary = self._workspace(root)
+            fake = SmallInputSizingRecorder(payload, validator=validator)
+            manager = HelperBundleManager(root, FakeSandbox(fake))
+            staged = manager.stage(
+                primary,
+                HelperSources(SAFE_SOURCE, SAFE_SOURCE, SAFE_SOURCE, SAFE_SOURCE),
+            )
+            validation = manager.preflight(
+                staged,
+                HelperPreflightConfig(
+                    contract_hash="validator-escalation", include_large=False
+                ),
+            )
+            self.assertTrue(validation["independent_input_validator"])
+
+            small_runs = fake.runs_for("small")
+            self.assertEqual(len(small_runs) % len(SMALL_INPUT_LADDER), 0)
+            self.assertEqual(
+                [run["budget"] for run in small_runs],
+                SMALL_INPUT_LADDER * (len(small_runs) // len(SMALL_INPUT_LADDER)),
+            )
+            # The validator saw both attempts, and the escalated one is the
+            # larger input: the jump is what made the case legal.
+            self.assertEqual(len(fake.validator_inputs), len(small_runs))
+            self.assertLess(
+                len(fake.validator_inputs[0]), len(fake.validator_inputs[1])
+            )
+            for record in validation["cases"]:
+                if record["profile"] == "small":
+                    self.assertEqual(record["small_input_attempts"], 2)
+                    self.assertEqual(
+                        record["max_input_bytes"], SMALL_INPUT_CEILING_BYTES
+                    )
+
+    def test_empty_generator_output_reaches_the_same_single_escalation(self) -> None:
+        # Empty output is the third trigger and shares the one-jump ladder.
+        def payload(profile: str, case_kind: str, seed: int, budget: int | None) -> bytes:
+            if (budget or 0) <= SMALL_INPUT_INITIAL_BYTES:
+                return b""
+            return f"{seed}\n".encode()
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            primary = self._workspace(root)
+            fake = SmallInputSizingRecorder(payload)
+            manager = HelperBundleManager(root, FakeSandbox(fake))
+            staged = manager.stage(
+                primary, HelperSources(SAFE_SOURCE, SAFE_SOURCE, SAFE_SOURCE)
+            )
+            validation = manager.preflight(
+                staged,
+                HelperPreflightConfig(
+                    contract_hash="empty-escalation", include_large=False
+                ),
+            )
+            small_runs = fake.runs_for("small")
+            self.assertEqual(len(small_runs) % len(SMALL_INPUT_LADDER), 0)
+            self.assertEqual(
+                [run["budget"] for run in small_runs],
+                SMALL_INPUT_LADDER * (len(small_runs) // len(SMALL_INPUT_LADDER)),
+            )
+            for record in validation["cases"]:
+                if record["profile"] == "small":
+                    self.assertEqual(record["small_input_attempts"], 2)
+
+    def test_optional_lower_bound_runs_only_when_the_blueprint_declares_it(self) -> None:
+        def case(profile: str, case_kind: str) -> dict[str, object]:
+            return {
+                "profile": profile,
+                "case_kind": case_kind,
+                "total_complexity": "O(output_size)",
+            }
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            primary = self._workspace(root)
+            backend = FakeSandbox()
+            manager = HelperBundleManager(root, backend)
+            staged = manager.stage(
+                primary, HelperSources(SAFE_SOURCE, SAFE_SOURCE, SAFE_SOURCE)
+            )
+
+            def generated_cases(blueprint, contract_hash):
+                before = len(backend.calls)
+                validation = manager.preflight(
+                    staged,
+                    HelperPreflightConfig(
+                        contract_hash=contract_hash,
+                        include_large=False,
+                        generator_blueprint=blueprint,
+                    ),
+                )
+                observed = [
+                    (
+                        env["ACM_STRESS_PROFILE"],
+                        env["ACM_STRESS_CASE_KIND"],
+                    )
+                    for argv, _stdin, env in backend.calls[before:]
+                    if len(argv) == 4
+                    and Path(argv[0]).stem.split(".")[0] == "generator"
+                ]
+                return validation, observed
+
+            declared_validation, declared_observed = generated_cases(
+                {"cases": [case("small", "lower_bound"), case("small", "random")]},
+                "lower-bound-declared",
+            )
+            undeclared_validation, undeclared_observed = generated_cases(
+                {"cases": [case("small", "random")]},
+                "lower-bound-undeclared",
+            )
+
+            # Declared: the optional case is generated exactly once, ahead of
+            # the small/random window, and owns one certified record.
+            self.assertEqual(
+                declared_observed.count(("small", "lower_bound")), 1
+            )
+            self.assertEqual(declared_observed[0], ("small", "lower_bound"))
+            declared_kinds = [
+                (record["profile"], record["case_kind"])
+                for record in declared_validation["cases"]
+            ]
+            self.assertEqual(declared_kinds.count(("small", "lower_bound")), 1)
+            self.assertEqual(
+                len(declared_kinds),
+                declared_validation["small_random_cases"] + 1,
+            )
+
+            # Undeclared: it is never executed and owns no record at all.
+            self.assertNotIn(("small", "lower_bound"), undeclared_observed)
+            self.assertNotIn("lower_bound", [kind for _profile, kind in undeclared_observed])
+            undeclared_kinds = [
+                (record["profile"], record["case_kind"])
+                for record in undeclared_validation["cases"]
+            ]
+            self.assertNotIn(("small", "lower_bound"), undeclared_kinds)
+            self.assertEqual(
+                len(undeclared_kinds),
+                undeclared_validation["small_random_cases"],
+            )
+            # The only difference between the two runs is that one record.
+            self.assertEqual(
+                len(declared_kinds) - len(undeclared_kinds), 1
+            )
+
 
 class ClassificationTests(unittest.TestCase):
-    def test_three_way_truth_table(self) -> None:
-        self.assertEqual(classify_three_way(b"1\n", b"1 ", b"1\n"), "agree")
+    def test_dual_reference_truth_table(self) -> None:
+        self.assertEqual(classify_dual_reference(b"1\n", b"1 ", b"1\n"), "agree")
+        self.assertEqual(classify_dual_reference(b"0", b"1", b"1"), "mismatch")
+        self.assertEqual(classify_dual_reference(b"0", b"0", b"1"), "oracle_conflict")
+        self.assertEqual(classify_dual_reference(b"0", b"1", b"2"), "oracle_conflict")
+        self.assertEqual(
+            classify_dual_reference(b"1\n", b"1 ", b"1\n", exact=True),
+            "oracle_conflict",
+        )
+
+    def test_legacy_classifier_alias_is_preserved(self) -> None:
         self.assertEqual(classify_three_way(b"0", b"1", b"1"), "mismatch")
-        self.assertEqual(classify_three_way(b"0", b"0", b"1"), "oracle_conflict")
-        self.assertEqual(classify_three_way(b"0", b"1", b"2"), "oracle_conflict")
-        self.assertEqual(classify_three_way(b"1\n", b"1 ", b"1\n", exact=True), "oracle_conflict")
 
 
 class RunnerTests(unittest.TestCase):
@@ -1299,14 +1970,14 @@ class RunnerTests(unittest.TestCase):
         executables = StressExecutables(
             solution=root / "solution.exe",
             generator=root / "generator.exe",
-            brute=root / "brute.exe",
-            reference=root / "reference.exe",
+            reference_primary=root / "reference_primary.exe",
+            reference_secondary=root / "reference_secondary.exe",
         )
         for path in (
             executables.solution,
             executables.generator,
-            executables.brute,
-            executables.reference,
+            executables.reference_primary,
+            executables.reference_secondary,
         ):
             path.write_bytes(b"test executable")
         return executables
@@ -1342,8 +2013,8 @@ class RunnerTests(unittest.TestCase):
             self.assertTrue((failure / "metadata.json").is_file())
             self.assertEqual((problem_dir / "CF1A_input.in").read_bytes(), b"42\n")
             self.assertEqual((problem_dir / "CF1A_current.out").read_bytes(), b"wrong\n")
-            self.assertEqual((problem_dir / "CF1A_brute.out").read_bytes(), b"correct\n")
-            self.assertEqual((problem_dir / "CF1A_reference.out").read_bytes(), b"correct\n")
+            self.assertEqual((problem_dir / "CF1A_ref1.out").read_bytes(), b"correct\n")
+            self.assertEqual((problem_dir / "CF1A_ref2.out").read_bytes(), b"correct\n")
 
     def test_oracle_conflict_exports_case_and_all_outputs_beside_solution(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1360,8 +2031,8 @@ class RunnerTests(unittest.TestCase):
                     0,
                     {
                         "solution": b"current output\n",
-                        "brute": b"brute output\n",
-                        "reference": b"reference output\n",
+                        "reference_primary": b"primary output\n",
+                        "reference_secondary": b"secondary output\n",
                     }[name],
                 )
 
@@ -1375,10 +2046,10 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(result.status, "oracle_conflict")
             self.assertEqual((problem_dir / "P2596_input.in").read_bytes(), b"conflict input\n")
             self.assertEqual((problem_dir / "P2596_current.out").read_bytes(), b"current output\n")
-            self.assertEqual((problem_dir / "P2596_brute.out").read_bytes(), b"brute output\n")
-            self.assertEqual((problem_dir / "P2596_reference.out").read_bytes(), b"reference output\n")
+            self.assertEqual((problem_dir / "P2596_ref1.out").read_bytes(), b"primary output\n")
+            self.assertEqual((problem_dir / "P2596_ref2.out").read_bytes(), b"secondary output\n")
 
-    def test_oracle_conflict_does_not_export_when_current_matches_reference(self) -> None:
+    def test_oracle_conflict_exports_even_when_current_matches_one_reference(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             problem_dir = root / "2026" / "8" / "5"
@@ -1391,7 +2062,9 @@ class RunnerTests(unittest.TestCase):
                 return SandboxProcessResult(
                     argv,
                     0,
-                    b"different brute\n" if name == "brute" else b"same answer\n",
+                    b"different primary\n"
+                    if name == "reference_primary"
+                    else b"same answer\n",
                 )
 
             result = LayeredStressRunner(
@@ -1402,10 +2075,10 @@ class RunnerTests(unittest.TestCase):
                 conflict_export_dir=problem_dir,
             ).run(StressRunConfig(first_seed=20, max_cases=1))
             self.assertEqual(result.status, "oracle_conflict")
-            self.assertFalse((problem_dir / "P2596_input.in").exists())
-            self.assertFalse((problem_dir / "P2596_current.out").exists())
-            self.assertFalse((problem_dir / "P2596_brute.out").exists())
-            self.assertFalse((problem_dir / "P2596_reference.out").exists())
+            self.assertEqual((problem_dir / "P2596_input.in").read_bytes(), b"oracle conflict\n")
+            self.assertEqual((problem_dir / "P2596_current.out").read_bytes(), b"same answer\n")
+            self.assertEqual((problem_dir / "P2596_ref1.out").read_bytes(), b"different primary\n")
+            self.assertEqual((problem_dir / "P2596_ref2.out").read_bytes(), b"same answer\n")
 
     def test_v2_runs_boundaries_then_four_small_to_one_large(self) -> None:
         cases: list[tuple[str, str, tuple[str, ...]]] = []
@@ -1524,10 +2197,20 @@ class RunnerTests(unittest.TestCase):
                         "generator.exe",
                         cwd=Path(temp),
                     )
+                expected = raised.exception.details["expected"]
+                # All four profile-v2 cases are required in exact order.
                 self.assertEqual(
-                    raised.exception.details["expected"]["supported_cases"],
-                    GENERATOR_CAPABILITIES["supported_cases"],
+                    expected["required_supported_cases"],
+                    [
+                        {"profile": "small", "case_kind": "lower_bound"},
+                        {"profile": "small", "case_kind": "random"},
+                        {"profile": "large", "case_kind": "upper_bound"},
+                        {"profile": "large", "case_kind": "random"},
+                    ],
                 )
+                self.assertTrue(expected["small_lower_bound_required"])
+                self.assertEqual(expected["manifest_version"], 1)
+                self.assertNotIn("supported_cases", expected)
                 self.assertEqual(
                     raised.exception.details["actual"], capabilities
                 )
@@ -1536,7 +2219,7 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only stress profile version 2"):
             StressRunConfig(first_seed=1, profile_version=1, max_cases=1)
 
-    def test_large_mismatch_skips_brute_and_uses_large_limits(self) -> None:
+    def test_large_mismatch_runs_both_references_and_uses_large_limits(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             problem_dir = root / "2026" / "8" / "5"
@@ -1573,20 +2256,110 @@ class RunnerTests(unittest.TestCase):
                 )
             )
             self.assertEqual(result.status, "mismatch")
-            self.assertNotIn("brute", [name for name, *_ in calls])
             self.assertEqual(calls[0][2], 32 * 1024 * 1024)
             for name, stdin_limit, stdout_limit, stderr_limit in calls[1:]:
-                self.assertIn(name, {"solution", "reference"})
+                self.assertIn(
+                    name,
+                    {"solution", "reference_primary", "reference_secondary"},
+                )
                 self.assertEqual(stdin_limit, 32 * 1024 * 1024)
                 self.assertEqual(stdout_limit, 16 * 1024 * 1024)
                 self.assertEqual(stderr_limit, 16 * 1024 * 1024)
-            self.assertEqual(
-                (problem_dir / "P9_brute.out").read_bytes(),
-                b"BRUTE_NOT_RUN_FOR_LARGE_PROFILE\n",
-            )
+            self.assertFalse((problem_dir / "P9_brute.out").exists())
+            self.assertEqual((problem_dir / "P9_ref1.out").read_bytes(), b"reference\n")
+            self.assertEqual((problem_dir / "P9_ref2.out").read_bytes(), b"reference\n")
             metadata = json.loads(Path(result.failure_dir, "metadata.json").read_text())
-            self.assertEqual(metadata["brute_status"], "skipped_large_profile")
+            self.assertIsNone(metadata["brute_status"])
+            self.assertEqual(metadata["oracle_protocol"], "dual_reference_v1")
             self.assertEqual(metadata["case_kind"], "upper_bound")
+
+    def test_reference_fault_is_attributed_to_exact_role(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+
+            def handler(argv, input_data, env, limits):
+                name = Path(argv[0]).stem
+                if name == "generator" and argv[1:] == ["--capabilities"]:
+                    return SandboxProcessResult(
+                        argv, 0,
+                        b'{"profile_version":2,"profiles":["small","large"],'
+                        b'"case_kinds":["lower_bound","upper_bound","random"]}',
+                    )
+                if name == "generator":
+                    return SandboxProcessResult(argv, 0, b"case\n")
+                if name == "reference_primary":
+                    return SandboxProcessResult(argv, -1, timed_out=True)
+                return SandboxProcessResult(argv, 0, b"answer\n")
+
+            result = LayeredStressRunner(
+                root, "P10", self._executables(root), FakeSandbox(handler)
+            ).run(StressRunConfig(first_seed=1, max_cases=1))
+            self.assertEqual(result.status, "reference_primary_timeout")
+            metadata = json.loads(Path(result.failure_dir, "metadata.json").read_text())
+            self.assertTrue(metadata["results"]["reference_primary"]["timed_out"])
+            self.assertNotIn("brute", metadata["results"])
+
+    def test_reference_conflict_precedes_solution_fault(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+
+            def handler(argv, input_data, env, limits):
+                name = Path(argv[0]).stem
+                if name == "generator" and argv[1:] == ["--capabilities"]:
+                    return SandboxProcessResult(
+                        argv, 0,
+                        b'{"profile_version":2,"profiles":["small","large"],'
+                        b'"case_kinds":["lower_bound","upper_bound","random"]}',
+                    )
+                if name == "generator":
+                    return SandboxProcessResult(argv, 0, b"case\n")
+                if name == "solution":
+                    return SandboxProcessResult(argv, 3, stderr=b"solution crashed")
+                return SandboxProcessResult(
+                    argv, 0,
+                    b"one\n" if name == "reference_primary" else b"two\n",
+                )
+
+            result = LayeredStressRunner(
+                root, "P12", self._executables(root), FakeSandbox(handler)
+            ).run(StressRunConfig(first_seed=1, max_cases=1))
+            self.assertEqual(result.status, "oracle_conflict")
+
+    def test_legacy_large_resume_keeps_single_reference_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            calls: list[str] = []
+
+            def handler(argv, input_data, env, limits):
+                name = Path(argv[0]).stem
+                if name == "generator" and argv[1:] == ["--capabilities"]:
+                    return SandboxProcessResult(
+                        argv, 0,
+                        b'{"profile_version":2,"profiles":["small","large"],'
+                        b'"case_kinds":["lower_bound","upper_bound","random"]}',
+                    )
+                calls.append(name)
+                if name == "generator":
+                    return SandboxProcessResult(argv, 0, b"case\n")
+                return SandboxProcessResult(
+                    argv, 0, b"wrong\n" if name == "solution" else b"answer\n"
+                )
+
+            result = LayeredStressRunner(
+                root, "P11", self._executables(root), FakeSandbox(handler)
+            ).run(
+                StressRunConfig(
+                    first_seed=1,
+                    schedule_offset=1,
+                    max_cases=1,
+                    oracle_protocol="legacy_trio",
+                )
+            )
+            self.assertEqual(result.status, "mismatch")
+            self.assertIn("reference", calls)
+            self.assertNotIn("brute", calls)
+            metadata = json.loads(Path(result.failure_dir, "metadata.json").read_text())
+            self.assertEqual(metadata["oracle_protocol"], "legacy_trio")
 
     def test_stop_token_stops_before_execution_and_cancel_delegates(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

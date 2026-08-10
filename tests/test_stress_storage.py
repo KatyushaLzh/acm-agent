@@ -79,7 +79,250 @@ def create_v11_database(path: Path) -> None:
         connection.close()
 
 
+def create_v13_database(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        for version in range(1, 14):
+            connection.executescript(MIGRATIONS[version])
+            connection.execute(f"PRAGMA user_version = {version}")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def create_v15_database(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        for version in range(1, 16):
+            connection.executescript(MIGRATIONS[version])
+            connection.execute(f"PRAGMA user_version = {version}")
+        connection.commit()
+    finally:
+        connection.close()
+
+
 class StressStorageMigrationTests(unittest.TestCase):
+    def test_v15_migration_preserves_data_and_candidate_foreign_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "state.db"
+            create_v15_database(path)
+            connection = sqlite3.connect(path)
+            try:
+                stamp = "2026-08-09T00:00:00+00:00"
+                connection.execute(
+                    """INSERT INTO problems(
+                           platform,problem_id,tags_json,source_json,updated_at)
+                       VALUES('codeforces','1A','[]','{}',?)""",
+                    (stamp,),
+                )
+                connection.execute(
+                    """INSERT INTO stress_artifact_bundles(
+                           id,platform,problem_id,created_at,updated_at)
+                       VALUES('legacy-v15-bundle','codeforces','1A',?,?)""",
+                    (stamp, stamp),
+                )
+                connection.execute(
+                    """INSERT INTO stress_artifacts(
+                           id,bundle_id,kind,source_code,source_hash,target_path,
+                           source_kind,created_at,updated_at)
+                       VALUES('legacy-v15-artifact','legacy-v15-bundle','generator',
+                              '// legacy','legacy-artifact-hash','legacy.gen.cpp',
+                              'ai_generated',?,?)""",
+                    (stamp, stamp),
+                )
+                for role in (
+                    "generator",
+                    "reference_primary",
+                    "reference_secondary",
+                ):
+                    connection.execute(
+                        """INSERT INTO stress_artifact_candidates(
+                               id,generation_key,platform,problem_id,role,
+                               source_code,source_hash,source_kind,
+                               generation_identity_json,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            f"legacy-v15-{role}",
+                            f"legacy-v15-generation-{role}",
+                            "codeforces",
+                            "1A",
+                            role,
+                            f"// {role}",
+                            f"legacy-v15-hash-{role}",
+                            "ai_generated",
+                            json.dumps({"role": role}),
+                            stamp,
+                        ),
+                    )
+                connection.execute(
+                    """INSERT INTO stress_artifact_proofs(
+                           proof_key,candidate_id,proof_kind,
+                           certification_identity_json,status,created_at)
+                       VALUES('legacy-v15-proof','legacy-v15-generator',
+                              'compile','{}','passed',?)""",
+                    (stamp,),
+                )
+                connection.execute(
+                    """INSERT INTO stress_bundle_certifications(
+                           certification_key,platform,problem_id,oracle_protocol,
+                           generator_candidate_id,reference_primary_candidate_id,
+                           reference_secondary_candidate_id,
+                           certification_identity_json,status,created_at)
+                       VALUES('legacy-v15-cert','codeforces','1A',
+                              'dual_reference_v1','legacy-v15-generator',
+                              'legacy-v15-reference_primary',
+                              'legacy-v15-reference_secondary','{}','valid',?)""",
+                    (stamp,),
+                )
+                connection.execute(
+                    """UPDATE stress_artifact_bundles
+                       SET certification_key='legacy-v15-cert'
+                       WHERE id='legacy-v15-bundle'"""
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with Database(path) as database:
+                self.assertEqual(SCHEMA_VERSION, 16)
+                self.assertEqual(
+                    database.connection.execute("PRAGMA user_version").fetchone()[0],
+                    16,
+                )
+                self.assertEqual(
+                    database.stress_artifact("legacy-v15-artifact")["source_kind"],
+                    "ai_generated",
+                )
+                self.assertEqual(
+                    database.stress_artifact_proof("legacy-v15-proof")["candidate_id"],
+                    "legacy-v15-generator",
+                )
+                self.assertEqual(
+                    database.stress_bundle_certification("legacy-v15-cert")[
+                        "reference_secondary_candidate_id"
+                    ],
+                    "legacy-v15-reference_secondary",
+                )
+                self.assertEqual(
+                    database.stress_artifact_bundle("legacy-v15-bundle")[
+                        "certification_key"
+                    ],
+                    "legacy-v15-cert",
+                )
+                self.assertEqual(
+                    list(database.connection.execute("PRAGMA foreign_key_check")), []
+                )
+
+                candidate = database.save_stress_artifact_candidate(
+                    "recipe-v16-candidate",
+                    generation_key="recipe-v16-generation",
+                    platform="codeforces",
+                    problem_id="1A",
+                    role="validator",
+                    source_code="// locally composed",
+                    source_kind="ai_recipe_composed",
+                    generation_identity={"engine": "local_templates_v1"},
+                )
+                artifact = database.save_stress_artifact(
+                    "recipe-v16-artifact",
+                    bundle_id="legacy-v15-bundle",
+                    kind="validator",
+                    source_code="// locally composed",
+                    target_path="recipe.validator.cpp",
+                    source_kind="ai_recipe_composed",
+                )
+                self.assertEqual(candidate["source_kind"], "ai_recipe_composed")
+                self.assertEqual(artifact["source_kind"], "ai_recipe_composed")
+                self.assertEqual(
+                    list(database.connection.execute("PRAGMA foreign_key_check")), []
+                )
+
+    def test_v13_migration_preserves_legacy_certification_and_adds_dual_roles(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "state.db"
+            create_v13_database(path)
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    """INSERT INTO problems(
+                           platform,problem_id,tags_json,source_json,updated_at)
+                       VALUES('codeforces','1A','[]','{}',
+                              '2026-08-08T00:00:00+00:00')"""
+                )
+                for role in ("generator", "brute", "reference"):
+                    connection.execute(
+                        """INSERT INTO stress_artifact_candidates(
+                               id,generation_key,platform,problem_id,role,
+                               source_code,source_hash,source_kind,
+                               generation_identity_json,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            f"candidate-{role}",
+                            f"generation-{role}",
+                            "codeforces",
+                            "1A",
+                            role,
+                            f"// {role}",
+                            role[0] * 64,
+                            "ai_generated",
+                            json.dumps({"role": role}),
+                            "2026-08-08T00:00:00+00:00",
+                        ),
+                    )
+                connection.execute(
+                    """INSERT INTO stress_bundle_certifications(
+                           certification_key,platform,problem_id,
+                           generator_candidate_id,brute_candidate_id,
+                           reference_candidate_id,certification_identity_json,
+                           status,created_at)
+                       VALUES('legacy-cert','codeforces','1A',
+                              'candidate-generator','candidate-brute',
+                              'candidate-reference','{}','valid',
+                              '2026-08-08T00:00:00+00:00')"""
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with Database(path) as database:
+                certification = database.stress_bundle_certification("legacy-cert")
+                self.assertIsNotNone(certification)
+                self.assertEqual(certification["oracle_protocol"], "legacy_trio")
+                self.assertEqual(certification["brute_candidate_id"], "candidate-brute")
+                self.assertIsNone(certification["reference_primary_candidate_id"])
+                self.assertEqual(
+                    list(database.connection.execute("PRAGMA foreign_key_check")), []
+                )
+                database.save_stress_artifact_candidate(
+                    "candidate-reference-primary",
+                    generation_key="generation-reference-primary",
+                    platform="codeforces",
+                    problem_id="1A",
+                    role="reference_primary",
+                    source_code="// primary",
+                    source_kind="ai_generated",
+                    generation_identity={"role": "reference_primary"},
+                )
+
+            backup = path.with_name("state.db.v13.bak")
+            self.assertTrue(backup.is_file())
+            backup_connection = sqlite3.connect(backup)
+            try:
+                self.assertEqual(
+                    backup_connection.execute("PRAGMA user_version").fetchone()[0], 13
+                )
+                columns = {
+                    row[1]
+                    for row in backup_connection.execute(
+                        "PRAGMA table_info(stress_bundle_certifications)"
+                    )
+                }
+                self.assertNotIn("oracle_protocol", columns)
+            finally:
+                backup_connection.close()
+
     def test_v7_migration_backs_up_once_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "state.db"
@@ -96,10 +339,10 @@ class StressStorageMigrationTests(unittest.TestCase):
                 connection.close()
 
             with Database(path) as database:
-                self.assertEqual(SCHEMA_VERSION, 12)
+                self.assertEqual(SCHEMA_VERSION, 16)
                 self.assertEqual(
                     database.connection.execute("PRAGMA user_version").fetchone()[0],
-                    12,
+                    16,
                 )
                 tables = {
                     row[0]
@@ -199,7 +442,7 @@ class StressStorageMigrationTests(unittest.TestCase):
             with Database(path) as database:
                 self.assertEqual(
                     database.connection.execute("PRAGMA user_version").fetchone()[0],
-                    12,
+                    16,
                 )
                 run = database.stress_run("legacy-run")
                 self.assertIsNotNone(run)
@@ -298,7 +541,7 @@ class StressStorageMigrationTests(unittest.TestCase):
             with Database(path) as database:
                 self.assertEqual(
                     database.connection.execute("PRAGMA user_version").fetchone()[0],
-                    12,
+                    16,
                 )
                 ai_columns = {
                     row[1]
@@ -398,7 +641,7 @@ class StressStorageMigrationTests(unittest.TestCase):
             with Database(path) as database:
                 self.assertEqual(
                     database.connection.execute("PRAGMA user_version").fetchone()[0],
-                    12,
+                    16,
                 )
                 tables = {
                     row[0]
@@ -490,7 +733,7 @@ class StressStorageMigrationTests(unittest.TestCase):
             with Database(path) as database:
                 self.assertEqual(
                     database.connection.execute("PRAGMA user_version").fetchone()[0],
-                    12,
+                    16,
                 )
 
     def test_failed_v11_migration_rolls_back_and_restart_succeeds(self) -> None:
@@ -531,7 +774,7 @@ class StressStorageMigrationTests(unittest.TestCase):
             with Database(path) as database:
                 self.assertEqual(
                     database.connection.execute("PRAGMA user_version").fetchone()[0],
-                    12,
+                    16,
                 )
 
     def test_failed_v10_migration_rolls_back_and_restart_succeeds(self) -> None:
@@ -565,7 +808,7 @@ class StressStorageMigrationTests(unittest.TestCase):
             with Database(path) as database:
                 self.assertEqual(
                     database.connection.execute("PRAGMA user_version").fetchone()[0],
-                    12,
+                    16,
                 )
                 columns = {
                     row[1]
@@ -606,7 +849,7 @@ class StressStorageMigrationTests(unittest.TestCase):
             with Database(path) as database:
                 self.assertEqual(
                     database.connection.execute("PRAGMA user_version").fetchone()[0],
-                    12,
+                    16,
                 )
                 columns = {
                     row[1]
@@ -645,7 +888,7 @@ class StressStorageMigrationTests(unittest.TestCase):
 
             with Database(path) as database:
                 self.assertEqual(
-                    database.connection.execute("PRAGMA user_version").fetchone()[0], 12
+                    database.connection.execute("PRAGMA user_version").fetchone()[0], 16
                 )
 
 
@@ -739,6 +982,25 @@ class StressStorageRepositoryTests(unittest.TestCase):
             self.db.update_stress_artifact_bundle(
                 "bundle-1", expected_revision=1, status="failed"
             )
+
+    def test_dual_reference_artifact_roles_are_persisted_in_protocol_order(self) -> None:
+        for role, suffix in (
+            ("reference_secondary", "ref2"),
+            ("generator", "gen"),
+            ("reference_primary", "ref1"),
+        ):
+            self.db.save_stress_artifact(
+                f"artifact-{role}",
+                bundle_id="bundle-1",
+                kind=role,
+                source_code=f"// {role}\n",
+                target_path=f"2026/8/8/CF1A.{suffix}.cpp",
+                source_kind="ai_generated",
+            )
+        self.assertEqual(
+            [row["kind"] for row in self.db.stress_artifacts("bundle-1")],
+            ["generator", "reference_primary", "reference_secondary"],
+        )
 
     def test_preparation_cache_bundle_lookup_and_metadata_merges(self) -> None:
         cached = self.db.save_stress_preparation_cache(
@@ -977,6 +1239,41 @@ class StressStorageRepositoryTests(unittest.TestCase):
             )[0]["certification_key"],
             "certification-1",
         )
+
+    def test_dual_reference_roles_and_certification_are_protocol_scoped(self) -> None:
+        generator = self._save_candidate("generator", "-dual")
+        primary = self._save_candidate("reference_primary", "-dual")
+        secondary = self._save_candidate("reference_secondary", "-dual")
+        certification = self.db.save_stress_bundle_certification(
+            "certification-dual",
+            platform="codeforces",
+            problem_id="1A",
+            oracle_protocol="dual_reference_v1",
+            generator_candidate_id=generator["id"],
+            reference_primary_candidate_id=primary["id"],
+            reference_secondary_candidate_id=secondary["id"],
+            certification_identity={"oracle_protocol": "dual_reference_v1"},
+        )
+        self.assertEqual(certification["oracle_protocol"], "dual_reference_v1")
+        self.assertIsNone(certification["brute_candidate_id"])
+        self.assertEqual(
+            self.db.stress_bundle_certifications(
+                oracle_protocol="dual_reference_v1"
+            )[0]["certification_key"],
+            "certification-dual",
+        )
+        with self.assertRaises(ValueError):
+            self.db.save_stress_bundle_certification(
+                "certification-mixed",
+                platform="codeforces",
+                problem_id="1A",
+                oracle_protocol="dual_reference_v1",
+                generator_candidate_id=generator["id"],
+                brute_candidate_id=primary["id"],
+                reference_primary_candidate_id=primary["id"],
+                reference_secondary_candidate_id=secondary["id"],
+                certification_identity={},
+            )
 
     def test_cache_alias_publish_uses_compare_and_swap(self) -> None:
         created = self.db.publish_stress_cache_alias(

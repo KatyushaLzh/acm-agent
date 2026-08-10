@@ -36,6 +36,8 @@ Python 3.13 标准库驱动的本地训练系统。网页是主要入口，CLI �
 .\acm.ps1 start CF1234A --with-stress
 .\acm.ps1 verify CF1234A
 .\acm.ps1 verify CF1234A --ai-stress
+.\acm.ps1 verify CF1234A --ai-stress --validator --strict  # validator 完整严格认证，失败不创建 run
+.\acm.ps1 verify CF1234A --ai-stress --minimal --unvalidated-large  # Dashboard 默认验证 + 极限大数据
 .\acm.ps1 close CF1234A
 .\acm.ps1 review week
 ```
@@ -44,7 +46,7 @@ Python 3.13 标准库驱动的本地训练系统。网页是主要入口，CLI �
 
 所有读取状态的命令都支持 `--json`。推荐输出包含数据新鲜度、位置、总分、每项分数和选择原因；平台同步失败不会删除最后一次成功快照。
 
-网页与 CLI 直接调用同一业务服务层，不通过子进程互相调用。旧版 `.acm/state.db` 会自动升级；v4→v5、v5→v6、v6→v7、v7→v8、v8→v9 和 v9→v10 前会分别通过 SQLite backup API 保存一次数据库备份。
+网页与 CLI 直接调用同一业务服务层，不通过子进程互相调用。受支持的旧版 `.acm/state.db` 会自动升级到当前 schema v16；直接打开 v4–v13 数据库时，会在首个受保护迁移前通过 SQLite backup API 创建相邻的版本化 `.bak`，已有备份不会被覆盖。
 
 ## DeepSeek BYOK 与 AI 工作台
 
@@ -65,9 +67,15 @@ $env:DEEPSEEK_API_KEY = "你的密钥"
 
 首次发送前，Dashboard 会提示数据出站范围。AI 推荐只发送最多 90 天/50 次尝试的结构化结果与冻结标签，不发送账号、notes、聊天、源码或本地路径；工作台对话会发送当前题面、有效标签、源码、attempt 和最近对话，但不会发送账号、文件路径或 API Key。`reasoning_content` 不展示也不保存。
 
-“本地验证”的 AI 持续对拍同样默认关闭。准备总 deadline 默认 600 秒，可配置为 60–1800 秒；默认档在 480 秒关闭 provider、590 秒结束本地门禁，最后 10 秒 shutdown/清理。单次 non-thinking、thinking、audit 上限为 120/180/50 秒，本地门禁预算不可借用；累计 provider usage 超过 100000 tokens 的 setup 必须 fail-closed，且不再启动后续请求。默认 `hybrid` fast-first，仅在明确机器诊断后使用 thinking；`fast` 全部 non-thinking，`full_thinking` 保留更高推理预算，900 秒可作为显式慢速档。generator 最多修复两次，validator/brute/reference 最多一次。DeepSeek 连接、读取、keep-alive、网络重试和 JSON 恢复共享绝对 deadline。可信 generator harness、独立 validator、来源白名单、安全审查、AppContainer、官方样例、16 个 small、边界和 large 门禁均保留；任何失败或超时都保留旧 helper 且不创建 run。
+“本地验证”的 AI 持续对拍同样默认关闭。准备总 deadline 默认 600 秒，可配置为 60–1800 秒；默认档在 480 秒关闭 provider、590 秒结束本地门禁，最后 10 秒 shutdown/清理。AI 不再生成 brute，而是优先从白名单来源搜索两份不同 URL、不同源码哈希的完整正确解候选；不足时以互相不可见、也不可见用户源码的独立请求生成满足最大约束的 reference。生成或下载的 artifact 会按机器诊断做有界修复，generator、每份 reference 与 validator 的具体上限由失败类别决定，部分源码安全或样例失败允许第二次修复。AppContainer、官方样例、16-case 变异检查、边界和 large 门禁均保留；Dashboard 的默认 Minimal 会跳过 validator 与 AI audit，并放宽通用 manifest/非-recipe coverage，但本地 recipe coverage 和 seed/output variation 仍执行。任何失败或超时都保留旧 helper 且不创建 run。
 
-contract schema v3 与 generator blueprint 在源码生成前本地验证证据、seed、覆盖闭合和 large 复杂度。profile-v2 manifest 的 stdout SHA、维度、coverage tags、records 和复杂度会在并行 small 集合及串行 large 门禁中验证。schema v12 保存角色 candidate/proof、联合 certification、cache alias 和结构化样例，并拆分 generation/certification identity。`cache_mode` 支持 `reuse`、`refresh_helpers`、`cold`，旧强制重生成映射为 cold；warm setup 保持 0 provider requests、0 tokens。
+validator 是可选的输入认证角色。默认不生成 validator，small 与 large 均运行 `reference_primary/reference_secondary`；两者一致后才能裁决用户解，两者不一致立即 `oracle_conflict`，不自动猜测或修复任一方。Dashboard 提供默认未勾选的“启用 validator（启用该选项会执行完整严格认证，显著提高AI对拍器正确性，但是成功生成率会显著下降）”选项；勾选后会要求 validator 生成、隐藏正负 probe 认证、源码安全、编译、AI audit、机器门禁和联合 preflight 全部成功。修复耗尽后任一步失败都不允许降级，不应用 helper、不创建 run，并统一报告 validator 严格认证失败。CLI 的等价用法是 `verify <ID> --ai-stress --validator --strict`；只有显式使用 `--validator` 且未加 `--strict` 时，才保留 `unvalidated` 降级与 `--unvalidated-large` 选项。新 helper 为 `<ID>.ref1.cpp/.ref2.cpp`，手动 CLI 入口为 `--generator-file/--reference-primary-file/--reference-secondary-file`；旧 `--reference-file/--brute-file` 仅作弃用别名。
+
+Dashboard 的 generator、两份 reference 和新增 Markdown 目标都通过系统原生文件选择器选择，不接受网页文本框手输路径。手动 helper 可以位于工作区外，但必须是现有的本机普通 `.cpp` 文件；服务只读原文件，将副本放入受管 staging 后仍执行源码审查、编译与 AppContainer 门禁。Markdown 选择器可选现有 `.md`，也可指定一个尚不存在的新 `.md`，注册时仍需完成“检查路径/schema → 再次确认保存”。AI 对拍准备不会暂停等待人工审核 contract 或输入修复提示；机器门禁失败时仅使用有界的模型自动修复，最终失败则直接安全停止。
+
+contract schema v3 与 generator blueprint 在源码生成前本地验证证据、seed、覆盖闭合和 large 复杂度。新 bundle 以 `dual_reference_v1` 保存双 reference candidate/proof/联合认证并与旧 `legacy_trio` 缓存隔离；validator 开关也是缓存身份的一部分。严格模式只复用同时具有 validator 源码 artifact、release executable、完整认证记录和 validator preflight 成功证据的 bundle；无 validator、曾降级或历史缓存不能满足严格模式。这里的“零误放”是针对这套现有门禁的 fail-closed 运行保证，不代表数学上证明 AI validator 绝对正确。旧 `.bf.cpp/.ref.cpp` bundle 只用于历史 run 的查看、恢复和回滚。
+
+静态输入 contract 先尝试完全本地的 `generator_recipe/v2`。当前 v2 只识别 `mutable_permutation` 与 `bracket_interval_queries` 两类 wire shape：本地编译器把 contract 的字段、范围、状态机和四个 profile-v2 case 绑定到内置、哈希绑定的 C++17 机器 runtime，不发送 recipe 请求，也不接收模型生成的 executable generator。受支持 v2 contract 的预验失败会 fail-closed，不回退到 AI。其他 contract 才尝试 `generator_recipe/v1`：AI 只选择白名单 `template_id`、serializer、参数绑定和语义目标，本地 composer 内联审计过的 primitive；再不支持才记录 `legacy_ai_cpp:<reason>`。两版都输出 `acm_generate_case(seed, profile, case_kind, out)` ABI；recipe/contract hash、catalog hash 与 composer version 进入 cache/checkpoint/certification identity，模板、license 或 provenance 变化会使缓存失效。v2 只消除 generator 的 provider 请求；contract 提取和两份 reference 的获取仍可能使用网络或模型。
 
 常用 CLI：
 
@@ -110,7 +118,7 @@ Agent 在网页服务未运行时可使用同一事务流程：
 
 preview JSON 会携带题单和全局覆盖两个修订号，CLI apply 会自动读取并校验。平台没有公开标签且用户明确要求补充时，仓库 `acm-workflow` skill 允许 Agent 只读取题面和元数据来生成专题标签，再通过上述 apply/API 写回托管题单；不得直接修改内置题单源文件。标签只描述题目专题，不代表 AC。
 
-`close` 始终先独立保存 attempt，不会自动修改知识库。“结束与复盘”可显式启用 DeepSeek Markdown 总结：根目录已有的 `algorithms.md`、`tricks.md` 会以固定 schema 自动成为已保存目标，其他 `.md` 可推断或自定义 schema。Dashboard 只显示可编辑 Markdown 与安全渲染预览，不展示 unified diff；确认 apply 前目标保持零修改。若 `Source` 题号完全相同，服务只把对应旧条目发送给 DeepSeek，与本次知识语义合并；标题相似但题号不同则新增条目。服务端继续以 proposal revision、基线哈希、备份、原子替换和 hash-guarded revert 保护写入。
+`close` 始终先独立保存 attempt，不会自动修改知识库。“结束与复盘”可显式启用 DeepSeek Markdown 总结：发行树根目录的脱敏 `algorithms.md`、`tricks.md` 示例模板会以固定 schema 自动成为已保存目标，其他 `.md` 可推断或自定义 schema。Dashboard 只显示可编辑 Markdown 与安全渲染预览，不展示 unified diff；确认 apply 前目标保持零修改。若 `Source` 题号完全相同，服务只把对应旧条目发送给 DeepSeek，与本次知识语义合并；标题相似但题号不同则新增条目。服务端继续以 proposal revision、基线哈希、备份、原子替换和 hash-guarded revert 保护写入。
 
 ## 开发验证
 

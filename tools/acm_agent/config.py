@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .ai_policy import DEFAULT_MODEL, DEFAULT_REASONING_EFFORT
+
 
 CONFIG_VERSION = 7
 STRESS_PREPARE_TIMEOUT_DEFAULT_SECONDS = 600
@@ -14,6 +16,7 @@ STRESS_PREPARE_TIMEOUT_MIN_SECONDS = 60
 STRESS_PREPARE_TIMEOUT_MAX_SECONDS = 1800
 STRESS_GENERATION_MODE_DEFAULT = "hybrid"
 STRESS_GENERATION_MODES = ("fast", "hybrid", "full_thinking")
+STRESS_CACHE_MODES = ("reuse", "refresh_helpers", "cold")
 
 
 @dataclass(frozen=True)
@@ -78,19 +81,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "timeout_seconds": 20,
     },
     "ai": {
-        "recommendation_model": "deepseek-v4-flash",
-        "coaching_model": "deepseek-v4-flash",
-        "summary_model": "deepseek-v4-flash",
-        "validation_model": "deepseek-v4-flash",
+        "recommendation_model": DEFAULT_MODEL,
+        "coaching_model": DEFAULT_MODEL,
+        "summary_model": DEFAULT_MODEL,
+        "validation_model": DEFAULT_MODEL,
         "recommendation_thinking": False,
         "coaching_thinking": True,
         "summary_thinking": True,
         "validation_thinking": True,
         "stress_prepare_timeout_seconds": STRESS_PREPARE_TIMEOUT_DEFAULT_SECONDS,
         "stress_generation_mode": STRESS_GENERATION_MODE_DEFAULT,
-        "reasoning_effort": "high",
-        "summary_reasoning_effort": "high",
-        "validation_reasoning_effort": "high",
+        "reasoning_effort": DEFAULT_REASONING_EFFORT,
+        "summary_reasoning_effort": DEFAULT_REASONING_EFFORT,
+        "validation_reasoning_effort": DEFAULT_REASONING_EFFORT,
     },
 }
 

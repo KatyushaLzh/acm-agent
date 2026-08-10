@@ -12,8 +12,16 @@ import shutil
 import subprocess
 import time
 from typing import Sequence
+import uuid
 
 from .workspace import ProblemRef, find_solution, parse_problem_ref
+
+
+# ASan/UBSan instrumentation costs several times the release runtime.  Reusing
+# the caller's wall-clock budget unchanged made ``--debug`` runs report TLE for
+# solutions that are comfortably in limit without sanitizers, which reads as a
+# real performance failure rather than as measurement overhead.
+_SANITIZER_TIMEOUT_SCALE = 4.0
 
 
 @dataclass(slots=True)
@@ -58,7 +66,15 @@ def sanitizer_supported(
     timeout: float = 15.0,
 ) -> tuple[bool, str]:
     """Probe both sanitizer linking and runtime before enabling debug flags."""
-    output = Path(build_dir) / ("sanitizer-probe.exe" if os.name == "nt" else "sanitizer-probe")
+    # A unique name per probe: a fixed name lets two concurrent verifies race on
+    # the same path, where one process can execute the other's half-written
+    # binary.  The probe is also removed in ``finally`` so it never accumulates
+    # in the managed build directory -- a leftover sanitizer-instrumented
+    # executable is both dead weight and a false positive for antivirus.
+    output = Path(build_dir) / (
+        f"sanitizer-probe-{os.getpid()}-{uuid.uuid4().hex}"
+        f"{'.exe' if os.name == 'nt' else ''}"
+    )
     command = [
         compiler,
         "-x",
@@ -93,6 +109,13 @@ def sanitizer_supported(
         return True, ""
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
+    finally:
+        try:
+            output.unlink(missing_ok=True)
+        except OSError:
+            # Windows can hold the image briefly after the child exits; a
+            # leftover probe is harmless next to failing the capability check.
+            pass
 
 
 def verify_problem(
@@ -140,6 +163,17 @@ def verify_problem(
                 + diagnostic.strip()[:500]
             )
 
+    # Sanitizer flags reach the solution, brute force and generator alike, so
+    # every timed run in this call needs the widened budget.
+    runtime_timeout = timeout
+    if sanitizer == "enabled":
+        runtime_timeout = timeout * _SANITIZER_TIMEOUT_SCALE
+        warnings.append(
+            f"sanitizers enabled; per-run timeout widened {timeout:.1f}s -> "
+            f"{runtime_timeout:.1f}s so instrumentation overhead is not "
+            f"reported as TLE"
+        )
+
     command = [resolved_compiler, *flags, str(source), "-o", str(executable)]
     compile_process = _run(command, timeout=max(15.0, timeout))
     compile_output = (compile_process.stdout + compile_process.stderr).decode(errors="replace")
@@ -158,7 +192,9 @@ def verify_problem(
 
     cases_dir = root_path / ".acm" / "cases" / ref.key
     if cases_dir.is_dir():
-        result.cases = _run_cases(executable, cases_dir, exact=exact, timeout=timeout)
+        result.cases = _run_cases(
+            executable, cases_dir, exact=exact, timeout=runtime_timeout
+        )
 
     brute_source = source.with_name(f"{ref.problem_id}.bf.cpp")
     generator_source = source.with_name(f"{ref.problem_id}.gen.cpp")
@@ -171,7 +207,7 @@ def verify_problem(
             resolved_compiler,
             flags,
             build_dir,
-            timeout=timeout,
+            timeout=runtime_timeout,
             iterations=stress_iterations,
             seed=seed,
         )
@@ -225,14 +261,29 @@ def _run(
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        return subprocess.CompletedProcess(
+        result = subprocess.CompletedProcess(
             list(command),
             124,
             exc.stdout or b"",
             (exc.stderr or b"") + b"\nprocess timed out",
         )
+        # Tagged rather than signalled by the return code so that a child
+        # genuinely exiting 124 is not misreported as a timeout.
+        result.acm_timed_out = True  # type: ignore[attr-defined]
+        return result
     except OSError as exc:
         return subprocess.CompletedProcess(list(command), 127, b"", str(exc).encode())
+
+
+def _timed_out(process: subprocess.CompletedProcess[bytes]) -> bool:
+    """Report whether ``_run`` aborted this process on its own deadline.
+
+    The synthesized timeout exit code (124) is indistinguishable from a child
+    that genuinely exited with 124, so timeout detection must read the marker
+    ``_run`` attaches rather than the exit code.  ``124`` is still returned for
+    compatibility with anything matching on it.
+    """
+    return bool(getattr(process, "acm_timed_out", False))
 
 
 def _run_cases(
@@ -253,7 +304,7 @@ def _run_cases(
             [str(executable)], input_data=input_path.read_bytes(), timeout=timeout
         )
         elapsed_ms = round((time.monotonic() - started) * 1000)
-        if process.returncode == 124:
+        if _timed_out(process):
             results.append(CaseResult(input_path.stem, False, "timeout", elapsed_ms))
         elif process.returncode != 0:
             results.append(
@@ -312,7 +363,7 @@ def _run_stress(
             return "failed", offset, None, warnings
         fast = _run([str(solution)], input_data=generated.stdout, timeout=timeout)
         brute_run = _run([str(brute)], input_data=generated.stdout, timeout=timeout)
-        if fast.returncode == 124 or brute_run.returncode == 124:
+        if _timed_out(fast) or _timed_out(brute_run):
             failure = _save_failure(
                 build_dir,
                 ref,

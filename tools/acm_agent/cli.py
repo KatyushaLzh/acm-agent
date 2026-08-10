@@ -7,16 +7,36 @@ import sys
 import time
 from typing import Any, Mapping, Sequence
 
+from .ai_policy import ALLOWED_MODELS, ALLOWED_REASONING_EFFORTS
+from .config import (
+    STRESS_CACHE_MODES,
+    STRESS_GENERATION_MODES,
+    STRESS_PREPARE_TIMEOUT_MAX_SECONDS,
+    STRESS_PREPARE_TIMEOUT_MIN_SECONDS,
+)
+from .knowledge import PRESET_NAMES
 # Re-exported dependencies keep existing CLI monkey-patch integrations stable.
 from .platforms import CodeforcesClient, LuoguClient, sync_codeforces, sync_luogu
 from .service import AcmService, FAILURE_MODES, RESULTS
 from .verify import verify_problem
 
 
+MODEL_CHOICES = tuple(sorted(ALLOWED_MODELS))
+REASONING_EFFORT_CHOICES = tuple(sorted(ALLOWED_REASONING_EFFORTS))
+KNOWLEDGE_PRESET_CHOICES = (*PRESET_NAMES, "custom")
+KNOWLEDGE_SCHEMA_MODE_CHOICES = ("auto", "stored", "ai")
+STRESS_GENERATION_CLI_CHOICES = tuple(
+    mode.replace("_", "-") for mode in STRESS_GENERATION_MODES
+)
+
+
 def _stress_prepare_timeout(value: str) -> int:
     seconds = int(value)
-    if not 60 <= seconds <= 1800:
-        raise argparse.ArgumentTypeError("准备耗时上限必须在 60..1800 秒之间")
+    if not STRESS_PREPARE_TIMEOUT_MIN_SECONDS <= seconds <= STRESS_PREPARE_TIMEOUT_MAX_SECONDS:
+        raise argparse.ArgumentTypeError(
+            "准备耗时上限必须在 "
+            f"{STRESS_PREPARE_TIMEOUT_MIN_SECONDS}..{STRESS_PREPARE_TIMEOUT_MAX_SECONDS} 秒之间"
+        )
     return seconds
 
 
@@ -442,12 +462,16 @@ def command_verify(args: argparse.Namespace, paths: Any) -> int:
         payload = service.ai_stress_start(
             args.problem,
             generate_generator=True,
-            generate_brute=True,
-            prepare_reference=True,
+            prepare_reference_primary=True,
+            prepare_reference_secondary=True,
             large_profile=not args.no_large,
+            include_validator=args.validator,
+            allow_validator_degradation=not args.strict,
+            unvalidated_large=args.unvalidated_large,
+            minimal_verification=args.minimal,
             compare="exact" if args.exact else "token",
             timeout=args.timeout,
-            brute_timeout=5.0,
+            reference_secondary_timeout=5.0,
             seed=args.seed,
             preparation_timeout_seconds=args.prepare_timeout,
             force_regenerate=args.force_regenerate,
@@ -457,12 +481,40 @@ def command_verify(args: argparse.Namespace, paths: Any) -> int:
                 if args.generation_mode is not None
                 else None
             ),
+            reference_primary_file=args.reference_primary_file,
+            reference_secondary_file=args.reference_secondary_file,
+            brute_file=args.brute_file,
+            reference_file=args.reference_file,
+            generator_file=args.generator_file,
         )
         run = payload.get("run", payload)
         run_id = run.get("id") or run.get("run_id") or payload.get("run_id") or "unknown"
         if not args.json:
+            for deprecated in payload.get("deprecations", []):
+                replacement = (
+                    "--reference-primary-file"
+                    if deprecated == "reference_file"
+                    else "--reference-secondary-file"
+                )
+                print(f"提示：--{deprecated.replace('_', '-')} 已弃用，请改用 {replacement}")
             print(f"AI 持续对拍已启动：{run_id}（Ctrl+C 安全停止）")
-        return _wait_for_stress_cli(service, run_id, payload, as_json=args.json)
+            if bool(payload.get("unvalidated")):
+                print(
+                    "警告：validator 认证失败，本次对拍进入降级模式——large case 已关闭，"
+                    "判定仅由小数据双 reference 交叉门禁保证；AI 生成的 helper 仍有小概率出错，"
+                    "若出现 mismatch 请重试一次确认。"
+                )
+        terminal_code = _wait_for_stress_cli(service, run_id, payload, as_json=args.json)
+        if (
+            not args.json
+            and bool(payload.get("unvalidated"))
+            and terminal_code != 0
+        ):
+            print(
+                "提示：以上失败可能来自 AI 生成的 helper 而非题解。"
+                "可重新运行 --ai-stress 重试（不影响你的题解文件）。"
+            )
+        return terminal_code
     payload = _service(paths).verify(
         args.problem,
         exact=args.exact,
@@ -795,7 +847,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     nxt.add_argument("--plan", dest="plan_ids", action="append", help="限定已启用题单，可重复")
     nxt.add_argument("--ai", action="store_true", help="显式使用 DeepSeek 对确定性候选重排")
-    nxt.add_argument("--model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
+    nxt.add_argument("--model", choices=MODEL_CHOICES)
     nxt.add_argument("--json", action="store_true")
     nxt.set_defaults(handler=command_next)
 
@@ -805,20 +857,20 @@ def build_parser() -> argparse.ArgumentParser:
     ai_status.add_argument("--json", action="store_true")
     ai_status.set_defaults(handler=command_ai_status)
     ai_test = ai_sub.add_parser("test")
-    ai_test.add_argument("--model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
+    ai_test.add_argument("--model", choices=MODEL_CHOICES)
     ai_test.add_argument("--json", action="store_true")
     ai_test.set_defaults(handler=command_ai_test)
     ai_settings = ai_sub.add_parser("settings")
-    ai_settings.add_argument("--recommend-model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
-    ai_settings.add_argument("--coach-model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
-    ai_settings.add_argument("--summary-model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
-    ai_settings.add_argument("--validation-model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
+    ai_settings.add_argument("--recommend-model", choices=MODEL_CHOICES)
+    ai_settings.add_argument("--coach-model", choices=MODEL_CHOICES)
+    ai_settings.add_argument("--summary-model", choices=MODEL_CHOICES)
+    ai_settings.add_argument("--validation-model", choices=MODEL_CHOICES)
     ai_settings.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=None)
-    ai_settings.add_argument("--reasoning-effort", choices=("high", "max"))
+    ai_settings.add_argument("--reasoning-effort", choices=REASONING_EFFORT_CHOICES)
     ai_settings.add_argument("--summary-thinking", action=argparse.BooleanOptionalAction, default=None)
-    ai_settings.add_argument("--summary-reasoning-effort", choices=("high", "max"))
+    ai_settings.add_argument("--summary-reasoning-effort", choices=REASONING_EFFORT_CHOICES)
     ai_settings.add_argument("--validation-thinking", action=argparse.BooleanOptionalAction, default=None)
-    ai_settings.add_argument("--validation-reasoning-effort", choices=("high", "max"))
+    ai_settings.add_argument("--validation-reasoning-effort", choices=REASONING_EFFORT_CHOICES)
     ai_settings.add_argument("--json", action="store_true")
     ai_settings.set_defaults(handler=command_ai_settings)
 
@@ -845,7 +897,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("message", nargs="?")
     ask.add_argument("--mode", choices=("hint", "explain", "review"), default="hint")
     ask.add_argument("--hint-level", type=int, default=1)
-    ask.add_argument("--model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
+    ask.add_argument("--model", choices=MODEL_CHOICES)
     ask.add_argument("--conversation")
     ask.add_argument("--json", action="store_true")
     ask.set_defaults(handler=command_ask)
@@ -855,7 +907,7 @@ def build_parser() -> argparse.ArgumentParser:
     patch_preview = patch_sub.add_parser("preview")
     patch_preview.add_argument("problem")
     patch_preview.add_argument("instruction", nargs="?")
-    patch_preview.add_argument("--model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
+    patch_preview.add_argument("--model", choices=MODEL_CHOICES)
     patch_preview.add_argument("--conversation")
     patch_preview.add_argument("--json", action="store_true")
     patch_preview.set_defaults(handler=command_patch_preview)
@@ -884,8 +936,8 @@ def build_parser() -> argparse.ArgumentParser:
     knowledge_target_add = knowledge_targets_sub.add_parser("add")
     knowledge_target_add.add_argument("path", type=Path)
     knowledge_target_add.add_argument("--name")
-    knowledge_target_add.add_argument("--preset", choices=("algorithms-v1", "tricks-v1", "custom"))
-    knowledge_target_add.add_argument("--schema-mode", choices=("auto", "stored", "ai"), default="auto")
+    knowledge_target_add.add_argument("--preset", choices=KNOWLEDGE_PRESET_CHOICES)
+    knowledge_target_add.add_argument("--schema-mode", choices=KNOWLEDGE_SCHEMA_MODE_CHOICES, default="auto")
     knowledge_target_add.add_argument("--schema-file", type=Path)
     knowledge_target_add.add_argument("--allow-create", action="store_true", help="允许注册尚不存在的 .md；此命令不会创建文件")
     knowledge_target_add.add_argument("--json", action="store_true")
@@ -893,8 +945,8 @@ def build_parser() -> argparse.ArgumentParser:
     knowledge_target_update = knowledge_targets_sub.add_parser("update")
     knowledge_target_update.add_argument("target_id")
     knowledge_target_update.add_argument("--name")
-    knowledge_target_update.add_argument("--preset", choices=("algorithms-v1", "tricks-v1", "custom"))
-    knowledge_target_update.add_argument("--schema-mode", choices=("auto", "stored", "ai"))
+    knowledge_target_update.add_argument("--preset", choices=KNOWLEDGE_PRESET_CHOICES)
+    knowledge_target_update.add_argument("--schema-mode", choices=KNOWLEDGE_SCHEMA_MODE_CHOICES)
     knowledge_target_update.add_argument("--schema-file", type=Path)
     knowledge_target_update.add_argument("--enabled", action=argparse.BooleanOptionalAction, default=None)
     knowledge_target_update.add_argument("--expected-revision", type=int, required=True)
@@ -909,8 +961,8 @@ def build_parser() -> argparse.ArgumentParser:
     knowledge_inspect = knowledge_sub.add_parser("inspect", help="只读检查 Markdown 路径与 schema")
     knowledge_inspect.add_argument("path", type=Path)
     knowledge_inspect.add_argument("--allow-create", action="store_true")
-    knowledge_inspect.add_argument("--preset", choices=("algorithms-v1", "tricks-v1", "custom"))
-    knowledge_inspect.add_argument("--schema-mode", choices=("auto", "stored", "ai"), default="auto")
+    knowledge_inspect.add_argument("--preset", choices=KNOWLEDGE_PRESET_CHOICES)
+    knowledge_inspect.add_argument("--schema-mode", choices=KNOWLEDGE_SCHEMA_MODE_CHOICES, default="auto")
     knowledge_inspect.add_argument("--schema-file", type=Path)
     knowledge_inspect.add_argument("--json", action="store_true")
     knowledge_inspect.set_defaults(handler=command_knowledge_inspect)
@@ -918,10 +970,10 @@ def build_parser() -> argparse.ArgumentParser:
     knowledge_preview = knowledge_sub.add_parser("preview", help="调用 DeepSeek 生成持久化预览，不写文件")
     knowledge_preview.add_argument("attempt_id", type=int)
     knowledge_preview.add_argument("target_id")
-    knowledge_preview.add_argument("--schema-mode", choices=("auto", "stored", "ai"), default="stored")
-    knowledge_preview.add_argument("--preset", choices=("algorithms-v1", "tricks-v1", "custom"))
+    knowledge_preview.add_argument("--schema-mode", choices=KNOWLEDGE_SCHEMA_MODE_CHOICES, default="stored")
+    knowledge_preview.add_argument("--preset", choices=KNOWLEDGE_PRESET_CHOICES)
     knowledge_preview.add_argument("--schema-file", type=Path)
-    knowledge_preview.add_argument("--model", choices=("deepseek-v4-flash", "deepseek-v4-pro"))
+    knowledge_preview.add_argument("--model", choices=MODEL_CHOICES)
     knowledge_preview.add_argument("--json", action="store_true")
     knowledge_preview.set_defaults(handler=command_knowledge_preview)
     knowledge_refresh = knowledge_sub.add_parser("refresh", help="用编辑后的条目刷新安全预览，不调用模型")
@@ -965,6 +1017,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="AI 持续对拍只运行可人工验证的小数据，不运行极限大数据",
     )
     verify.add_argument(
+        "--strict",
+        action="store_true",
+        help="validator 认证失败时不允许降级：保持原有失败行为",
+    )
+    verify.add_argument(
+        "--minimal",
+        action="store_true",
+        help="最小验证模式：只生成 contract/generator/两份 reference，"
+        "跳过 validator、AI audit 与 manifest/coverage/seed 门禁，"
+        "判定仅靠官方样例与 small 双 reference oracle",
+    )
+    verify.add_argument(
+        "--unvalidated-large",
+        action="store_true",
+        help="降级（无 validator）模式下仍显式运行极限大数据，接受小概率误报风险",
+    )
+    verify.add_argument(
+        "--validator",
+        action="store_true",
+        help="显式生成独立 validator 并启用隐藏 probe 认证；"
+        "默认不生成，输入合法性由 generator 与 manifest 检查负责",
+    )
+    verify.add_argument(
         "--prepare-timeout",
         type=_stress_prepare_timeout,
         metavar="SECONDS",
@@ -977,13 +1052,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify.add_argument(
         "--cache-mode",
-        choices=("reuse", "refresh_helpers", "cold"),
+        choices=STRESS_CACHE_MODES,
         help="准备缓存策略（默认 reuse；cold 绕过所有本地读取）",
     )
     verify.add_argument(
         "--generation-mode",
-        choices=("fast", "hybrid", "full-thinking"),
+        choices=STRESS_GENERATION_CLI_CHOICES,
         help="helper 生成策略（默认读取配置；full-thinking 映射为 full_thinking）",
+    )
+    verify.add_argument(
+        "--reference-primary-file",
+        type=Path,
+        help="手动指定第一份 reference 源码（仍执行全部机器门禁）",
+    )
+    verify.add_argument(
+        "--reference-secondary-file",
+        type=Path,
+        help="手动指定第二份独立 reference 源码（仍执行全部机器门禁）",
+    )
+    verify.add_argument(
+        "--brute-file",
+        type=Path,
+        help="已弃用：等价于 --reference-secondary-file",
+    )
+    verify.add_argument(
+        "--reference-file",
+        type=Path,
+        help="已弃用：等价于 --reference-primary-file",
+    )
+    verify.add_argument(
+        "--generator-file",
+        type=Path,
+        help="手动指定 generator adapter 源码文件（跳过 AI 生成与 blueprint；仍跑全部机器门禁）",
     )
     verify.add_argument("--json", action="store_true")
     verify.set_defaults(handler=command_verify)

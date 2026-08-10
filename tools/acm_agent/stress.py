@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import copy
 from datetime import datetime
 import hashlib
 import json
@@ -18,34 +19,58 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import threading
 import time
 from typing import Callable, Mapping, Protocol, Sequence
 import uuid
+
+from .canonical import canonical_json_bytes
+from .stress_recipe import SMALL_EXHAUSTIVE_MAX_BYTES
+from .stress_search import CaseRequest, SearchDriver
 
 
 MAX_CPP_BYTES = 256 * 1024
 MAX_STREAM_BYTES = 2 * 1024 * 1024
 MAX_LARGE_INPUT_BYTES = 32 * 1024 * 1024
 MAX_LARGE_OUTPUT_BYTES = 16 * 1024 * 1024
-BRUTE_SKIPPED_LARGE_OUTPUT = b"BRUTE_NOT_RUN_FOR_LARGE_PROFILE\n"
+# Small inputs get exactly two attempts: the initial human-checkable budget,
+# then the global stream ceiling.  Escalating in small steps would let a
+# structurally broken generator walk from 100 bytes to 2 MiB, spending a
+# sandboxed generator run per step until the local-validation window is gone and
+# the only diagnostic left is "budget exhausted" instead of the real defect.
+# One jump keeps the legal-but-larger case working while a genuinely broken
+# generator fails closed after two runs with its own failure attached.
+SMALL_INPUT_INITIAL_BYTES = 100
+SMALL_INPUT_CEILING_BYTES = MAX_STREAM_BYTES
+DUAL_REFERENCE_PROTOCOL = "dual_reference_v1"
+LEGACY_TRIO_PROTOCOL = "legacy_trio"
 DEFAULT_MEMORY_BYTES = 512 * 1024 * 1024
 _LAUNCHER_BUILD_LOCK = threading.Lock()
 _DETAIL_UNSET = object()
-_GENERATOR_SUPPORTED_CASES = [
+_GENERATOR_REQUIRED_CASES = [
     {"profile": "small", "case_kind": "lower_bound"},
     {"profile": "small", "case_kind": "random"},
     {"profile": "large", "case_kind": "upper_bound"},
     {"profile": "large", "case_kind": "random"},
 ]
+# Kept as a named case for scheduling/backward-compatible imports.  It is no
+# longer optional: minimal verification always exercises it, so capability and
+# generation policy must require it end-to-end.
+_GENERATOR_OPTIONAL_CASE = {"profile": "small", "case_kind": "lower_bound"}
+_GENERATOR_SUPPORTED_CASES = list(_GENERATOR_REQUIRED_CASES)
 _GENERATOR_CAPABILITY_EXPECTED = {
     "profile_version": 2,
+    # v1 remains the compatibility baseline; the accepted-version list records
+    # the additive v2 protocol for newer local recipe generators.
     "manifest_version": 1,
+    "manifest_version_contains": [1, 2],
     "profiles_contains": ["small", "large"],
-    "case_kinds_contains": ["lower_bound", "upper_bound", "random"],
-    "supported_cases": _GENERATOR_SUPPORTED_CASES,
+    "case_kinds_contains": ["upper_bound", "random"],
+    "required_supported_cases": _GENERATOR_REQUIRED_CASES,
+    "small_lower_bound_required": True,
 }
-_GENERATOR_MANIFEST_KEYS = {
+_GENERATOR_MANIFEST_V1_KEYS = {
     "manifest_version",
     "profile",
     "case_kind",
@@ -56,6 +81,20 @@ _GENERATOR_MANIFEST_KEYS = {
     "records",
     "total_complexity",
 }
+_GENERATOR_MANIFEST_V2_EXTRA_KEYS = {
+    "engine",
+    "recipe_source",
+    "state_machine",
+    "section_family",
+    "operation_family",
+    "planned_byte_bucket",
+    "actual_byte_bucket",
+}
+_GENERATOR_MANIFEST_V2_KEYS = (
+    _GENERATOR_MANIFEST_V1_KEYS | _GENERATOR_MANIFEST_V2_EXTRA_KEYS
+)
+# Historical private alias kept for v1-focused tests and diagnostics.
+_GENERATOR_MANIFEST_KEYS = _GENERATOR_MANIFEST_V1_KEYS
 
 
 class StressError(RuntimeError):
@@ -64,6 +103,27 @@ class StressError(RuntimeError):
 
 class SourceSafetyError(StressError):
     """Raised when generated or downloaded C++ violates the source policy."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        rule_id: str = "source_policy",
+        matched_token: str = "",
+        line: int | None = None,
+        column: int | None = None,
+        excerpt: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.details: dict[str, object] = {"rule_id": str(rule_id)[:80]}
+        if matched_token:
+            self.details["matched_token"] = str(matched_token)[:80]
+        if line is not None:
+            self.details["line"] = max(1, int(line))
+        if column is not None:
+            self.details["column"] = max(1, int(column))
+        if excerpt:
+            self.details["excerpt"] = str(excerpt)[:240]
 
 
 class SandboxUnavailableError(StressError):
@@ -167,6 +227,45 @@ class SandboxProcessResult:
         return self.returncode == 0 and not self.timed_out and not self.output_limited
 
 
+_SANDBOX_ENV_NAME_RE = re.compile(r"\A[A-Z][A-Z0-9_]*\Z")
+_SANDBOX_ENV_ALLOWED_PREFIX = "ACM_STRESS_"
+_SANDBOX_ENV_MAX_VALUE_BYTES = 4096
+
+
+def _sandbox_env_entries(
+    env: Mapping[str, str] | None,
+) -> list[tuple[str, str]]:
+    """Validate caller-supplied sandbox environment entries.
+
+    The launcher hands the child a deliberately minimal, launcher-controlled
+    environment.  Callers may add deterministic stress knobs but nothing else:
+    only ``ACM_STRESS_*`` names are accepted, and values may not contain NUL
+    (which would truncate the Windows environment block) or a newline (which
+    would corrupt meta/diagnostic parsing).  Anything else raises rather than
+    being silently dropped, because a seed that fails to reach the generator
+    produces a non-reproducible run that looks successful.
+    """
+    if not env:
+        return []
+    entries: list[tuple[str, str]] = []
+    for raw_name, raw_value in env.items():
+        name = str(raw_name)
+        value = str(raw_value)
+        if not _SANDBOX_ENV_NAME_RE.match(name):
+            raise ValueError(f"invalid sandbox environment name: {name!r}")
+        if not name.startswith(_SANDBOX_ENV_ALLOWED_PREFIX):
+            raise ValueError(
+                f"sandbox environment name must start with "
+                f"{_SANDBOX_ENV_ALLOWED_PREFIX}: {name!r}"
+            )
+        if "\x00" in value or "\n" in value or "\r" in value:
+            raise ValueError(f"invalid sandbox environment value for {name}")
+        if len(value.encode("utf-8")) > _SANDBOX_ENV_MAX_VALUE_BYTES:
+            raise ValueError(f"sandbox environment value too large for {name}")
+        entries.append((name, value))
+    return sorted(entries)
+
+
 class SandboxBackend(Protocol):
     """Execution boundary for untrusted helper and reference programs."""
 
@@ -210,29 +309,57 @@ def probe_generator_v2(
         capabilities = None
     profiles = capabilities.get("profiles") if isinstance(capabilities, dict) else None
     case_kinds = capabilities.get("case_kinds") if isinstance(capabilities, dict) else None
+    supported_cases = (
+        capabilities.get("supported_cases")
+        if isinstance(capabilities, dict)
+        else None
+    )
+    valid_supported_cases = (
+        isinstance(supported_cases, list)
+        and supported_cases == _GENERATOR_REQUIRED_CASES
+    )
+    declared_case_kinds = (
+        {str(item) for item in case_kinds} if isinstance(case_kinds, list) else set()
+    )
     valid = (
         failure is None
         and isinstance(capabilities, dict)
         and type(capabilities.get("profile_version")) is int
         and capabilities.get("profile_version") == 2
         and type(capabilities.get("manifest_version")) is int
-        and capabilities.get("manifest_version") == 1
+        and capabilities.get("manifest_version") in {1, 2}
         and isinstance(profiles, list)
         and {"small", "large"}.issubset({str(item) for item in profiles})
         and isinstance(case_kinds, list)
-        and {"lower_bound", "upper_bound", "random"}.issubset(
-            {str(item) for item in case_kinds}
-        )
-        and capabilities.get("supported_cases") == _GENERATOR_SUPPORTED_CASES
+        and {"lower_bound", "upper_bound", "random"}.issubset(declared_case_kinds)
+        and valid_supported_cases
     )
     if not valid:
         raise GeneratorCapabilityError(
             "generator does not declare the complete stress profile-v2 manifest "
             "capability; regenerate helpers",
-            expected=_GENERATOR_CAPABILITY_EXPECTED,
+            # Deep-copied: details travel into diagnostics, JSON payloads and
+            # persisted validation records, and a caller mutating them must not
+            # corrupt the module constant (nor the nested case lists it shares
+            # with _GENERATOR_REQUIRED_CASES) for the rest of the process.
+            expected=copy.deepcopy(_GENERATOR_CAPABILITY_EXPECTED),
             actual=capabilities,
         )
     return dict(capabilities)
+
+
+# Static linking is a correctness and security requirement for the launcher, not
+# an optimisation.  The launcher is the trusted half of the execution boundary, so
+# it must not resolve libstdc++/libgcc from the ambient PATH: when a different
+# MinGW runtime shadows the toolchain that compiled it (Git-for-Windows ships a
+# copy that commonly precedes the real toolchain), the launcher faults inside
+# std::ifstream before it can write its meta file.  The caller then sees only an
+# opaque ``launcher exited 3221225477`` and every sandboxed run on the machine
+# fails closed.
+_LAUNCHER_COMPILE_FLAGS: tuple[str, ...] = (
+    "-std=c++17", "-O2", "-municode", "-static",
+)
+_LAUNCHER_LINK_FLAGS: tuple[str, ...] = ("-ladvapi32", "-lole32")
 
 
 class WindowsAppContainerBackend:
@@ -260,6 +387,7 @@ class WindowsAppContainerBackend:
         self.root = Path(root).resolve() if root is not None else None
         self._build_error = ""
         self._active: subprocess.Popen[bytes] | None = None
+        self._active_cancel_path: Path | None = None
         self._lock = threading.Lock()
         self._cancel_requested = threading.Event()
 
@@ -284,7 +412,19 @@ class WindowsAppContainerBackend:
         native_dir.mkdir(parents=True, exist_ok=True)
         output = native_dir / "appcontainer_runner.exe"
         stamp = native_dir / "appcontainer_runner.sha256"
-        expected = sha256_file(source)
+        # The stamp covers the build flags as well as the source.  A launcher
+        # produced by an older flag set is otherwise indistinguishable from a
+        # current one, so a flag correction would never reach a machine that
+        # already holds a stale binary.
+        expected = sha256_bytes(
+            b"\x00".join(
+                [
+                    sha256_file(source).encode("ascii"),
+                    *[flag.encode("utf-8") for flag in _LAUNCHER_COMPILE_FLAGS],
+                    *[flag.encode("utf-8") for flag in _LAUNCHER_LINK_FLAGS],
+                ]
+            )
+        )
         if output.is_file() and stamp.is_file() and stamp.read_text(encoding="ascii").strip() == expected:
             self.launcher = output
             return
@@ -292,8 +432,8 @@ class WindowsAppContainerBackend:
         try:
             built = subprocess.run(
                 [
-                    "g++", "-std=c++17", "-O2", "-municode", str(source),
-                    "-o", str(temporary), "-ladvapi32", "-lole32",
+                    "g++", *_LAUNCHER_COMPILE_FLAGS, str(source),
+                    "-o", str(temporary), *_LAUNCHER_LINK_FLAGS,
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -350,7 +490,8 @@ class WindowsAppContainerBackend:
         env: Mapping[str, str] | None = None,
         limits: SandboxLimits | None = None,
     ) -> SandboxProcessResult:
-        self._cancel_requested.clear()
+        if self._cancel_requested.is_set():
+            return SandboxProcessResult(list(command), 130)
         capability = self.probe()
         if not capability.available:
             raise SandboxUnavailableError(capability.reason)
@@ -368,6 +509,7 @@ class WindowsAppContainerBackend:
         stdout_path = sandbox_dir / f".{request_id}.stdout"
         stderr_path = sandbox_dir / f".{request_id}.stderr"
         meta_path = sandbox_dir / f".{request_id}.meta"
+        cancel_path = sandbox_dir / f".{request_id}.cancel"
         stdin_path.write_bytes(input_data or b"")
         argv = [
             str(self.launcher), "--run",
@@ -375,12 +517,15 @@ class WindowsAppContainerBackend:
             "--stdout", str(stdout_path),
             "--stderr", str(stderr_path),
             "--meta", str(meta_path),
+            "--cancel", str(cancel_path),
             "--timeout-ms", str(max(1, round(selected.timeout_seconds * 1000))),
             "--memory", str(selected.memory_bytes),
             "--stdout-limit", str(selected.stdout_bytes),
             "--stderr-limit", str(selected.stderr_bytes),
-            "--", *[str(item) for item in command],
         ]
+        for name, value in _sandbox_env_entries(env):
+            argv += ["--env", f"{name}={value}"]
+        argv += ["--", *[str(item) for item in command]]
         started = time.monotonic()
         process = subprocess.Popen(
             argv,
@@ -390,29 +535,45 @@ class WindowsAppContainerBackend:
         )
         with self._lock:
             self._active = process
+            self._active_cancel_path = cancel_path
             # ``cancel`` may race with Popen between the early cancellation
-            # check and publishing ``_active``.  Recheck while holding the
-            # same lock used by cancel so that every interleaving either kills
-            # this process here or exposes it to cancel.
+            # check and publishing the marker path.  Recheck while holding the
+            # same lock used by cancel so every interleaving leaves a marker
+            # for the launcher to consume after it has safely assigned the
+            # AppContainer child to its kill-on-close Job Object.
             cancel_after_launch = self._cancel_requested.is_set()
-        if cancel_after_launch and process.poll() is None:
-            process.kill()
+        if cancel_after_launch:
+            try:
+                cancel_path.write_bytes(b"cancel\n")
+            except OSError:
+                pass
         try:
             launcher_stdout, launcher_stderr = process.communicate(
                 timeout=max(5.0, selected.timeout_seconds + 3.0)
             )
         except subprocess.TimeoutExpired:
-            process.kill()
-            launcher_stdout, launcher_stderr = process.communicate()
-            for path in (stdin_path, stdout_path, stderr_path, meta_path):
+            try:
+                cancel_path.write_bytes(b"cancel\n")
+            except OSError:
+                pass
+            try:
+                launcher_stdout, launcher_stderr = process.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                launcher_stdout, launcher_stderr = process.communicate()
+            cancelled = self._cancel_requested.is_set()
+            for path in (stdin_path, stdout_path, stderr_path, meta_path, cancel_path):
                 path.unlink(missing_ok=True)
             return SandboxProcessResult(
-                list(command), 124, b"", launcher_stderr[: selected.stderr_bytes],
-                round((time.monotonic() - started) * 1000), timed_out=True,
+                list(command), 130 if cancelled else 124, b"",
+                launcher_stderr[: selected.stderr_bytes],
+                round((time.monotonic() - started) * 1000),
+                timed_out=not cancelled,
             )
         finally:
             with self._lock:
                 self._active = None
+                self._active_cancel_path = None
         try:
             if process.returncode != 0 or not meta_path.is_file():
                 if self._cancel_requested.is_set():
@@ -446,43 +607,60 @@ class WindowsAppContainerBackend:
         except (ValueError, TypeError, OSError) as exc:
             raise SandboxUnavailableError(f"invalid sandbox launcher response: {exc}") from exc
         finally:
-            for path in (stdin_path, stdout_path, stderr_path, meta_path):
+            for path in (stdin_path, stdout_path, stderr_path, meta_path, cancel_path):
                 path.unlink(missing_ok=True)
 
     def cancel(self) -> None:
         self._cancel_requested.set()
         with self._lock:
-            process = self._active
-        if process is not None and process.poll() is None:
-            process.kill()
+            cancel_path = self._active_cancel_path
+        if cancel_path is not None:
+            try:
+                cancel_path.write_bytes(b"cancel\n")
+            except OSError:
+                # The launcher may have completed and removed the request
+                # boundary between reading the path and writing the marker.
+                pass
 
 
 _ALLOWED_HEADERS = frozenset(
     {
         "algorithm", "array", "bit", "bitset", "cassert", "cctype", "cerrno",
-        "cfloat", "chrono", "climits", "cmath", "cstdint", "cstdio", "cstdlib", "ctime",
+        "cfloat", "chrono", "climits", "cmath", "cstddef", "cstdint", "cstdio", "cstdlib", "ctime",
         "cstring", "deque", "functional", "iomanip", "iostream", "iterator",
         "limits", "map", "numeric", "optional", "queue", "random", "set",
         "sstream", "istream", "ostream", "ios", "iosfwd", "streambuf",
-        "list", "forward_list", "memory", "stack", "string", "string_view",
+        "list", "forward_list", "memory", "stack", "stdexcept", "string", "string_view",
         "tuple", "type_traits",
         "unordered_map", "unordered_set", "utility", "vector", "bits/stdc++.h",
     }
 )
-_DANGEROUS_PATTERNS: tuple[tuple[str, str], ...] = (
-    (r"(?m)^\s*#\s*(?:pragma|line|import|embed)\b", "dangerous preprocessor directive"),
-    (r"(?m)^\s*#\s*include\s*[\"']", "quoted include"),
-    (r"\b(?:system|popen|_popen|fork|vfork|exec[lvpe]*|spawn[lvpe]*|CreateProcess\w*|WinExec|ShellExecute\w*)\s*\(", "process API"),
-    (r"\b(?:socket|connect|bind|listen|accept|send|recv|WSAStartup|InternetOpen\w*|URLDownloadToFile\w*)\s*\(", "network API"),
-    (r"\b(?:fopen|freopen|open|creat|remove|rename|unlink|rmdir|mkdir|CreateFile\w*|DeleteFile\w*|MoveFile\w*)\s*\(", "filesystem API"),
-    (r"\b(?:ifstream|ofstream|fstream)\b", "file stream"),
-    (r"\b(?:dlopen|dlsym|LoadLibrary\w*|GetProcAddress)\s*\(", "dynamic loading"),
-    (r"\b(?:asm|__asm|__asm__)\b", "inline assembly"),
+_DANGEROUS_PATTERNS: tuple[tuple[str, str, str], ...] = (
+    ("preprocessor_directive", r"(?m)^\s*#\s*(?:pragma|line|import|embed)\b", "dangerous preprocessor directive"),
+    ("quoted_include", r"(?m)^\s*#\s*include\s*[\"']", "quoted include"),
+    ("process_api", r"\b(?:system|popen|_popen|fork|vfork|exec[lvpe]*|spawn[lvpe]*|CreateProcess\w*|WinExec|ShellExecute\w*)\s*\(", "process API"),
+    ("network_api", r"\b(?:socket|connect|bind|listen|accept|send|recv|WSAStartup|InternetOpen\w*|URLDownloadToFile\w*)\s*\(", "network API"),
+    ("filesystem_api", r"\b(?:fopen|freopen|open|creat|remove|rename|unlink|rmdir|mkdir|CreateFile\w*|DeleteFile\w*|MoveFile\w*)\s*\(", "filesystem API"),
+    ("file_stream", r"\b(?:ifstream|ofstream|fstream)\b", "file stream"),
+    ("dynamic_loading", r"\b(?:dlopen|dlsym|LoadLibrary\w*|GetProcAddress)\s*\(", "dynamic loading"),
+    ("inline_assembly", r"\b(?:asm|__asm|__asm__)\b", "inline assembly"),
 )
 
-TRUSTED_GENERATOR_HARNESS_VERSION = 2
-_TRUSTED_GENERATOR_MARKER = "// ACM_TRUSTED_GENERATOR_HARNESS_V2"
-_LEGACY_TRUSTED_GENERATOR_MARKER = "// ACM_TRUSTED_GENERATOR_HARNESS_V1"
+TRUSTED_GENERATOR_HARNESS_VERSION = 3
+HELPER_PREFLIGHT_VERSION = 9
+_TRUSTED_GENERATOR_MARKER = "// ACM_TRUSTED_GENERATOR_HARNESS_V3"
+_LEGACY_TRUSTED_GENERATOR_MARKERS = (
+    "// ACM_TRUSTED_GENERATOR_HARNESS_V2",
+    "// ACM_TRUSTED_GENERATOR_HARNESS_V1",
+)
+_LOCAL_RECIPE_GENERATOR_V1_MARKER = "// ACM_LOCAL_RECIPE_GENERATOR_V1"
+_LOCAL_RECIPE_GENERATOR_V2_MARKER = "// ACM_LOCAL_RECIPE_GENERATOR_V2"
+_LOCAL_RECIPE_GENERATOR_MARKERS = (
+    _LOCAL_RECIPE_GENERATOR_V1_MARKER,
+    _LOCAL_RECIPE_GENERATOR_V2_MARKER,
+)
+# Historical private alias.
+_LOCAL_RECIPE_GENERATOR_MARKER = _LOCAL_RECIPE_GENERATOR_V1_MARKER
 _GENERATOR_ADAPTER_SYMBOL = "acm_generate_case"
 
 
@@ -564,11 +742,17 @@ def compose_trusted_generator_harness(source: str | bytes) -> str:
     model_source = validate_cpp_source(source)
     if (
         _TRUSTED_GENERATOR_MARKER in model_source
-        or _LEGACY_TRUSTED_GENERATOR_MARKER in model_source
+        or any(marker in model_source for marker in _LEGACY_TRUSTED_GENERATOR_MARKERS)
     ):
         return model_source
     uses_adapter = bool(
         re.search(rf"\b{re.escape(_GENERATOR_ADAPTER_SYMBOL)}\s*\(", model_source)
+    )
+    uses_local_recipe_manifest = uses_adapter and any(
+        marker in model_source for marker in _LOCAL_RECIPE_GENERATOR_MARKERS
+    )
+    local_recipe_manifest_version = (
+        2 if _LOCAL_RECIPE_GENERATOR_V2_MARKER in model_source else 1
     )
     if not uses_adapter:
         # Compatibility is deliberately limited to already-existing/manual
@@ -627,7 +811,7 @@ int invoke_model(Function function, int argc, char** argv) {
 }
 int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--capabilities") == 0) {
-        std::cout << "{\"profile_version\":2,\"manifest_version\":1,"
+        std::cout << "{\"profile_version\":2,\"manifest_version\":ACM_TRUSTED_MANIFEST_VERSION,"
                      "\"profiles\":[\"small\",\"large\"],"
                      "\"case_kinds\":[\"lower_bound\",\"upper_bound\",\"random\"],"
                      "\"supported_cases\":[{\"profile\":\"small\",\"case_kind\":\"lower_bound\"},"
@@ -636,6 +820,7 @@ int main(int argc, char** argv) {
                      "{\"profile\":\"large\",\"case_kind\":\"random\"}]}";
         return 0;
     }
+    ACM_TRUSTED_GENERATOR_MANIFEST_QUERY
     unsigned long long seed = 0;
     if (argc != 4 || !acm_trusted_harness::decimal_seed(argv[1], seed) ||
         !acm_trusted_harness::supported(argv[2], argv[3])) return 64;
@@ -648,6 +833,25 @@ int main(int argc, char** argv) {
         "    return std::cout.good() ? 0 : 74;"
         if uses_adapter
         else "return acm_trusted_harness::invoke_model(&acm_generated_main, argc, argv);"
+    )
+    manifest_query = (
+        'if (argc == 5 && std::strcmp(argv[1], "--manifest") == 0) {\n'
+        '        unsigned long long manifest_seed = 0;\n'
+        '        if (!acm_trusted_harness::decimal_seed(argv[2], manifest_seed) ||\n'
+        '            !acm_trusted_harness::supported(argv[3], argv[4])) return 64;\n'
+        '        acm_trusted_harness::set_protocol_env(argv[2], argv[3], argv[4]);\n'
+        '        acm_generate_manifest(manifest_seed, std::string(argv[3]), '\
+        'std::string(argv[4]), std::cout);\n'
+        '        return std::cout.good() ? 0 : 74;\n'
+        '    }'
+        if uses_local_recipe_manifest
+        else ""
+    )
+    harness = harness.replace(
+        "ACM_TRUSTED_GENERATOR_MANIFEST_QUERY", manifest_query
+    )
+    harness = harness.replace(
+        "ACM_TRUSTED_MANIFEST_VERSION", str(local_recipe_manifest_version)
     )
     harness = harness.replace("ACM_TRUSTED_GENERATOR_INVOKE", invocation)
     source_prefix = "" if uses_adapter else "#define main acm_generated_main\n"
@@ -857,9 +1061,30 @@ def _parse_generator_manifest(
     seed: int,
     generated_input: bytes,
 ) -> dict[str, object]:
+    try:
+        manifest = _strict_json_object(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise _GeneratorManifestValidationError(
+            f"generator manifest is not strict JSON: {exc}",
+            expected={"manifest_version": [1, 2]},
+            actual=payload.decode("utf-8", errors="replace")[:1000],
+        ) from exc
+
+    manifest_version = manifest.get("manifest_version")
+    if type(manifest_version) is not int or manifest_version not in {1, 2}:
+        raise _GeneratorManifestValidationError(
+            "generator manifest version is unsupported",
+            expected={"manifest_version": [1, 2]},
+            actual={"manifest_version": manifest_version},
+        )
+    expected_keys = (
+        _GENERATOR_MANIFEST_V2_KEYS
+        if manifest_version == 2
+        else _GENERATOR_MANIFEST_V1_KEYS
+    )
     expected_schema: dict[str, object] = {
-        "keys": sorted(_GENERATOR_MANIFEST_KEYS),
-        "manifest_version": 1,
+        "keys": sorted(expected_keys),
+        "manifest_version": manifest_version,
         "profile": profile,
         "case_kind": case_kind,
         "seed": int(seed),
@@ -869,23 +1094,14 @@ def _parse_generator_manifest(
         "records": "non-negative integer",
         "total_complexity": "non-empty string",
     }
-    try:
-        manifest = _strict_json_object(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise _GeneratorManifestValidationError(
-            f"generator manifest is not strict JSON: {exc}",
-            expected=expected_schema,
-            actual=payload.decode("utf-8", errors="replace")[:1000],
-        ) from exc
-
-    if set(manifest) != _GENERATOR_MANIFEST_KEYS:
+    if set(manifest) != expected_keys:
         raise _GeneratorManifestValidationError(
             "generator manifest has missing or unexpected fields",
-            expected=sorted(_GENERATOR_MANIFEST_KEYS),
+            expected=sorted(expected_keys),
             actual=sorted(str(key) for key in manifest),
         )
     exact_fields = {
-        "manifest_version": 1,
+        "manifest_version": manifest_version,
         "profile": profile,
         "case_kind": case_kind,
         "seed": int(seed),
@@ -904,6 +1120,35 @@ def _parse_generator_manifest(
                 expected={key: expected},
                 actual={key: actual},
             )
+
+    if manifest_version == 2:
+        exact_v2_strings = {
+            "engine": "local_templates_v2",
+            "recipe_source": "deterministic_contract_shape_v2",
+        }
+        for key, expected in exact_v2_strings.items():
+            if manifest.get(key) != expected:
+                raise _GeneratorManifestValidationError(
+                    f"generator manifest field {key!r} is inconsistent",
+                    expected={key: expected},
+                    actual={key: manifest.get(key)},
+                )
+        for key in ("state_machine", "section_family", "operation_family"):
+            value = manifest.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise _GeneratorManifestValidationError(
+                    f"generator manifest field {key!r} must be a non-empty string",
+                    expected={key: "non-empty string"},
+                    actual={key: value},
+                )
+        for key in ("planned_byte_bucket", "actual_byte_bucket"):
+            value = manifest.get(key)
+            if type(value) is not int or not 0 <= value <= 3:
+                raise _GeneratorManifestValidationError(
+                    f"generator manifest field {key!r} is invalid",
+                    expected={key: "integer in [0,3]"},
+                    actual={key: value},
+                )
 
     dimensions = manifest.get("dimensions")
     if (
@@ -989,35 +1234,111 @@ def validate_cpp_source(source: str | bytes, *, max_bytes: int = MAX_CPP_BYTES) 
     """Return normalized text or raise for code outside the safe subset."""
     raw = source.encode("utf-8") if isinstance(source, str) else bytes(source)
     if not raw:
-        raise SourceSafetyError("C++ source is empty")
+        raise SourceSafetyError("C++ source is empty", rule_id="empty_source")
     if len(raw) > max_bytes:
-        raise SourceSafetyError(f"C++ source exceeds {max_bytes} bytes")
+        raise SourceSafetyError(
+            f"C++ source exceeds {max_bytes} bytes", rule_id="source_size"
+        )
     if b"\0" in raw:
-        raise SourceSafetyError("C++ source contains NUL")
+        raise SourceSafetyError("C++ source contains NUL", rule_id="nul_byte")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise SourceSafetyError("C++ source must be UTF-8") from exc
+        raise SourceSafetyError(
+            "C++ source must be UTF-8", rule_id="invalid_utf8"
+        ) from exc
+
+    def safety_location(match: re.Match[str]) -> dict[str, object]:
+        start = match.start()
+        line_start = text.rfind("\n", 0, start) + 1
+        line_end = text.find("\n", start)
+        if line_end < 0:
+            line_end = len(text)
+        raw_excerpt = text[line_start:line_end]
+        sanitized = re.sub(r'"(?:\\.|[^"\\])*"', '"<redacted>"', raw_excerpt)
+        sanitized = re.sub(r"'(?:\\.|[^'\\])*'", "'<redacted>'", sanitized)
+        sanitized = re.sub(r"//.*$", "// <redacted>", sanitized)
+        excerpt = " ".join(sanitized.replace("\r", " ").split())[:240]
+        token_match = re.search(r"[A-Za-z_]\w*", match.group(0))
+        token = token_match.group(0) if token_match is not None else match.group(0).strip()
+        return {
+            "matched_token": token[:80],
+            "line": text.count("\n", 0, start) + 1,
+            "column": start - line_start + 1,
+            "excerpt": excerpt,
+        }
+
     for match in re.finditer(r"(?m)^\s*#\s*include\s*<([^>]+)>", text):
         header = match.group(1).strip()
         if header not in _ALLOWED_HEADERS:
-            raise SourceSafetyError(f"non-standard or unsafe include: <{header}>")
+            raise SourceSafetyError(
+                f"non-standard or unsafe include: <{header}>",
+                rule_id="unsafe_include",
+                **safety_location(match),
+            )
     include_lines = re.findall(r"(?m)^\s*#\s*include\b[^\r\n]*", text)
     parsed_lines = re.findall(r"(?m)^\s*#\s*include\s*<[^>]+>\s*(?://.*)?$", text)
     if len(include_lines) != len(parsed_lines):
-        raise SourceSafetyError("malformed or unsupported include")
-    for pattern, label in _DANGEROUS_PATTERNS:
-        if re.search(pattern, text):
-            raise SourceSafetyError(f"C++ source uses forbidden {label}")
+        match = re.search(r"(?m)^\s*#\s*include\b[^\r\n]*", text)
+        raise SourceSafetyError(
+            "malformed or unsupported include",
+            rule_id="malformed_include",
+            **(safety_location(match) if match is not None else {}),
+        )
+    for rule_id, pattern, label in _DANGEROUS_PATTERNS:
+        match = re.search(pattern, text)
+        if match is not None:
+            raise SourceSafetyError(
+                f"C++ source uses forbidden {label}",
+                rule_id=rule_id,
+                **safety_location(match),
+            )
     return text
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class HelperSources:
     generator: str | bytes
-    brute: str | bytes
-    reference: str | bytes
+    reference_primary: str | bytes
+    reference_secondary: str | bytes
     validator: str | bytes | None = None
+
+    def __init__(
+        self,
+        generator: str | bytes,
+        reference_primary: str | bytes | None = None,
+        reference_secondary: str | bytes | None = None,
+        validator: str | bytes | None = None,
+        *,
+        brute: str | bytes | None = None,
+        reference: str | bytes | None = None,
+    ) -> None:
+        """Create a dual-reference source set.
+
+        ``brute`` and ``reference`` remain accepted as deprecated construction
+        aliases so an in-flight legacy setup can be decoded, but staging always
+        writes the values as ref1/ref2 and never creates a new legacy bundle.
+        """
+        primary = reference_primary if reference_primary is not None else brute
+        secondary = reference_secondary if reference_secondary is not None else reference
+        if primary is None or secondary is None:
+            raise TypeError("both reference_primary and reference_secondary are required")
+        if reference_primary is not None and brute is not None:
+            raise TypeError("reference_primary and deprecated brute are mutually exclusive")
+        if reference_secondary is not None and reference is not None:
+            raise TypeError("reference_secondary and deprecated reference are mutually exclusive")
+        object.__setattr__(self, "generator", generator)
+        object.__setattr__(self, "reference_primary", primary)
+        object.__setattr__(self, "reference_secondary", secondary)
+        object.__setattr__(self, "validator", validator)
+
+    @property
+    def brute(self) -> str | bytes:
+        return self.reference_primary
+
+    @property
+    def reference(self) -> str | bytes:
+        return self.reference_secondary
 
 
 @dataclass(slots=True)
@@ -1031,6 +1352,7 @@ class HelperBundle:
     backup_dir: str
     staging_dir: str
     created_at: str
+    oracle_protocol: str = DUAL_REFERENCE_PROTOCOL
     release_executables: dict[str, str] = field(default_factory=dict)
     validation: dict[str, object] = field(default_factory=dict)
 
@@ -1050,7 +1372,12 @@ class HelperPreflightConfig:
     generator_timeout: float = 2.0
     reference_timeout: float = 2.0
     brute_timeout: float = 5.0
+    reference_primary_timeout: float | None = None
+    reference_secondary_timeout: float | None = None
     validator_timeout: float = 2.0
+    require_manifest: bool = True
+    require_coverage: bool = True
+    require_seed_variation: bool = True
     deadline: float | None = None
     clock: Callable[[], float] = time.monotonic
 
@@ -1105,10 +1432,35 @@ class HelperPreflightConfig:
                 raise ValueError("validator probe is malformed")
             probe_ids.add(probe_id)
         if min(
-            self.generator_timeout, self.reference_timeout, self.brute_timeout,
+            self.generator_timeout,
+            (
+                self.reference_primary_timeout
+                if self.reference_primary_timeout is not None
+                else self.brute_timeout
+            ),
+            (
+                self.reference_secondary_timeout
+                if self.reference_secondary_timeout is not None
+                else self.reference_timeout
+            ),
             self.validator_timeout,
         ) <= 0:
             raise ValueError("helper preflight timeouts must be positive")
+
+    def reference_timeout_for(self, role: str) -> float:
+        if role == "reference_primary":
+            return float(
+                self.reference_primary_timeout
+                if self.reference_primary_timeout is not None
+                else self.brute_timeout
+            )
+        if role == "reference_secondary":
+            return float(
+                self.reference_secondary_timeout
+                if self.reference_secondary_timeout is not None
+                else self.reference_timeout
+            )
+        raise KeyError(role)
 
 
 @dataclass(slots=True)
@@ -1127,6 +1479,7 @@ class StagedHelperBundle:
     backup_dir: str
     staging_dir: str
     created_at: str
+    oracle_protocol: str = DUAL_REFERENCE_PROTOCOL
     preflight_completed: bool = False
     validation: dict[str, object] | None = None
     applied: bool = False
@@ -1144,13 +1497,116 @@ def _atomic_write(path: Path, data: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
+_CPP_COMPILER_FALLBACKS: tuple[str, ...] = ("g++", "clang++", "c++")
+
+
+def resolve_cpp_compiler(compiler: str) -> str | None:
+    """Resolve ``compiler``, then any other C++ driver available locally.
+
+    The configured default is ``g++``, which macOS does not ship; there the
+    usable driver is ``clang++``.  Probing the alternatives keeps a missing
+    ``g++`` from failing every compile on a machine whose toolchain is fine.
+    """
+    resolved = shutil.which(compiler)
+    if resolved is not None:
+        return resolved
+    for candidate in _CPP_COMPILER_FALLBACKS:
+        if candidate == compiler:
+            continue
+        fallback = shutil.which(candidate)
+        if fallback is not None:
+            return fallback
+    return None
+
+
+def portable_cpp_flags(flags: Sequence[str]) -> tuple[str, ...]:
+    """Drop compile flags the local platform cannot honour.
+
+    macOS has no static libc, so ``-static`` fails the link outright rather
+    than degrading to a dynamic one.  Dropping it only there keeps the shared
+    flag sets intact and leaves Windows and Linux byte-identical.
+    """
+    if sys.platform == "darwin":
+        return tuple(flag for flag in flags if flag != "-static")
+    return tuple(flags)
+
+
+# The exact flag sets handed to the C++ driver for generated helpers.  The
+# persisted preparation identity fingerprints these (see
+# ``cpp_compiler_fingerprint``), so a cached bundle is only reused for a build
+# that still matches — which requires the compile sites and the fingerprint to
+# read the same constants rather than parallel copies.
+CPP_STANDARD_FLAG = "-std=c++17"
+RELEASE_COMPILE_FLAGS = ("-O2", "-static")
+AUDIT_COMPILE_FLAGS = (
+    "-O0", "-g", "-static", "-D_GLIBCXX_DEBUG", "-D_GLIBCXX_ASSERTIONS",
+)
+SANITIZER_COMPILE_FLAGS = (
+    "-O1", "-g", "-fsanitize=address,undefined",
+    "-fno-omit-frame-pointer", "-D_GLIBCXX_ASSERTIONS",
+)
+HELPER_COMPILE_FLAG_SETS = (
+    (CPP_STANDARD_FLAG, *RELEASE_COMPILE_FLAGS),
+    (CPP_STANDARD_FLAG, *AUDIT_COMPILE_FLAGS),
+    (CPP_STANDARD_FLAG, *SANITIZER_COMPILE_FLAGS),
+)
+
+
+def cpp_compiler_fingerprint(
+    compiler: str = "g++",
+    *,
+    flag_sets: Sequence[Sequence[str]] = (),
+) -> str:
+    """Fingerprint the driver that compilation will actually execute."""
+
+    resolved = resolve_cpp_compiler(compiler)
+    effective_flags = tuple(tuple(portable_cpp_flags(flags)) for flags in flag_sets)
+    if resolved is None:
+        payload = {
+            "configured": str(compiler),
+            "resolved": None,
+            "flag_sets": effective_flags,
+        }
+        return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+    path = Path(resolved)
+    try:
+        result = subprocess.run(
+            [resolved, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=3.0,
+            check=False,
+            shell=False,
+        )
+        version = result.stdout[:4096]
+    except (OSError, subprocess.TimeoutExpired):
+        version = b"unavailable"
+    try:
+        file_stat = path.stat()
+        identity = {
+            "path": str(path.resolve()),
+            "size": int(file_stat.st_size),
+            "mtime_ns": int(file_stat.st_mtime_ns),
+        }
+    except OSError:
+        identity = {"path": str(path)}
+    payload = canonical_json_bytes(
+        {
+            "configured": str(compiler),
+            "resolved": identity,
+            "flag_sets": effective_flags,
+        }
+    )
+    return hashlib.sha256(payload + b"\0" + version).hexdigest()
+
+
 def _compile_cpp(
     compiler: str,
     source: Path,
     output: Path,
     *,
     timeout: float,
-    flags: Sequence[str] = ("-O2", "-static"),
+    flags: Sequence[str] = RELEASE_COMPILE_FLAGS,
 ) -> subprocess.CompletedProcess[bytes]:
     """Compile a statically checked source with a trusted local toolchain.
 
@@ -1159,12 +1615,15 @@ def _compile_cpp(
     installation and its runtime dependencies.  The generated executable is
     still never run here; all execution remains behind ``SandboxBackend``.
     """
-    resolved = shutil.which(compiler)
+    resolved = resolve_cpp_compiler(compiler)
     if resolved is None:
         return subprocess.CompletedProcess(
             [compiler], 127, b"", f"compiler not found: {compiler}".encode()
         )
-    command = [resolved, "-std=c++17", *flags, str(source), "-o", str(output)]
+    command = [
+        resolved, CPP_STANDARD_FLAG, *portable_cpp_flags(flags),
+        str(source), "-o", str(output),
+    ]
     try:
         return subprocess.run(
             command,
@@ -1210,7 +1669,7 @@ class HelperBundleManager:
             raise ValueError("primary source must be an existing .cpp file")
         if not primary.is_relative_to(self.root) or primary.is_symlink():
             raise ValueError("primary source must be a non-symlink inside workspace")
-        if primary.stem.endswith((".gen", ".bf", ".ref")):
+        if primary.stem.endswith((".gen", ".bf", ".ref", ".ref1", ".ref2")):
             raise ValueError("primary source cannot be a stress helper")
         return primary
 
@@ -1251,14 +1710,14 @@ class HelperBundleManager:
         staging.mkdir(parents=True, exist_ok=False)
         names = {
             "generator": f"{problem_id}.gen.cpp",
-            "brute": f"{problem_id}.bf.cpp",
-            "reference": f"{problem_id}.ref.cpp",
+            "reference_primary": f"{problem_id}.ref1.cpp",
+            "reference_secondary": f"{problem_id}.ref2.cpp",
         }
         staging_names = dict(names)
         raw_sources = {
             "generator": sources.generator,
-            "brute": sources.brute,
-            "reference": sources.reference,
+            "reference_primary": sources.reference_primary,
+            "reference_secondary": sources.reference_secondary,
         }
         if sources.validator is not None:
             staging_names["validator"] = f"{problem_id}.validator.cpp"
@@ -1278,13 +1737,15 @@ class HelperBundleManager:
                 validated = validated_text.encode("utf-8")
             except SourceSafetyError as exc:
                 shutil.rmtree(staging, ignore_errors=True)
-                raise HelperPreflightError(
+                failure = HelperPreflightError(
                     str(exc),
                     artifact=role,
                     profile="build",
                     case_kind="source_safety",
                     seed=0,
-                ) from exc
+                )
+                failure.details["source_safety"] = dict(exc.details)
+                raise failure from exc
             staged = staging / filename
             staged.write_bytes(validated)
             staged_paths[role] = staged
@@ -1306,7 +1767,7 @@ class HelperBundleManager:
                 staged,
                 release,
                 timeout=compile_timeout,
-                flags=("-O2", "-static"),
+                flags=RELEASE_COMPILE_FLAGS,
             )
             if compiled.returncode != 0:
                 raise self._compile_failure(role, "release", compiled)
@@ -1316,10 +1777,7 @@ class HelperBundleManager:
                 staged,
                 audit,
                 timeout=compile_timeout,
-                flags=(
-                    "-O0", "-g", "-static", "-D_GLIBCXX_DEBUG",
-                    "-D_GLIBCXX_ASSERTIONS",
-                ),
+                flags=AUDIT_COMPILE_FLAGS,
             )
             if compiled.returncode != 0:
                 raise self._compile_failure(role, "audit", compiled)
@@ -1343,10 +1801,7 @@ class HelperBundleManager:
         probe_source = staging / "sanitizer-probe.cpp"
         probe_source.write_text("int main(){return 0;}\n", encoding="utf-8")
         probe_executable = staging / f"sanitizer-probe{suffix}"
-        sanitizer_flags = (
-            "-O1", "-g", "-fsanitize=address,undefined",
-            "-fno-omit-frame-pointer", "-D_GLIBCXX_ASSERTIONS",
-        )
+        sanitizer_flags = SANITIZER_COMPILE_FLAGS
         probe_compile = _compile_cpp(
             compiler,
             probe_source,
@@ -1388,6 +1843,7 @@ class HelperBundleManager:
             backup_dir=str(backup),
             staging_dir=str(staging),
             created_at=datetime.now().astimezone().isoformat(),
+            oracle_protocol=DUAL_REFERENCE_PROTOCOL,
         )
 
     @staticmethod
@@ -1430,6 +1886,16 @@ class HelperBundleManager:
                 )
             timeout = min(float(timeout), remaining)
         selected_sandbox = sandbox or self.sandbox
+        input_size = len(input_data or b"")
+        # The generator may legally emit up to MAX_LARGE_INPUT_BYTES for large
+        # profiles, and every downstream validator/oracle run feeds that output
+        # as its stdin.  Size the stdin budget to the actual input (capped at
+        # the generator's own output ceiling) instead of leaving the 2 MiB
+        # default that turns a legal large case into an unrepaired StressError.
+        selected_stdin_bytes = min(
+            MAX_LARGE_INPUT_BYTES,
+            max(int(stdin_bytes), input_size + 64 * 1024),
+        )
         result = selected_sandbox.run(
             [str(executable), *args],
             cwd=cwd,
@@ -1437,7 +1903,7 @@ class HelperBundleManager:
             env=env,
             limits=SandboxLimits(
                 timeout_seconds=timeout,
-                stdin_bytes=stdin_bytes,
+                stdin_bytes=selected_stdin_bytes,
                 stdout_bytes=stdout_bytes,
                 stderr_bytes=stderr_bytes,
             ),
@@ -1481,10 +1947,24 @@ class HelperBundleManager:
         seed: int,
         timeout: float,
         sandbox: SandboxBackend | None = None,
+        max_input_bytes: int | None = None,
         deadline: float | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> SandboxProcessResult:
         large = profile == "large"
+        output_limit = (
+            MAX_LARGE_INPUT_BYTES
+            if large
+            else int(max_input_bytes or MAX_STREAM_BYTES)
+        )
+        environment = {
+            "ACM_STRESS_SEED": str(seed),
+            "ACM_STRESS_PROFILE": profile,
+            "ACM_STRESS_CASE_KIND": case_kind,
+            "ACM_STRESS_PROFILE_VERSION": "2",
+        }
+        if not large and max_input_bytes is not None:
+            environment["ACM_STRESS_MAX_INPUT_BYTES"] = str(max_input_bytes)
         result = self._preflight_run(
             executable,
             cwd=cwd,
@@ -1493,14 +1973,9 @@ class HelperBundleManager:
             case_kind=case_kind,
             seed=seed,
             timeout=timeout,
-            env={
-                "ACM_STRESS_SEED": str(seed),
-                "ACM_STRESS_PROFILE": profile,
-                "ACM_STRESS_CASE_KIND": case_kind,
-                "ACM_STRESS_PROFILE_VERSION": "2",
-            },
+            env=environment,
             args=(str(seed), profile, case_kind),
-            stdout_bytes=MAX_LARGE_INPUT_BYTES if large else MAX_STREAM_BYTES,
+            stdout_bytes=output_limit,
             sandbox=sandbox,
             deadline=deadline,
             clock=clock,
@@ -1525,12 +2000,22 @@ class HelperBundleManager:
         case_kind: str,
         seed: int,
         generated_input: bytes,
+        max_input_bytes: int | None = None,
         timeout: float,
         sandbox: SandboxBackend | None = None,
         deadline: float | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> dict[str, object]:
         args = ("--manifest", str(seed), profile, case_kind)
+        environment = {
+            "ACM_STRESS_QUERY": "manifest",
+            "ACM_STRESS_SEED": str(seed),
+            "ACM_STRESS_PROFILE": profile,
+            "ACM_STRESS_CASE_KIND": case_kind,
+            "ACM_STRESS_PROFILE_VERSION": "2",
+        }
+        if profile == "small" and max_input_bytes is not None:
+            environment["ACM_STRESS_MAX_INPUT_BYTES"] = str(max_input_bytes)
         try:
             result = self._preflight_run(
                 executable,
@@ -1540,13 +2025,7 @@ class HelperBundleManager:
                 case_kind=case_kind,
                 seed=seed,
                 timeout=timeout,
-                env={
-                    "ACM_STRESS_QUERY": "manifest",
-                    "ACM_STRESS_SEED": str(seed),
-                    "ACM_STRESS_PROFILE": profile,
-                    "ACM_STRESS_CASE_KIND": case_kind,
-                    "ACM_STRESS_PROFILE_VERSION": "2",
-                },
+                env=environment,
                 args=args,
                 stdout_bytes=256 * 1024,
                 sandbox=sandbox,
@@ -1854,9 +2333,9 @@ class HelperBundleManager:
 
     @staticmethod
     def _blueprint_case_complexity(
-        blueprint: Mapping[str, object], profile: str, case_kind: str
+        blueprint: Mapping[str, object] | None, profile: str, case_kind: str
     ) -> str:
-        cases = blueprint.get("cases")
+        cases = blueprint.get("cases") if isinstance(blueprint, Mapping) else None
         if isinstance(cases, Sequence) and not isinstance(cases, (str, bytes)):
             for item in cases:
                 if (
@@ -1949,27 +2428,11 @@ class HelperBundleManager:
                 clock=config.clock,
             )
 
-        first = self._preflight_generate(
-            audit["generator"], cwd=cwd, profile="small", case_kind="random",
-            seed=seed0, timeout=config.generator_timeout,
-            deadline=config.deadline, clock=config.clock,
-        )
-        repeated = self._preflight_generate(
-            audit["generator"], cwd=cwd, profile="small", case_kind="random",
-            seed=seed0, timeout=config.generator_timeout,
-            deadline=config.deadline, clock=config.clock,
-        )
-        if first.stdout != repeated.stdout:
-            raise HelperPreflightError(
-                "generator output is not deterministic for the same seed",
-                artifact="generator",
-                profile="small",
-                case_kind="determinism",
-                seed=seed0,
-            )
-
         records: list[dict[str, object]] = []
         blueprint = dict(config.generator_blueprint or {})
+        local_recipe = blueprint.get("engine") in {
+            "local_templates_v1", "local_templates_v2"
+        }
         small_required_tags = {
             str(tag) for tag in blueprint.get("required_coverage_tags", [])
         }
@@ -1993,25 +2456,65 @@ class HelperBundleManager:
                     deadline=config.deadline,
                     clock=config.clock,
                 )
-            for role in ("brute", "reference"):
-                result = self._preflight_run(
-                    audit[role], cwd=cwd, artifact=role,
-                    profile=f"sample:{sample.name}", case_kind="official_sample",
-                    seed=seed0, timeout=(
-                        config.brute_timeout if role == "brute" else config.reference_timeout
-                    ), input_data=sample.input_data,
-                    deadline=config.deadline, clock=config.clock,
-                )
+            for role in ("reference_primary", "reference_secondary"):
+                try:
+                    result = self._preflight_run(
+                        audit[role], cwd=cwd, artifact=role,
+                        profile=f"sample:{sample.name}", case_kind="official_sample",
+                        seed=seed0, timeout=config.reference_timeout_for(role),
+                        input_data=sample.input_data,
+                        deadline=config.deadline, clock=config.clock,
+                    )
+                except HelperPreflightError as exc:
+                    exc.details.update(
+                        {
+                            "sample_name": str(sample.name)[:200],
+                            "input_excerpt": sample.input_data.decode(
+                                "utf-8", errors="replace"
+                            )[:2000],
+                            "expected_stdout": sample.expected_output.decode(
+                                "utf-8", errors="replace"
+                            )[:2000],
+                        }
+                    )
+                    raise
                 if not _equal(result.stdout, sample.expected_output, config.exact_output):
-                    raise HelperPreflightError(
+                    sample_name = str(sample.name)[:200]
+                    input_excerpt = sample.input_data.decode(
+                        "utf-8", errors="replace"
+                    )[:2000]
+                    expected_stdout = sample.expected_output.decode(
+                        "utf-8", errors="replace"
+                    )[:2000]
+                    actual_stdout = result.stdout.decode(
+                        "utf-8", errors="replace"
+                    )[:2000]
+                    failure = HelperPreflightError(
                         f"{role} output disagrees with official sample",
                         artifact=role,
                         profile=f"sample:{sample.name}",
                         case_kind="official_sample",
                         seed=seed0,
                         stderr=result.stderr,
-                        code="stress_oracle_preflight_conflict",
+                        code="stress_reference_sample_mismatch",
+                        expected={
+                            "sample_name": sample_name,
+                            "stdout": expected_stdout,
+                        },
+                        actual={
+                            "sample_name": sample_name,
+                            "stdout": actual_stdout,
+                        },
                     )
+                    failure.details.update(
+                        {
+                            "sample_name": sample_name,
+                            "input_excerpt": input_excerpt,
+                            "expected_stdout": expected_stdout,
+                            "actual_stdout": actual_stdout,
+                        }
+                    )
+                    raise failure
             records.append({"profile": "sample", "case_kind": sample.name})
 
         def run_case(
@@ -2027,56 +2530,85 @@ class HelperBundleManager:
             # an input the generator did not actually produce, allowing the
             # same bundle to fault immediately after application.
             seed_attempts = 1
-            last_rejection: HelperPreflightError | None = None
             input_transform: dict[str, object] | None = None
             for seed_attempt in range(seed_attempts):
                 seed = _derived_candidate_seed(requested_seed, seed_attempt)
-                try:
-                    generated = self._preflight_generate(
-                        audit["generator"], cwd=cwd, profile=profile, case_kind=case_kind,
-                        seed=seed, timeout=config.generator_timeout, sandbox=sandbox,
-                        deadline=config.deadline, clock=config.clock,
-                    )
-                except HelperPreflightError as exc:
-                    if (
-                        case_kind != "random"
-                        or "generator_runtime_error" not in str(exc)
-                        or seed_attempt + 1 >= seed_attempts
-                    ):
-                        raise
-                    last_rejection = exc
-                    continue
-                generated_input = generated.stdout
-                input_transform = None
-                if "validator" not in audit:
-                    observation = None
-                    break
-                try:
-                    observation = self._preflight_validator_observation(
-                        audit["validator"],
-                        cwd=cwd,
-                        profile=profile,
-                        case_kind=case_kind,
-                        seed=seed,
-                        generated_input=generated_input,
-                        timeout=config.validator_timeout,
-                        sandbox=sandbox,
-                        deadline=config.deadline,
-                        clock=config.clock,
-                    )
-                    break
-                except HelperPreflightError as exc:
-                    if exc.code != "stress_generated_input_invalid" or seed_attempt + 1 >= seed_attempts:
-                        exc.details["seed_search"] = {
-                            "requested_seed": requested_seed,
-                            "attempts": seed_attempt + 1,
-                            "last_effective_seed": seed,
-                        }
-                        raise
-                    last_rejection = exc
+                max_input_bytes = (
+                    SMALL_INPUT_INITIAL_BYTES if profile == "small" else None
+                )
+                size_attempts = 0
+                while True:
+                    size_attempts += 1
+                    try:
+                        generated = self._preflight_generate(
+                            audit["generator"], cwd=cwd, profile=profile,
+                            case_kind=case_kind, seed=seed,
+                            timeout=config.generator_timeout, sandbox=sandbox,
+                            max_input_bytes=max_input_bytes,
+                            deadline=config.deadline, clock=config.clock,
+                        )
+                    except HelperPreflightError as exc:
+                        retryable = (
+                            profile == "small"
+                            and not local_recipe
+                            and (
+                                "generator_output_limit" in str(exc)
+                                or "empty input" in str(exc)
+                            )
+                        )
+                        if not retryable or max_input_bytes is None:
+                            raise
+                        if max_input_bytes >= MAX_STREAM_BYTES:
+                            exc.details["small_input_attempts"] = size_attempts
+                            exc.details["max_input_bytes"] = max_input_bytes
+                            raise
+                        max_input_bytes = SMALL_INPUT_CEILING_BYTES
+                        continue
+                    generated_input = generated.stdout
+                    input_transform = None
+                    if "validator" not in audit:
+                        observation = None
+                        break
+                    try:
+                        observation = self._preflight_validator_observation(
+                            audit["validator"], cwd=cwd, profile=profile,
+                            case_kind=case_kind, seed=seed,
+                            generated_input=generated_input,
+                            timeout=config.validator_timeout, sandbox=sandbox,
+                            deadline=config.deadline, clock=config.clock,
+                        )
+                        break
+                    except HelperPreflightError as exc:
+                        if (
+                            exc.code != "stress_generated_input_invalid"
+                            or profile != "small"
+                            or local_recipe
+                            or max_input_bytes is None
+                        ):
+                            raise
+                        if max_input_bytes >= MAX_STREAM_BYTES:
+                            exc.details["small_input_attempts"] = size_attempts
+                            exc.details["max_input_bytes"] = max_input_bytes
+                            raise
+                        max_input_bytes = SMALL_INPUT_CEILING_BYTES
+                break
             else:  # pragma: no cover - the loop always breaks or raises
                 raise AssertionError("seed search must break or raise")
-            if "validator" in audit:
+            if local_recipe:
+                manifest = self._preflight_generator_manifest(
+                    audit["generator"],
+                    cwd=cwd,
+                    profile=profile,
+                    case_kind=case_kind,
+                    seed=seed,
+                    generated_input=generated_input,
+                    max_input_bytes=max_input_bytes,
+                    timeout=config.generator_timeout,
+                    sandbox=sandbox,
+                    deadline=config.deadline,
+                    clock=config.clock,
+                )
+            elif "validator" in audit:
                 assert observation is not None
                 manifest_payload = {
                     "manifest_version": 1,
@@ -2113,69 +2645,83 @@ class HelperBundleManager:
                         actual=exc.actual,
                     ) from exc
             else:
-                manifest = self._preflight_generator_manifest(
-                    audit["generator"],
-                    cwd=cwd,
-                    profile=profile,
-                    case_kind=case_kind,
-                    seed=seed,
-                    generated_input=generated_input,
-                    timeout=config.generator_timeout,
-                    sandbox=sandbox,
-                    deadline=config.deadline,
-                    clock=config.clock,
-                )
+                if not config.require_manifest:
+                    manifest = None
+                else:
+                    manifest = self._preflight_generator_manifest(
+                        audit["generator"],
+                        cwd=cwd,
+                        profile=profile,
+                        case_kind=case_kind,
+                        seed=seed,
+                        generated_input=generated_input,
+                        max_input_bytes=max_input_bytes,
+                        timeout=config.generator_timeout,
+                        sandbox=sandbox,
+                        deadline=config.deadline,
+                        clock=config.clock,
+                    )
             limits = MAX_LARGE_INPUT_BYTES if profile == "large" else MAX_STREAM_BYTES
             output_limit = MAX_LARGE_OUTPUT_BYTES if profile == "large" else MAX_STREAM_BYTES
-            reference = self._preflight_run(
-                audit["reference"], cwd=cwd, artifact="reference",
+            reference_primary = self._preflight_run(
+                audit["reference_primary"], cwd=cwd, artifact="reference_primary",
                 profile=profile, case_kind=case_kind, seed=seed,
-                timeout=config.reference_timeout, input_data=generated_input,
+                timeout=config.reference_timeout_for("reference_primary"),
+                input_data=generated_input,
                 stdin_bytes=limits, stdout_bytes=output_limit, stderr_bytes=output_limit,
                 sandbox=sandbox,
                 deadline=config.deadline, clock=config.clock,
             )
-            if profile == "small":
-                brute = self._preflight_run(
-                    audit["brute"], cwd=cwd, artifact="brute",
-                    profile=profile, case_kind=case_kind, seed=seed,
-                    timeout=config.brute_timeout, input_data=generated_input,
-                    stdin_bytes=limits, stdout_bytes=output_limit,
-                    stderr_bytes=output_limit,
-                    sandbox=sandbox,
-                    deadline=config.deadline, clock=config.clock,
+            reference_secondary = self._preflight_run(
+                audit["reference_secondary"], cwd=cwd, artifact="reference_secondary",
+                profile=profile, case_kind=case_kind, seed=seed,
+                timeout=config.reference_timeout_for("reference_secondary"),
+                input_data=generated_input,
+                stdin_bytes=limits, stdout_bytes=output_limit,
+                stderr_bytes=output_limit,
+                sandbox=sandbox,
+                deadline=config.deadline, clock=config.clock,
+            )
+            if not _equal(
+                reference_primary.stdout,
+                reference_secondary.stdout,
+                config.exact_output,
+            ):
+                raise HelperPreflightError(
+                    "references disagree during preflight",
+                    artifact="oracle",
+                    profile=profile,
+                    case_kind=case_kind,
+                    seed=seed,
+                    stderr=(reference_primary.stderr + b"\n" + reference_secondary.stderr),
+                    code="stress_oracle_preflight_conflict",
+                    expected={
+                        "oracle": "reference_primary",
+                        "stdout": reference_primary.stdout.decode(
+                            "utf-8", errors="replace"
+                        )[:2000],
+                        "input_excerpt": generated_input.decode(
+                            "utf-8", errors="replace"
+                        )[:2000],
+                    },
+                    actual={
+                        "oracle": "reference_secondary",
+                        "stdout": reference_secondary.stdout.decode(
+                            "utf-8", errors="replace"
+                        )[:2000],
+                    },
                 )
-                if not _equal(brute.stdout, reference.stdout, config.exact_output):
-                    raise HelperPreflightError(
-                        "brute and reference disagree during small preflight",
-                        artifact="oracle",
-                        profile=profile,
-                        case_kind=case_kind,
-                        seed=seed,
-                        stderr=(brute.stderr + b"\n" + reference.stderr),
-                        code="stress_oracle_preflight_conflict",
-                        expected={
-                            "oracle": "brute",
-                            "stdout": brute.stdout.decode(
-                                "utf-8", errors="replace"
-                            )[:2000],
-                            "input_excerpt": generated_input.decode(
-                                "utf-8", errors="replace"
-                            )[:2000],
-                        },
-                        actual={
-                            "oracle": "reference",
-                            "stdout": reference.stdout.decode(
-                                "utf-8", errors="replace"
-                            )[:2000],
-                        },
-                    )
             record: dict[str, object] = {
                 "profile": profile,
                 "case_kind": case_kind,
                 "seed": seed,
                 "requested_seed": requested_seed,
                 "seed_search_attempts": seed_attempt + 1,
+                "small_input_attempts": size_attempts if profile == "small" else 1,
+                "max_input_bytes": (
+                    max_input_bytes if profile == "small" else MAX_LARGE_INPUT_BYTES
+                ),
+                "input_bytes": len(generated_input),
                 "input_sha256": sha256_bytes(generated_input),
                 "generator_manifest": manifest,
             }
@@ -2183,13 +2729,38 @@ class HelperBundleManager:
                 record["input_transform"] = input_transform
             return generated_input, record
 
-        total_cases = 1 + config.small_random_cases + (2 if config.include_large else 0)
-        if progress:
-            progress("small", "lower_bound", 1, total_cases)
-        _lower_output, lower_record = run_case(
-            "small", "lower_bound", seed0, sandbox=self.sandbox
+        blueprint_cases = blueprint.get("cases", [])
+        has_lower_bound = any(
+            isinstance(item, Mapping)
+            and item.get("profile") == "small"
+            and item.get("case_kind") == "lower_bound"
+            for item in blueprint_cases
+        ) if isinstance(blueprint_cases, Sequence) else False
+        total_cases = (
+            config.small_random_cases
+            + (1 if has_lower_bound else 0)
+            + (2 if config.include_large else 0)
         )
-        records.append(lower_record)
+        if has_lower_bound:
+            if progress:
+                progress("small", "lower_bound", 1, total_cases)
+            _lower_output, lower_record = run_case(
+                "small", "lower_bound", seed0, sandbox=self.sandbox
+            )
+            records.append(lower_record)
+
+        first_output, _first_record = run_case(
+            "small", "random", seed0, sandbox=self.sandbox
+        )
+        repeated_output, _repeated_record = run_case(
+            "small", "random", seed0, sandbox=self.sandbox
+        )
+        if first_output != repeated_output:
+            raise HelperPreflightError(
+                "generator output is not deterministic for the same seed",
+                artifact="generator", profile="small", case_kind="determinism",
+                seed=seed0,
+            )
 
         random_results: dict[int, tuple[bytes, dict[str, object]]] = {}
         if self._sandbox_factory is None:
@@ -2242,17 +2813,23 @@ class HelperBundleManager:
             result, record = random_results[offset]
             small_random_outputs.add(result)
             manifest = record["generator_manifest"]
-            assert isinstance(manifest, Mapping)
-            tags = manifest["coverage_tags"]
-            assert isinstance(tags, list)
-            small_observed_tags.update(str(tag) for tag in tags)
+            if manifest is not None:
+                assert isinstance(manifest, Mapping)
+                tags = manifest["coverage_tags"]
+                assert isinstance(tags, list)
+                small_observed_tags.update(str(tag) for tag in tags)
             records.append(record)
 
         # Adjacent seeds are allowed to collide: tiny legal state spaces and
         # deliberately weighted distributions make that a valid outcome.  A
         # generator is seed-insensitive only when the whole bounded window is
         # constant.  The same-seed probe above remains the determinism gate.
-        if config.small_random_cases >= 2 and len(small_random_outputs) < 2:
+        minimum_distinct_outputs = 12 if local_recipe else 2
+        if (
+            config.require_seed_variation
+            and config.small_random_cases >= 2
+            and len(small_random_outputs) < minimum_distinct_outputs
+        ):
             raise HelperPreflightError(
                 "generator ignores the seed across the small random window",
                 artifact="generator",
@@ -2260,15 +2837,186 @@ class HelperBundleManager:
                 case_kind="random",
                 seed=seed0 + config.small_random_cases,
                 code="stress_generator_seed_variation_failed",
-                expected={"distinct_outputs_minimum": 2},
+                expected={"distinct_outputs_minimum": minimum_distinct_outputs},
                 actual={
                     "distinct_outputs": len(small_random_outputs),
                     "window_size": config.small_random_cases,
                 },
             )
 
+        if local_recipe:
+            random_case = next(
+                (
+                    item
+                    for item in blueprint.get("cases", [])
+                    if isinstance(item, Mapping)
+                    and item.get("profile") == "small"
+                    and item.get("case_kind") == "random"
+                ),
+                None,
+            )
+            if not isinstance(random_case, Mapping):
+                raise HelperPreflightError(
+                    "local recipe has no small/random case",
+                    artifact="generator",
+                    profile="small",
+                    case_kind="random",
+                    seed=seed0,
+                    code="stress_generator_distribution_failed",
+                )
+
+            def require_balanced_counts(
+                label: str, expected_values: Sequence[str], observed_values: Sequence[str]
+            ) -> None:
+                expected = list(dict.fromkeys(str(value) for value in expected_values))
+                if not expected:
+                    return
+                counts = {value: 0 for value in expected}
+                for value in observed_values:
+                    if value in counts:
+                        counts[value] += 1
+                if min(counts.values()) < 1 or max(counts.values()) - min(counts.values()) > 1:
+                    raise HelperPreflightError(
+                        f"local recipe {label} distribution is not balanced",
+                        artifact="generator",
+                        profile="small",
+                        case_kind="random",
+                        seed=seed0 + config.small_random_cases,
+                        code="stress_generator_distribution_failed",
+                        expected={"values": expected, "maximum_count_delta": 1},
+                        actual={"counts": counts},
+                    )
+
+            budget = random_case.get("byte_budget")
+            budget = dict(budget) if isinstance(budget, Mapping) else {}
+            raw_all_buckets = budget.get("buckets", [])
+            all_buckets: list[tuple[int, int]] = []
+            if isinstance(raw_all_buckets, Sequence) and not isinstance(
+                raw_all_buckets, (str, bytes)
+            ):
+                for item in raw_all_buckets:
+                    if (
+                        isinstance(item, Sequence)
+                        and not isinstance(item, (str, bytes))
+                        and len(item) == 2
+                        and type(item[0]) is int
+                        and type(item[1]) is int
+                    ):
+                        all_buckets.append((int(item[0]), int(item[1])))
+            raw_buckets = budget.get("active_buckets", raw_all_buckets)
+            active_buckets: list[tuple[int, int]] = []
+            if isinstance(raw_buckets, Sequence) and not isinstance(raw_buckets, (str, bytes)):
+                for item in raw_buckets:
+                    if (
+                        isinstance(item, Sequence)
+                        and not isinstance(item, (str, bytes))
+                        and len(item) == 2
+                        and type(item[0]) is int
+                        and type(item[1]) is int
+                    ):
+                        active_buckets.append((int(item[0]), int(item[1])))
+            if not all_buckets:
+                all_buckets = list(active_buckets)
+            active_bucket_indices = {
+                index
+                for index, bucket in enumerate(all_buckets)
+                if bucket in active_buckets
+            }
+            bucket_values: list[str] = []
+            tag_values: list[str] = []
+            scheduled_bucket_fallbacks = 0
+            for offset in range(1, config.small_random_cases + 1):
+                result, record = random_results[offset]
+                matches = [
+                    index
+                    for index, (lower, upper) in enumerate(all_buckets)
+                    if lower <= len(result) <= upper
+                ]
+                if all_buckets and len(matches) != 1:
+                    raise HelperPreflightError(
+                        "local recipe output is outside its declared byte buckets",
+                        artifact="generator",
+                        profile="small",
+                        case_kind="random",
+                        seed=seed0 + offset,
+                        code="stress_generator_distribution_failed",
+                        expected={"buckets": all_buckets},
+                        actual={"input_bytes": len(result)},
+                    )
+                if matches:
+                    bucket_values.append(str(matches[0]))
+                manifest = record.get("generator_manifest")
+                if isinstance(manifest, Mapping):
+                    dimensions = manifest.get("dimensions", {})
+                    if isinstance(dimensions, Mapping) and matches:
+                        scheduled_bucket = dimensions.get("scheduled_byte_bucket")
+                        if (
+                            type(scheduled_bucket) is int
+                            and int(scheduled_bucket) != matches[0]
+                        ):
+                            scheduled_bucket_fallbacks += 1
+                        if matches[0] not in active_bucket_indices:
+                            scheduled_bucket_fallbacks += 1
+                    tags = manifest.get("coverage_tags", [])
+                    if isinstance(tags, Sequence) and not isinstance(tags, (str, bytes)):
+                        tag_values.extend(str(tag) for tag in tags)
+            # Compiler size ranges conservatively over-approximate digit widths
+            # and correlated n/m domains.  Preserve strict balance when every
+            # planned bucket was realizable; otherwise the generator reports
+            # the actual bucket and byte stratification remains an observable
+            # quality metric rather than an input-correctness failure.
+            if scheduled_bucket_fallbacks == 0:
+                require_balanced_counts(
+                    "byte bucket",
+                    [str(index) for index in sorted(active_bucket_indices)],
+                    bucket_values,
+                )
+            records.append(
+                {
+                    "profile": "small",
+                    "case_kind": "recipe_distribution",
+                    "scheduled_byte_bucket_fallbacks": scheduled_bucket_fallbacks,
+                    "actual_byte_bucket_counts": {
+                        bucket: bucket_values.count(bucket)
+                        for bucket in sorted(set(bucket_values))
+                    },
+                }
+            )
+            if blueprint.get("engine") == "local_templates_v1":
+                families = random_case.get("families", [])
+                family_ids: list[str] = []
+                semantic_ids: list[str] = []
+                if isinstance(families, Sequence) and not isinstance(
+                    families, (str, bytes)
+                ):
+                    for family_index, family in enumerate(families):
+                        if not isinstance(family, Mapping):
+                            continue
+                        structure = family.get("structure")
+                        if isinstance(structure, Mapping):
+                            family_id = str(structure.get("template_id") or "")
+                            if family_id:
+                                family_ids.append(
+                                    f"family:{family_id}#{family_index}"
+                                )
+                        goals = family.get("semantic_goals", [])
+                        if isinstance(goals, Sequence) and not isinstance(
+                            goals, (str, bytes)
+                        ):
+                            semantic_ids.extend(
+                                f"semantic:{goal}"
+                                for goal in goals
+                                if str(goal).strip()
+                            )
+                require_balanced_counts("family", family_ids, tag_values)
+                require_balanced_counts(
+                    "semantic family",
+                    semantic_ids or ["semantic:general"],
+                    tag_values,
+                )
+
         missing_small_tags = small_required_tags - small_observed_tags
-        if missing_small_tags:
+        if config.require_coverage and missing_small_tags:
             raise HelperPreflightError(
                 "small random generator manifests do not cover the required blueprint tags",
                 artifact="generator",
@@ -2292,10 +3040,11 @@ class HelperBundleManager:
                 "large", "upper_bound", upper_seed, sandbox=self.sandbox
             )
             upper_manifest = upper_record["generator_manifest"]
-            assert isinstance(upper_manifest, Mapping)
-            upper_tags = upper_manifest["coverage_tags"]
-            assert isinstance(upper_tags, list)
-            large_observed_tags.update(str(tag) for tag in upper_tags)
+            if upper_manifest is not None:
+                assert isinstance(upper_manifest, Mapping)
+                upper_tags = upper_manifest["coverage_tags"]
+                assert isinstance(upper_tags, list)
+                large_observed_tags.update(str(tag) for tag in upper_tags)
             records.append(upper_record)
             if progress:
                 progress("large", "random", total_cases, total_cases)
@@ -2311,14 +3060,15 @@ class HelperBundleManager:
                     seed=random_seed,
                 )
             large_manifest = large_record["generator_manifest"]
-            assert isinstance(large_manifest, Mapping)
-            large_tags = large_manifest["coverage_tags"]
-            assert isinstance(large_tags, list)
-            large_observed_tags.update(str(tag) for tag in large_tags)
+            if large_manifest is not None:
+                assert isinstance(large_manifest, Mapping)
+                large_tags = large_manifest["coverage_tags"]
+                assert isinstance(large_tags, list)
+                large_observed_tags.update(str(tag) for tag in large_tags)
             records.append(large_record)
 
             missing_large_tags = large_required_tags - large_observed_tags
-            if missing_large_tags:
+            if config.require_coverage and missing_large_tags:
                 raise HelperPreflightError(
                     "large generator manifests do not cover the required blueprint tags",
                     artifact="generator",
@@ -2336,14 +3086,17 @@ class HelperBundleManager:
                 )
 
         validation: dict[str, object] = {
-            "preflight_version": 5,
+            "preflight_version": HELPER_PREFLIGHT_VERSION,
+            "oracle_protocol": staged.oracle_protocol,
             "seed": seed0,
             "contract_hash": config.contract_hash,
             "generator_capabilities": capabilities,
             "build_modes": ["release_static", "libstdcxx_debug"],
             "sanitizer": sanitizer_status,
             "deterministic_generator": True,
-            "generator_manifest_version": 1,
+            "generator_manifest_version": int(
+                capabilities.get("manifest_version", 1)
+            ),
             "validator_probes": validator_probe_results,
             "independent_input_validator": "validator" in audit,
             "generator_blueprint": blueprint,
@@ -2419,12 +3172,20 @@ class HelperBundleManager:
                 deadline=config.deadline,
                 clock=config.clock,
             )
+        local_recipe = bool(
+            isinstance(config.generator_blueprint, Mapping)
+            and config.generator_blueprint.get("engine")
+            in {"local_templates_v1", "local_templates_v2"}
+        )
+
         def qualified_random(
             requested_seed: int,
         ) -> tuple[SandboxProcessResult, int, int]:
-            last_rejection: HelperPreflightError | None = None
-            for seed_attempt in range(1):
-                effective_seed = _derived_candidate_seed(requested_seed, seed_attempt)
+            effective_seed = requested_seed
+            max_input_bytes = SMALL_INPUT_INITIAL_BYTES
+            size_attempts = 0
+            while True:
+                size_attempts += 1
                 try:
                     generated = self._preflight_generate(
                         executables["generator"],
@@ -2433,20 +3194,27 @@ class HelperBundleManager:
                         case_kind="random",
                         seed=effective_seed,
                         timeout=config.generator_timeout,
+                        max_input_bytes=max_input_bytes,
                         deadline=config.deadline,
                         clock=config.clock,
                     )
                 except HelperPreflightError as exc:
-                    if (
-                        "generator_runtime_error" not in str(exc)
-                        or seed_attempt + 1
-                        >= _GENERATOR_VALID_SEED_SEARCH_ATTEMPTS
+                    if not (
+                        not local_recipe
+                        and (
+                        "generator_output_limit" in str(exc)
+                        or "empty input" in str(exc)
+                        )
                     ):
                         raise
-                    last_rejection = exc
+                    if max_input_bytes >= MAX_STREAM_BYTES:
+                        exc.details["small_input_attempts"] = size_attempts
+                        exc.details["max_input_bytes"] = max_input_bytes
+                        raise
+                    max_input_bytes = SMALL_INPUT_CEILING_BYTES
                     continue
                 if "validator" not in executables:
-                    return generated, effective_seed, seed_attempt + 1
+                    return generated, effective_seed, size_attempts
                 try:
                     self._preflight_validator_observation(
                         executables["validator"],
@@ -2460,17 +3228,18 @@ class HelperBundleManager:
                         clock=config.clock,
                     )
                 except HelperPreflightError as exc:
-                    if exc.code != "stress_generated_input_invalid":
+                    if exc.code != "stress_generated_input_invalid" or local_recipe:
                         raise
-                    exc.details["seed_search"] = {
-                        "requested_seed": requested_seed,
-                        "attempts": 1,
-                        "last_effective_seed": effective_seed,
-                    }
-                    raise
-                return generated, effective_seed, seed_attempt + 1
-            assert last_rejection is not None  # pragma: no cover
-            raise last_rejection
+                    if max_input_bytes >= MAX_STREAM_BYTES:
+                        exc.details["small_input_search"] = {
+                            "requested_seed": requested_seed,
+                            "attempts": size_attempts,
+                            "max_input_bytes": max_input_bytes,
+                        }
+                        raise
+                    max_input_bytes = SMALL_INPUT_CEILING_BYTES
+                    continue
+                return generated, effective_seed, size_attempts
 
         first, first_effective_seed, _first_attempts = qualified_random(seed)
         repeated, repeated_effective_seed, _repeated_attempts = qualified_random(seed)
@@ -2494,7 +3263,8 @@ class HelperBundleManager:
         for offset in range(1, 16):
             generated, _effective_seed, _attempts = qualified_random(seed + offset)
             variation_window.append(generated)
-        if len({result.stdout for result in variation_window}) < 2:
+        minimum_distinct_outputs = 12 if local_recipe else 2
+        if len({result.stdout for result in variation_window}) < minimum_distinct_outputs:
             raise HelperPreflightError(
                 "generator ignored every seed in the qualification window",
                 artifact="generator",
@@ -2502,7 +3272,7 @@ class HelperBundleManager:
                 case_kind="seed_variation",
                 seed=seed,
                 code="stress_generator_seed_variation_failed",
-                expected={"distinct_outputs_minimum": 2},
+                expected={"distinct_outputs_minimum": minimum_distinct_outputs},
                 actual={"distinct_outputs": 1, "window_size": len(variation_window)},
             )
         if "validator" in executables:
@@ -2551,7 +3321,7 @@ class HelperBundleManager:
                 )
             large_smoke_checked = True
         oracle_outputs: dict[str, bytes] = {}
-        for role in ("brute", "reference"):
+        for role in ("reference_primary", "reference_secondary"):
             result = self._preflight_run(
                 executables[role],
                 cwd=cwd,
@@ -2559,27 +3329,27 @@ class HelperBundleManager:
                 profile="small",
                 case_kind="smoke",
                 seed=seed,
-                timeout=(
-                    config.brute_timeout if role == "brute" else config.reference_timeout
-                ),
+                timeout=config.reference_timeout_for(role),
                 input_data=first.stdout,
                 deadline=config.deadline,
                 clock=config.clock,
             )
             oracle_outputs[role] = result.stdout
         if not _equal(
-            oracle_outputs["brute"], oracle_outputs["reference"], config.exact_output
+            oracle_outputs["reference_primary"],
+            oracle_outputs["reference_secondary"],
+            config.exact_output,
         ):
             raise HelperPreflightError(
-                "brute and reference disagree during smoke gate",
+                "references disagree during smoke gate",
                 artifact="oracle",
                 profile="small",
                 case_kind="smoke",
                 seed=seed,
                 code="stress_oracle_preflight_conflict",
                 expected={
-                    "oracle": "brute",
-                    "stdout": oracle_outputs["brute"].decode(
+                    "oracle": "reference_primary",
+                    "stdout": oracle_outputs["reference_primary"].decode(
                         "utf-8", errors="replace"
                     )[:2000],
                     "input_excerpt": first.stdout.decode(
@@ -2587,8 +3357,8 @@ class HelperBundleManager:
                     )[:2000],
                 },
                 actual={
-                    "oracle": "reference",
-                    "stdout": oracle_outputs["reference"].decode(
+                    "oracle": "reference_secondary",
+                    "stdout": oracle_outputs["reference_secondary"].decode(
                         "utf-8", errors="replace"
                     )[:2000],
                 },
@@ -2625,6 +3395,7 @@ class HelperBundleManager:
             manifest = {
                 "bundle_id": staged.bundle_id,
                 "problem_id": staged.problem_id,
+                "oracle_protocol": staged.oracle_protocol,
                 "baseline_hashes": staged.baseline_hashes,
                 "applied_hashes": staged.applied_hashes,
                 "files": names,
@@ -2664,6 +3435,7 @@ class HelperBundleManager:
             backup_dir=staged.backup_dir,
             staging_dir=staged.staging_dir,
             created_at=staged.created_at,
+            oracle_protocol=staged.oracle_protocol,
             release_executables=dict(staged.release_executables),
             validation=dict(staged.validation or {}),
         )
@@ -2710,7 +3482,11 @@ class HelperBundleManager:
         if preflight_config is None:
             raw = b"\0".join(
                 validate_cpp_source(source).encode("utf-8")
-                for source in (sources.generator, sources.brute, sources.reference)
+                for source in (
+                    sources.generator,
+                    sources.reference_primary,
+                    sources.reference_secondary,
+                )
             )
             preflight_config = HelperPreflightConfig(contract_hash=sha256_bytes(raw))
         self.preflight(staged, preflight_config, progress=progress)
@@ -2755,13 +3531,46 @@ class StopToken:
         self._event.clear()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class StressExecutables:
     solution: Path
     generator: Path
-    brute: Path
-    reference: Path
+    reference_primary: Path
+    reference_secondary: Path
     validator: Path | None = None
+
+    def __init__(
+        self,
+        solution: Path,
+        generator: Path,
+        reference_primary: Path | None = None,
+        reference_secondary: Path | None = None,
+        validator: Path | None = None,
+        *,
+        brute: Path | None = None,
+        reference: Path | None = None,
+    ) -> None:
+        primary = reference_primary if reference_primary is not None else brute
+        secondary = reference_secondary if reference_secondary is not None else reference
+        if primary is None or secondary is None:
+            raise TypeError("both reference executables are required")
+        if reference_primary is not None and brute is not None:
+            raise TypeError("reference_primary and deprecated brute are mutually exclusive")
+        if reference_secondary is not None and reference is not None:
+            raise TypeError("reference_secondary and deprecated reference are mutually exclusive")
+        object.__setattr__(self, "solution", Path(solution))
+        object.__setattr__(self, "generator", Path(generator))
+        object.__setattr__(self, "reference_primary", Path(primary))
+        object.__setattr__(self, "reference_secondary", Path(secondary))
+        object.__setattr__(self, "validator", Path(validator) if validator is not None else None)
+
+    @property
+    def brute(self) -> Path:
+        return self.reference_primary
+
+    @property
+    def reference(self) -> Path:
+        return self.reference_secondary
 
 
 @dataclass(frozen=True, slots=True)
@@ -2784,13 +3593,42 @@ class StressRunConfig:
     generator_timeout: float = 2.0
     reference_timeout: float = 2.0
     brute_timeout: float = 5.0
+    reference_primary_timeout: float | None = None
+    reference_secondary_timeout: float | None = None
     validator_timeout: float = 2.0
+    oracle_protocol: str = DUAL_REFERENCE_PROTOCOL
     exact_output: bool = False
     max_cases: int | None = None
 
     def __post_init__(self) -> None:
         if self.profile_version != 2:
             raise ValueError("only stress profile version 2 is supported")
+        if self.oracle_protocol not in {DUAL_REFERENCE_PROTOCOL, LEGACY_TRIO_PROTOCOL}:
+            raise ValueError("unsupported stress oracle protocol")
+        if min(
+            self.reference_primary_timeout
+            if self.reference_primary_timeout is not None
+            else self.brute_timeout,
+            self.reference_secondary_timeout
+            if self.reference_secondary_timeout is not None
+            else self.reference_timeout,
+        ) <= 0:
+            raise ValueError("reference timeouts must be positive")
+
+    def reference_timeout_for(self, role: str) -> float:
+        if role == "reference_primary":
+            return float(
+                self.reference_primary_timeout
+                if self.reference_primary_timeout is not None
+                else self.brute_timeout
+            )
+        if role == "reference_secondary":
+            return float(
+                self.reference_secondary_timeout
+                if self.reference_secondary_timeout is not None
+                else self.reference_timeout
+            )
+        raise KeyError(role)
 
 
 @dataclass(slots=True)
@@ -2805,6 +3643,9 @@ class StressRunResult:
     elapsed_ms: int = 0
     current_profile: str = ""
     case_kind: str = ""
+    #: Search-driver counters and the diversity report, empty when the run stayed
+    #: recipe-only (no contract, or a contract the profiler cannot parse).
+    search: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -2814,18 +3655,27 @@ def _equal(left: bytes, right: bytes, exact: bool) -> bool:
     return left == right if exact else left.split() == right.split()
 
 
-def classify_three_way(solution: bytes, brute: bytes, reference: bytes, *, exact: bool = False) -> str:
-    """Classify successful small-case outputs without blaming an uncertain oracle."""
-    brute_reference = _equal(brute, reference, exact)
-    solution_brute = _equal(solution, brute, exact)
-    solution_reference = _equal(solution, reference, exact)
-    if brute_reference and solution_brute:
+def classify_dual_reference(
+    solution: bytes,
+    reference_primary: bytes,
+    reference_secondary: bytes,
+    *,
+    exact: bool = False,
+) -> str:
+    """Classify output only after the two independent references agree."""
+    references_agree = _equal(reference_primary, reference_secondary, exact)
+    if references_agree and _equal(solution, reference_primary, exact):
         return "agree"
-    if brute_reference and not solution_brute:
+    if references_agree:
         return "mismatch"
-    if solution_brute or solution_reference:
-        return "oracle_conflict"
     return "oracle_conflict"
+
+
+def classify_three_way(
+    solution: bytes, brute: bytes, reference: bytes, *, exact: bool = False
+) -> str:
+    """Deprecated alias for reading legacy trio runs."""
+    return classify_dual_reference(solution, brute, reference, exact=exact)
 
 
 def _result_failure_kind(role: str, result: SandboxProcessResult) -> str | None:
@@ -2849,12 +3699,14 @@ def save_failure_assets(
     results: Mapping[str, SandboxProcessResult],
     source_hashes: Mapping[str, str],
     reference_source: Mapping[str, str] | None = None,
+    reference_sources: Mapping[str, Mapping[str, str]] | None = None,
     conflict_export_dir: str | Path | None = None,
     exact_output: bool = False,
     input_limit: int = MAX_STREAM_BYTES,
     output_limit: int = MAX_STREAM_BYTES,
     brute_status: str | None = None,
     case_kind: str = "random",
+    oracle_protocol: str = DUAL_REFERENCE_PROTOCOL,
 ) -> Path:
     root_path = Path(root).resolve()
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -2875,17 +3727,27 @@ def save_failure_assets(
         }
     conflict_exports: dict[str, str] = {}
     solution_result = results.get("solution")
-    reference_result = results.get("reference")
-    if (
-        conflict_export_dir is not None
-        and solution_result is not None
-        and reference_result is not None
-        and not _equal(
-            solution_result.stdout,
-            reference_result.stdout,
-            exact_output,
+    primary_result = results.get("reference_primary")
+    secondary_result = results.get("reference_secondary")
+    if oracle_protocol == LEGACY_TRIO_PROTOCOL:
+        primary_result = results.get("brute")
+        secondary_result = results.get("reference")
+        should_export = (
+            solution_result is not None
+            and secondary_result is not None
+            and not _equal(solution_result.stdout, secondary_result.stdout, exact_output)
         )
-    ):
+    else:
+        should_export = (
+            solution_result is not None
+            and primary_result is not None
+            and secondary_result is not None
+            and (
+                not _equal(primary_result.stdout, secondary_result.stdout, exact_output)
+                or not _equal(solution_result.stdout, primary_result.stdout, exact_output)
+            )
+        )
+    if conflict_export_dir is not None and should_export:
         export_dir = Path(conflict_export_dir).resolve()
         try:
             export_dir.relative_to(root_path)
@@ -2896,11 +3758,16 @@ def save_failure_assets(
         exports: dict[str, tuple[str, bytes]] = {
             "input": (f"{safe_problem}_input.in", input_data[:input_limit]),
         }
-        for role, label in (
-            ("solution", "current"),
-            ("brute", "brute"),
-            ("reference", "reference"),
-        ):
+        export_roles = (
+            (("solution", "current"), ("brute", "brute"), ("reference", "reference"))
+            if oracle_protocol == LEGACY_TRIO_PROTOCOL
+            else (
+                ("solution", "current"),
+                ("reference_primary", "ref1"),
+                ("reference_secondary", "ref2"),
+            )
+        )
+        for role, label in export_roles:
             result = results.get(role)
             if result is not None:
                 exports[label] = (
@@ -2918,6 +3785,11 @@ def save_failure_assets(
         "reason": reason,
         "source_hashes": dict(source_hashes),
         "reference_source": dict(reference_source or {}),
+        "reference_sources": {
+            str(role): dict(source)
+            for role, source in dict(reference_sources or {}).items()
+        },
+        "oracle_protocol": oracle_protocol,
         "results": metadata_results,
         "brute_status": brute_status,
         "conflict_exports": conflict_exports,
@@ -2946,16 +3818,25 @@ class LayeredStressRunner:
         progress: Callable[[StressRunResult], None] | None = None,
         source_hashes: Mapping[str, str] | None = None,
         reference_source: Mapping[str, str] | None = None,
+        reference_sources: Mapping[str, Mapping[str, str]] | None = None,
         conflict_export_dir: str | Path | None = None,
+        contract: Mapping[str, object] | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         self.problem_id = problem_id
         self.executables = executables
         self.sandbox = sandbox
+        # Optional: without it the search driver stays recipe-only, which is
+        # exactly the pre-driver behaviour.
+        self.contract = dict(contract) if contract is not None else None
         self.stop_token = stop_token or StopToken()
         self.progress = progress
         self.source_hashes = dict(source_hashes or {})
         self.reference_source = dict(reference_source or {})
+        self.reference_sources = {
+            str(role): dict(source)
+            for role, source in dict(reference_sources or {}).items()
+        }
         self.conflict_export_dir: Path | None = None
         if conflict_export_dir is not None:
             export_dir = Path(conflict_export_dir).resolve()
@@ -2967,6 +3848,8 @@ class LayeredStressRunner:
                 raise ValueError("conflict_export_dir must be an existing directory")
             self.conflict_export_dir = export_dir
         self._active_run_dir: Path | None = None
+        self._supports_lower_bound = False
+        self._driver: SearchDriver | None = None
 
     def request_stop(self) -> None:
         self.stop_token.request_stop()
@@ -2989,11 +3872,21 @@ class LayeredStressRunner:
         # every executable into that boundary instead of asking the sandbox to
         # read the dated source tree or shared build/staging directories.
         local_executables: dict[str, Path] = {}
+        oracle_roles = (
+            (
+                ("brute", self.executables.reference_primary),
+                ("reference", self.executables.reference_secondary),
+            )
+            if config.oracle_protocol == LEGACY_TRIO_PROTOCOL
+            else (
+                ("reference_primary", self.executables.reference_primary),
+                ("reference_secondary", self.executables.reference_secondary),
+            )
+        )
         for role, source in (
             ("solution", self.executables.solution),
             ("generator", self.executables.generator),
-            ("brute", self.executables.brute),
-            ("reference", self.executables.reference),
+            *oracle_roles,
         ):
             suffix = source.suffix if source.suffix else (".exe" if os.name == "nt" else "")
             target = run_dir / f"{role}{suffix}"
@@ -3005,11 +3898,16 @@ class LayeredStressRunner:
             target = run_dir / f"validator{suffix}"
             shutil.copy2(source, target)
             local_executables["validator"] = target
+        oracle_names = (
+            ("brute", "reference")
+            if config.oracle_protocol == LEGACY_TRIO_PROTOCOL
+            else ("reference_primary", "reference_secondary")
+        )
         self.executables = StressExecutables(
             local_executables["solution"],
             local_executables["generator"],
-            local_executables["brute"],
-            local_executables["reference"],
+            local_executables[oracle_names[0]],
+            local_executables[oracle_names[1]],
             local_executables.get("validator"),
         )
 
@@ -3038,30 +3936,67 @@ class LayeredStressRunner:
                     results={"validator": validator_result},
                     source_hashes=self.source_hashes,
                     reference_source=self.reference_source,
+                    reference_sources=self.reference_sources,
                     exact_output=config.exact_output,
+                    oracle_protocol=config.oracle_protocol,
                 )
                 state.failure_dir = str(directory)
                 return self._finish(state, reason, started)
-            for role, path in (
-                ("solution", self.executables.solution),
-                ("brute", self.executables.brute),
-                ("reference", self.executables.reference),
-            ):
+            sample_roles = (
+                (
+                    ("solution", self.executables.solution),
+                    ("brute", self.executables.reference_primary),
+                    ("reference", self.executables.reference_secondary),
+                )
+                if config.oracle_protocol == LEGACY_TRIO_PROTOCOL
+                else (
+                    ("solution", self.executables.solution),
+                    ("reference_primary", self.executables.reference_primary),
+                    ("reference_secondary", self.executables.reference_secondary),
+                )
+            )
+            for role, path in sample_roles:
                 results[role] = self._execute(
                     path, sample.input_data, self._timeout(role, config), run_dir
                 )
                 if self.stop_token.is_stopped():
                     return self._finish(state, "stopped", started)
-            failure = next((_result_failure_kind(role, result) for role, result in results.items() if _result_failure_kind(role, result)), None)
-            if failure or any(not _equal(result.stdout, sample.expected_output, config.exact_output) for result in results.values()):
-                reason = failure or "sample_mismatch"
+            if config.oracle_protocol == DUAL_REFERENCE_PROTOCOL:
+                failure = next(
+                    (
+                        _result_failure_kind(role, results[role])
+                        for role in ("reference_primary", "reference_secondary")
+                        if _result_failure_kind(role, results[role])
+                    ),
+                    None,
+                )
+            else:
+                failure = next((_result_failure_kind(role, result) for role, result in results.items() if _result_failure_kind(role, result)), None)
+            dual_conflict = (
+                config.oracle_protocol == DUAL_REFERENCE_PROTOCOL
+                and not _equal(
+                    results["reference_primary"].stdout,
+                    results["reference_secondary"].stdout,
+                    config.exact_output,
+                )
+            )
+            if (
+                config.oracle_protocol == DUAL_REFERENCE_PROTOCOL
+                and failure is None
+                and not dual_conflict
+            ):
+                failure = _result_failure_kind("solution", results["solution"])
+            if failure or dual_conflict or any(not _equal(result.stdout, sample.expected_output, config.exact_output) for result in results.values()):
+                reason = failure or ("oracle_conflict" if dual_conflict else "sample_mismatch")
                 directory = save_failure_assets(
                     self.root, self.problem_id, config.first_seed, reason=reason,
                     profile=f"sample:{sample.name}", input_data=sample.input_data,
                     results=results, source_hashes=self.source_hashes,
                     reference_source=self.reference_source,
+                    reference_sources=self.reference_sources,
                     conflict_export_dir=self.conflict_export_dir,
                     exact_output=config.exact_output,
+                    oracle_protocol=config.oracle_protocol,
                 )
                 state.failure_dir = str(directory)
                 return self._finish(state, reason, started)
@@ -3074,20 +4009,29 @@ class LayeredStressRunner:
             if self.stop_token.is_stopped():
                 return self._finish(state, "stopped", started)
             raise
+        self._driver = self._build_driver(config, run_dir)
 
+        driver = self._driver
         while config.max_cases is None or state.total_cases < config.max_cases:
             if self.stop_token.is_stopped():
                 return self._finish(state, "stopped", started)
             profile, case_kind = self._case_for_index(state.total_cases, config)
             state.current_profile = profile
             state.case_kind = case_kind
-            seed = state.next_seed
+            request = (
+                driver.next_case(profile, case_kind)
+                if driver is not None
+                else CaseRequest("recipe", state.next_seed, origin="recipe")
+            )
             outcome = self._run_generated_case(
-                seed, profile, case_kind, config, run_dir
+                request.seed, profile, case_kind, config, run_dir, request=request
             )
             if outcome is not None and outcome[0] == "stopped":
                 return self._finish(state, "stopped", started)
-            state.next_seed += 1
+            # The driver owns seed allocation once it exists, so that a
+            # synthesized case still advances the seed the dashboard and resume
+            # bookkeeping are keyed by.
+            state.next_seed = driver.next_seed if driver is not None else state.next_seed + 1
             state.total_cases += 1
             if profile == "small":
                 state.small_cases += 1
@@ -3103,16 +4047,71 @@ class LayeredStressRunner:
                 self.progress(state)
         return self._finish(state, "limit_reached", started)
 
-    @staticmethod
-    def _case_for_index(index: int, config: StressRunConfig) -> tuple[str, str]:
+    def _build_driver(
+        self, config: StressRunConfig, run_dir: Path
+    ) -> SearchDriver | None:
+        """Construct the case-selection driver, or ``None`` to stay recipe-only.
+
+        Recipe-only is the pre-driver behaviour, so every failure to build one is
+        a silent degradation rather than an error: no contract, an unparseable
+        contract, or a resume whose archive cannot be restored all just mean the
+        loop keeps asking the generator for seeds.
+        """
+
+        if self.contract is None:
+            return None
+        driver = SearchDriver(
+            self.contract,
+            first_seed=config.first_seed,
+            max_bytes=SMALL_EXHAUSTIVE_MAX_BYTES,
+            rng_seed=config.first_seed,
+        )
+        if not driver.active:
+            return None
+        archive_path = self._archive_path
+        if archive_path is not None and archive_path.is_file():
+            try:
+                driver.load(str(archive_path))
+            except (OSError, ValueError, json.JSONDecodeError):
+                # A corrupt or stale archive must not abort a run that would
+                # otherwise work.  Start from an empty one.
+                pass
+        return driver
+
+    @property
+    def _archive_path(self) -> Path | None:
+        """Where this problem's archive persists across runs.
+
+        Outside the per-run directory on purpose: the run directory is deleted by
+        :meth:`cleanup`, and the whole point of the archive is to survive.
+        """
+
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", self.problem_id).strip("._-")
+        if not safe:
+            return None
+        return self.root / ".acm" / "stress-archives" / f"{safe}.json"
+
+    def _persist_archive(self) -> None:
+        driver = self._driver
+        archive_path = self._archive_path
+        if driver is None or archive_path is None or not driver.active:
+            return
+        try:
+            driver.save(str(archive_path))
+        except OSError:
+            # Losing the archive costs the next run its warm start, nothing more.
+            pass
+
+    def _case_for_index(self, index: int, config: StressRunConfig) -> tuple[str, str]:
         if config.profile_version != 2:
             raise ValueError("only stress profile version 2 is supported")
         absolute = config.schedule_offset + index
-        if absolute == 0:
+        if self._supports_lower_bound and absolute == 0:
             return "small", "lower_bound"
-        if config.include_large and absolute == 1:
+        upper_index = 1 if self._supports_lower_bound else 0
+        if config.include_large and absolute == upper_index:
             return "large", "upper_bound"
-        prelude = 2 if config.include_large else 1
+        prelude = int(self._supports_lower_bound) + int(config.include_large)
         position = max(0, absolute - prelude)
         if not config.include_large or config.large_per_cycle <= 0:
             return "small", "random"
@@ -3126,22 +4125,58 @@ class LayeredStressRunner:
     def _require_generator_v2(
         self, config: StressRunConfig, cwd: Path
     ) -> None:
-        probe_generator_v2(
+        capabilities = probe_generator_v2(
             self.sandbox,
             self.executables.generator,
             cwd=cwd,
             timeout=config.generator_timeout,
         )
+        self._supports_lower_bound = (
+            _GENERATOR_OPTIONAL_CASE in capabilities["supported_cases"]
+        )
 
     @staticmethod
     def _timeout(role: str, config: StressRunConfig) -> float:
-        return {
+        fixed = {
             "solution": config.solution_timeout,
             "generator": config.generator_timeout,
             "reference": config.reference_timeout,
             "brute": config.brute_timeout,
             "validator": config.validator_timeout,
-        }[role]
+        }
+        if role in {"reference_primary", "reference_secondary"}:
+            return config.reference_timeout_for(role)
+        return fixed[role]
+
+    def _record_case(
+        self,
+        request: CaseRequest | None,
+        input_data: bytes,
+        results: Mapping[str, SandboxProcessResult],
+        config: StressRunConfig,
+    ) -> None:
+        """Feed a completed, non-failing case back into the search driver.
+
+        The behavioural signal must come from a reference, never from the
+        solution under test: keying archive cells on the solution's output would
+        make the search reward the very disagreement it is hunting for, and a
+        wrong solution would steer its own test data.
+        """
+
+        driver = self._driver
+        if driver is None or request is None:
+            return
+        role = (
+            "reference_primary"
+            if config.oracle_protocol == DUAL_REFERENCE_PROTOCOL
+            else ("brute" if "brute" in results else "reference")
+        )
+        reference = results.get(role)
+        driver.record(
+            request,
+            input_data,
+            reference_output=reference.stdout if reference is not None else None,
+        )
 
     def _validate_input(
         self,
@@ -3257,6 +4292,8 @@ class LayeredStressRunner:
         case_kind: str,
         config: StressRunConfig,
         cwd: Path,
+        *,
+        request: CaseRequest | None = None,
     ) -> tuple[str, Path | None, str] | None:
         requested_seed = seed
         environment = {"ACM_STRESS_SEED": str(seed), "ACM_STRESS_PROFILE": profile}
@@ -3275,14 +4312,26 @@ class LayeredStressRunner:
         # hide an invalid generator after a bundle has been certified.
         seed_attempts = 1
         validator_result: SandboxProcessResult | None = None
+        synthesized = request is not None and request.data is not None
         for seed_attempt in range(seed_attempts):
             seed = _derived_candidate_seed(requested_seed, seed_attempt)
             environment["ACM_STRESS_SEED"] = str(seed)
             generator_args = (str(seed), profile, case_kind)
-            generated = self._execute(
-                self.executables.generator, None, config.generator_timeout, cwd,
-                env=environment, args=generator_args, stdout_bytes=generator_stdout,
-            )
+            if synthesized:
+                # The input came from the search driver, so there is no generator
+                # process for this case.  A synthetic result keeps the failure
+                # assets and reporting paths below unchanged.
+                assert request is not None and request.data is not None
+                generated = SandboxProcessResult(
+                    command=[f"<search:{request.origin or request.source}>"],
+                    returncode=0,
+                    stdout=request.data,
+                )
+            else:
+                generated = self._execute(
+                    self.executables.generator, None, config.generator_timeout, cwd,
+                    env=environment, args=generator_args, stdout_bytes=generator_stdout,
+                )
             if self.stop_token.is_stopped():
                 return "stopped", None, "stopped by user"
             gen_failure = _result_failure_kind("generator", generated)
@@ -3299,6 +4348,7 @@ class LayeredStressRunner:
                     self.root, self.problem_id, seed, reason=gen_failure, profile=profile,
                     input_data=generated.stdout, results={"generator": generated},
                     source_hashes=self.source_hashes, reference_source=self.reference_source,
+                    reference_sources=self.reference_sources,
                     conflict_export_dir=self.conflict_export_dir,
                     exact_output=config.exact_output,
                     input_limit=generator_stdout,
@@ -3306,6 +4356,7 @@ class LayeredStressRunner:
                         MAX_LARGE_OUTPUT_BYTES if profile == "large" else MAX_STREAM_BYTES
                     ),
                     case_kind=case_kind,
+                    oracle_protocol=config.oracle_protocol,
                 )
                 return gen_failure, directory, "generator did not produce a valid case"
             input_data = generated.stdout
@@ -3320,6 +4371,17 @@ class LayeredStressRunner:
             if validation_failure is None:
                 break
             reason, validator_result = validation_failure
+            if synthesized and reason == "generated_input_rejected":
+                # The certified generator is not implicated: the driver's
+                # contract-clamped mutation cannot see cross-field constraints, so
+                # it can propose something the real validator refuses.  Discard
+                # the case, tell the driver, and keep the run going.  Saving
+                # failure assets here would report a generator bug that is not
+                # there and stop a healthy run.
+                if self._driver is not None:
+                    assert request is not None
+                    self._driver.reject(request)
+                return None
             if reason == "generated_input_rejected" and seed_attempt + 1 < seed_attempts:
                 continue
             directory = save_failure_assets(
@@ -3333,16 +4395,28 @@ class LayeredStressRunner:
                 results={"generator": generated, "validator": validator_result},
                 source_hashes=self.source_hashes,
                 reference_source=self.reference_source,
+                reference_sources=self.reference_sources,
                 exact_output=config.exact_output,
                 input_limit=generator_stdout,
                 output_limit=(
                     MAX_LARGE_OUTPUT_BYTES if profile == "large" else MAX_STREAM_BYTES
                 ),
+                oracle_protocol=config.oracle_protocol,
             )
             return reason, directory, "validator rejected generated input"
-        roles = [("solution", self.executables.solution), ("reference", self.executables.reference)]
-        if profile == "small":
-            roles.insert(1, ("brute", self.executables.brute))
+        if config.oracle_protocol == LEGACY_TRIO_PROTOCOL:
+            roles = [
+                ("solution", self.executables.solution),
+                ("reference", self.executables.reference_secondary),
+            ]
+            if profile == "small":
+                roles.insert(1, ("brute", self.executables.reference_primary))
+        else:
+            roles = [
+                ("solution", self.executables.solution),
+                ("reference_primary", self.executables.reference_primary),
+                ("reference_secondary", self.executables.reference_secondary),
+            ]
         large = profile == "large"
         program_input_limit = MAX_LARGE_INPUT_BYTES if large else MAX_STREAM_BYTES
         program_output_limit = MAX_LARGE_OUTPUT_BYTES if large else MAX_STREAM_BYTES
@@ -3359,7 +4433,13 @@ class LayeredStressRunner:
             )
             if self.stop_token.is_stopped():
                 return "stopped", None, "stopped by user"
-        for role, result in results.items():
+        failure_roles = (
+            ("reference_primary", "reference_secondary")
+            if config.oracle_protocol == DUAL_REFERENCE_PROTOCOL
+            else tuple(results)
+        )
+        for role in failure_roles:
+            result = results[role]
             failure = _result_failure_kind(role, result)
             if failure:
                 all_results = {"generator": generated, **results}
@@ -3367,14 +4447,54 @@ class LayeredStressRunner:
                     self.root, self.problem_id, seed, reason=failure, profile=profile,
                     input_data=input_data, results=all_results,
                     source_hashes=self.source_hashes, reference_source=self.reference_source,
+                    reference_sources=self.reference_sources,
                     conflict_export_dir=self.conflict_export_dir,
                     exact_output=config.exact_output,
                     input_limit=program_input_limit,
                     output_limit=program_output_limit,
-                    brute_status=("skipped_large_profile" if large else None),
                     case_kind=case_kind,
+                    oracle_protocol=config.oracle_protocol,
                 )
                 return failure, directory, f"{role} execution failed"
+        self._record_case(request, input_data, results, config)
+        if config.oracle_protocol == DUAL_REFERENCE_PROTOCOL:
+            classification = classify_dual_reference(
+                results["solution"].stdout,
+                results["reference_primary"].stdout,
+                results["reference_secondary"].stdout,
+                exact=config.exact_output,
+            )
+            if classification != "oracle_conflict":
+                solution_failure = _result_failure_kind("solution", results["solution"])
+                if solution_failure:
+                    directory = save_failure_assets(
+                        self.root, self.problem_id, seed, reason=solution_failure,
+                        profile=profile, input_data=input_data,
+                        results={"generator": generated, **results},
+                        source_hashes=self.source_hashes,
+                        reference_source=self.reference_source,
+                        reference_sources=self.reference_sources,
+                        conflict_export_dir=self.conflict_export_dir,
+                        exact_output=config.exact_output,
+                        input_limit=program_input_limit,
+                        output_limit=program_output_limit,
+                        case_kind=case_kind,
+                        oracle_protocol=config.oracle_protocol,
+                    )
+                    return solution_failure, directory, "solution execution failed"
+            if classification == "agree":
+                return None
+            directory = save_failure_assets(
+                self.root, self.problem_id, seed, reason=classification, profile=profile,
+                input_data=input_data, results={"generator": generated, **results},
+                source_hashes=self.source_hashes, reference_source=self.reference_source,
+                reference_sources=self.reference_sources,
+                conflict_export_dir=self.conflict_export_dir,
+                exact_output=config.exact_output,
+                case_kind=case_kind,
+                oracle_protocol=config.oracle_protocol,
+            )
+            return classification, directory, "dual-reference outputs disagree"
         if profile == "small":
             classification = classify_three_way(
                 results["solution"].stdout, results["brute"].stdout,
@@ -3386,20 +4506,17 @@ class LayeredStressRunner:
                 self.root, self.problem_id, seed, reason=classification, profile=profile,
                 input_data=input_data, results={"generator": generated, **results},
                 source_hashes=self.source_hashes, reference_source=self.reference_source,
+                reference_sources=self.reference_sources,
                 conflict_export_dir=self.conflict_export_dir,
                 exact_output=config.exact_output,
                 case_kind=case_kind,
+                oracle_protocol=config.oracle_protocol,
             )
-            return classification, directory, "three-way outputs disagree"
+            return classification, directory, "legacy three-way outputs disagree"
         if _equal(results["solution"].stdout, results["reference"].stdout, config.exact_output):
             return None
 
         if large:
-            results["brute"] = SandboxProcessResult(
-                command=[],
-                returncode=0,
-                stdout=BRUTE_SKIPPED_LARGE_OUTPUT,
-            )
             directory = save_failure_assets(
                 self.root,
                 self.problem_id,
@@ -3410,12 +4527,14 @@ class LayeredStressRunner:
                 results={"generator": generated, **results},
                 source_hashes=self.source_hashes,
                 reference_source=self.reference_source,
+                reference_sources=self.reference_sources,
                 conflict_export_dir=self.conflict_export_dir,
                 exact_output=config.exact_output,
                 input_limit=MAX_LARGE_INPUT_BYTES,
                 output_limit=MAX_LARGE_OUTPUT_BYTES,
                 brute_status="skipped_large_profile",
                 case_kind=case_kind,
+                oracle_protocol=config.oracle_protocol,
             )
             return "mismatch", directory, "large solution/reference disagreement"
 
@@ -3424,6 +4543,10 @@ class LayeredStressRunner:
     def _finish(self, state: StressRunResult, status: str, started: float) -> StressRunResult:
         state.status = status
         state.elapsed_ms = round((time.monotonic() - started) * 1000)
+        driver = self._driver
+        if driver is not None:
+            state.search = driver.report()
+        self._persist_archive()
         if self.progress:
             self.progress(state)
         self.cleanup()
@@ -3445,11 +4568,13 @@ class LayeredStressRunner:
 __all__ = [
     "BundleConflictError", "HelperBundle", "HelperBundleManager", "HelperPreflightConfig",
     "HelperPreflightError", "HelperSources", "StagedHelperBundle",
-    "BRUTE_SKIPPED_LARGE_OUTPUT", "GeneratorCapabilityError", "LayeredStressRunner", "MAX_CPP_BYTES",
+    "DUAL_REFERENCE_PROTOCOL", "LEGACY_TRIO_PROTOCOL", "GeneratorCapabilityError",
+    "LayeredStressRunner", "MAX_CPP_BYTES",
     "MAX_LARGE_INPUT_BYTES", "MAX_LARGE_OUTPUT_BYTES", "MAX_STREAM_BYTES", "SampleCase",
     "SandboxBackend", "SandboxCapability", "SandboxLimits", "SandboxProcessResult",
     "SandboxUnavailableError", "SourceSafetyError", "StopToken", "StressError",
     "StressExecutables", "StressRunConfig", "StressRunResult",
-    "WindowsAppContainerBackend", "classify_three_way", "probe_generator_v2", "save_failure_assets",
+    "WindowsAppContainerBackend", "classify_dual_reference", "classify_three_way",
+    "cpp_compiler_fingerprint", "probe_generator_v2", "save_failure_assets",
     "sha256_bytes", "sha256_file", "validate_cpp_source",
 ]

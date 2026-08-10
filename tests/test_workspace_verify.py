@@ -10,9 +10,12 @@ from tools.acm_agent.verify import outputs_equal, verify_problem
 from tools.acm_agent.workspace import (
     DEFAULT_TEMPLATE,
     find_solution,
+    load_default_template,
     parse_problem_ref,
+    save_default_template,
     scan_local_solutions,
     start_problem,
+    validate_default_template,
 )
 
 
@@ -24,15 +27,29 @@ class WorkspaceTests(unittest.TestCase):
             "https://codeforces.com/contest/1313/problem/C1": ("codeforces", "CF1313C1"),
             "P3373": ("luogu", "P3373"),
             "https://www.luogu.com.cn/problem/P3373": ("luogu", "P3373"),
+            "abc123": ("custom", "ABC123"),
+            "my-test-1": ("custom", "MY-TEST-1"),
+            "P1000x": ("custom", "P1000X"),
+            "校内模拟/2026/round2": ("custom", "校内模拟_2026_ROUND2"),
         }
         for raw, expected in cases.items():
             with self.subTest(raw=raw):
                 parsed = parse_problem_ref(raw)
                 self.assertEqual((parsed.platform, parsed.problem_id), expected)
 
-    def test_rejects_non_problem_url(self) -> None:
+    def test_rejects_non_problem_url_and_reserved_names(self) -> None:
+        for value in (
+            "https://codeforces.com/contest/1",
+            "https://atcoder.jp/contests/abc123/tasks/abc123_a",
+            "www.example.com/x",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    parse_problem_ref(value)
         with self.assertRaises(ValueError):
-            parse_problem_ref("https://codeforces.com/contest/1")
+            parse_problem_ref("CON")
+        with self.assertRaises(ValueError):
+            parse_problem_ref("nul")
 
     def test_scan_only_dated_primary_solutions(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -41,13 +58,24 @@ class WorkspaceTests(unittest.TestCase):
             day.mkdir(parents=True)
             (day / "CF1A.cpp").write_text("", encoding="utf-8")
             (day / "CF1A.bf.cpp").write_text("", encoding="utf-8")
+            (day / "CF1A.gen.cpp").write_text("", encoding="utf-8")
             (day / "P1000.cpp").write_text("", encoding="utf-8")
+            (day / "MYTEST.cpp").write_text("", encoding="utf-8")
+            (day / "MYTEST.ref.cpp").write_text("", encoding="utf-8")
             (day / "notes.cpp").write_text("", encoding="utf-8")
+            (day / "template.cpp").write_text("", encoding="utf-8")
             nested = day / "nested"
             nested.mkdir()
             (nested / "CF2A.cpp").write_text("", encoding="utf-8")
             found = scan_local_solutions(root)
-            self.assertEqual([item.problem.problem_id for item in found], ["CF1A", "P1000"])
+            self.assertEqual(
+                [item.problem.problem_id for item in found],
+                ["CF1A", "MYTEST", "NOTES", "P1000"],
+            )
+            self.assertEqual(
+                {item.problem.platform for item in found},
+                {"codeforces", "custom", "luogu"},
+            )
             self.assertTrue(all(item.to_dict()["status"] == "local_only" for item in found))
 
     def test_start_uses_unpadded_date_and_preserves_files(self) -> None:
@@ -77,6 +105,41 @@ class WorkspaceTests(unittest.TestCase):
             result = start_problem(temp, "P1000", today=date(2026, 1, 2))
             self.assertEqual(result.source.read_text(encoding="utf-8"), DEFAULT_TEMPLATE)
             self.assertIsNone(result.template_source)
+
+    def test_global_template_used_when_day_has_none(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            global_template = root / ".acm" / "template.cpp"
+            global_template.parent.mkdir(parents=True)
+            global_template.write_text("// global\n", encoding="utf-8")
+            result = start_problem(root, "CF1A", today=date(2026, 1, 2))
+            self.assertEqual(result.source.read_text(encoding="utf-8"), "// global\n")
+            self.assertEqual(result.template_source, global_template.resolve())
+
+    def test_day_template_beats_global_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            day = root / "2026" / "8" / "3"
+            day.mkdir(parents=True)
+            (day / "template.cpp").write_text("// day\n", encoding="utf-8")
+            global_template = root / ".acm" / "template.cpp"
+            global_template.parent.mkdir(parents=True)
+            global_template.write_text("// global\n", encoding="utf-8")
+            result = start_problem(root, "P1000", today=date(2026, 8, 3))
+            self.assertEqual(result.source.read_text(encoding="utf-8"), "// day\n")
+
+    def test_save_validate_and_load_default_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = save_default_template(root, "// hi\n")
+            self.assertEqual(path.read_text(encoding="utf-8"), "// hi\n")
+            self.assertEqual(load_default_template(root), "// hi\n")
+            self.assertEqual(load_default_template(root / "missing"), DEFAULT_TEMPLATE)
+            with self.assertRaises(ValueError):
+                validate_default_template("a\x00b")
+            with self.assertRaises(ValueError):
+                validate_default_template("x" * (64 * 1024 + 1))
+            self.assertEqual(validate_default_template("ok"), "ok")
 
     def test_find_solution_uses_latest_date_not_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

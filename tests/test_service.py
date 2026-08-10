@@ -48,6 +48,26 @@ class AcmServiceTests(unittest.TestCase):
         shutil.copy2(REPO_ROOT / "training/data-structures-30d/plan.json", target / "plan.json")
         shutil.copy2(REPO_ROOT / "training/data-structures-30d/README.md", target / "README.md")
 
+    def test_start_saves_and_uses_global_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.prepare_root(root)
+            service = AcmService(root)
+            service.setup("fixture", "42", target_rating=1700, skip_validate=True)
+            template = "// custom\nint main() {}\n"
+            started = service.start("CF1A", template=template)
+            global_file = root / ".acm" / "template.cpp"
+            self.assertEqual(global_file.read_text(encoding="utf-8"), template)
+            self.assertEqual(
+                Path(started["source"]).read_text(encoding="utf-8"), template
+            )
+            payload = service.workspace_template()
+            self.assertEqual(payload["template"], template)
+            self.assertEqual(payload["source"], "global")
+            self.assertTrue(payload["builtin"])
+            with self.assertRaises(ValueError):
+                service.start("CF1B", template="bad\x00template")
+
     def test_bootstrap_before_setup_is_non_failing_and_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -139,6 +159,22 @@ class AcmServiceTests(unittest.TestCase):
                     source_mode="plan_only",
                 )
             self.assertEqual(captured["target_cf_rating"], 2100)
+
+    def test_recommendations_support_explicit_dependency_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.prepare_root(root)
+            captured: dict[str, object] = {}
+
+            def fake_recommend(*args, **kwargs):
+                captured.update(kwargs)
+                return []
+
+            service = AcmService(root, recommend_fn=fake_recommend)
+            service.setup("fixture", "42", target_rating=1900, skip_validate=True)
+            service.recommendations(count=1, mode="new", source_mode="plan_only")
+
+            self.assertEqual(captured["target_cf_rating"], 1900)
 
     def test_skip_is_global_idempotent_and_does_not_create_attempt_or_review(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
