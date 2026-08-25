@@ -8,6 +8,8 @@ The default implementation uses only :mod:`urllib.request`.
 from __future__ import annotations
 
 import json
+import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -27,7 +29,12 @@ CF_THROTTLE_SECONDS = 2.1
 LUOGU_CATALOG_WORKERS = 4
 LUOGU_TAG_WORKERS = 4
 LUOGU_TAG_FAILURES_KEY = "tag_enrichment_failures"
+LUOGU_TAGLESS_KEY = "tag_enrichment_tagless"
 LUOGU_FULL_CATALOG_MIN_PROBLEMS = 10_000
+LUOGU_CHALLENGE_COOKIE_RE = re.compile(
+    r'["\'](C3VK=[A-Za-z0-9._~-]{1,128});\s*path=/;\s*max-age=\d+;?["\']',
+    re.IGNORECASE,
+)
 
 
 def _report_progress(
@@ -54,6 +61,25 @@ class RemoteAPIError(PlatformError):
 
 class ResponseShapeError(PlatformError):
     pass
+
+
+def _luogu_challenge_cookie(payload: Any) -> str | None:
+    """Return the narrowly-scoped Luogu JS challenge cookie, if present.
+
+    Luogu may answer an anonymous request with a tiny script that only sets a
+    short-lived ``C3VK`` cookie and reloads the same URL.  The client must not
+    execute arbitrary JavaScript, so accept only that exact cookie contract.
+    """
+
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8-sig", errors="replace")
+    if not isinstance(payload, str) or len(payload) > 4096:
+        return None
+    lowered = payload.lower()
+    if "<script" not in lowered or "window.open(" not in lowered or "c3vk=" not in lowered:
+        return None
+    match = LUOGU_CHALLENGE_COOKIE_RE.search(payload)
+    return match.group(1) if match else None
 
 
 class RequestFunction(Protocol):
@@ -567,13 +593,26 @@ def parse_luogu_problem(
 class LuoguClient:
     def __init__(self, request: RequestFunction | None = None):
         self.request = request or HttpTransport()
+        self._cookie_lock = threading.Lock()
+        self._challenge_cookie: str | None = None
 
     def _get(self, path: str, **params: Any) -> Any:
-        return self.request(
-            f"{LUOGU_BASE}{path}",
-            params,
-            {"Referer": LUOGU_BASE + "/"},
-        )
+        url = f"{LUOGU_BASE}{path}"
+        for challenge_attempt in range(2):
+            with self._cookie_lock:
+                cookie = self._challenge_cookie
+            headers = {"Referer": LUOGU_BASE + "/"}
+            if cookie:
+                headers["Cookie"] = cookie
+            payload = self.request(url, params, headers)
+            challenge_cookie = _luogu_challenge_cookie(payload)
+            if challenge_cookie is None:
+                return payload
+            with self._cookie_lock:
+                self._challenge_cookie = challenge_cookie
+            if challenge_attempt == 1:
+                break
+        raise RemoteAPIError("Luogu JavaScript cookie challenge persisted after retry")
 
     def practice(self, uid: str | int) -> set[str]:
         return parse_luogu_passed(self._get(f"/user/{uid}/practice", _contentOnly=1))
@@ -842,15 +881,48 @@ def enrich_luogu_accepted_problem_tags(
     metadata = _sync_metadata(db, "luogu")
     cursor = metadata.get(LUOGU_TAG_ENRICHMENT_CURSOR_KEY)
     missing = _luogu_accepted_problems_missing_tags(db)
+    missing_set = set(missing)
     raw_failures = metadata.get(LUOGU_TAG_FAILURES_KEY)
     failures: dict[str, dict[str, Any]] = {
         str(problem_id).strip().upper(): dict(value)
         for problem_id, value in (raw_failures.items() if isinstance(raw_failures, Mapping) else [])
-        if isinstance(value, Mapping)
+        if isinstance(value, Mapping) and str(problem_id).strip().upper() in missing_set
     }
+    raw_tagless = metadata.get(LUOGU_TAGLESS_KEY)
+    if isinstance(raw_tagless, Mapping):
+        tagless: dict[str, dict[str, Any]] = {
+            str(problem_id).strip().upper(): dict(value)
+            for problem_id, value in raw_tagless.items()
+            if isinstance(value, Mapping)
+            and str(problem_id).strip().upper() in missing_set
+        }
+    elif isinstance(raw_tagless, list):
+        tagless = {
+            str(problem_id).strip().upper(): {}
+            for problem_id in raw_tagless
+            if isinstance(problem_id, str)
+            and str(problem_id).strip().upper() in missing_set
+        }
+    else:
+        tagless = {}
+
+    # Migrate the old classification without another network request.  Only
+    # the exact diagnostic produced by this parser is safe to reinterpret;
+    # transport and schema failures must remain retryable failures.
+    for problem_id, failure in list(failures.items()):
+        if failure.get("error") != f"Luogu problem {problem_id} has no public tags":
+            continue
+        tagless[problem_id] = {
+            "observed_at": str(failure.get("last_failed_at") or now.isoformat(timespec="seconds")),
+            "source": "public_problem_page",
+        }
+        failures.pop(problem_id, None)
+
     eligible: list[str] = []
     deferred = 0
     for problem_id in missing:
+        if problem_id in tagless:
+            continue
         retry_at = _parse_iso(str(failures.get(problem_id, {}).get("next_retry_at") or ""))
         if full and retry_at is not None and retry_at > now:
             deferred += 1
@@ -890,7 +962,9 @@ def enrich_luogu_accepted_problem_tags(
 
     failed_problem_ids: set[str] = set()
 
-    def fetch_problem(problem_id: str) -> tuple[str, dict[str, Any] | None, BaseException | None]:
+    def fetch_problem(
+        problem_id: str,
+    ) -> tuple[str, dict[str, Any] | None, bool, BaseException | None]:
         try:
             problem = client.problem(problem_id, tag_names=tag_names)
             returned_id = str(problem.get("problem_id") or "").strip().upper()
@@ -900,10 +974,10 @@ def enrich_luogu_accepted_problem_tags(
                 )
             tags = _normalise_preview_tags(problem.get("tags", []))
             if not tags:
-                raise ResponseShapeError(f"Luogu problem {problem_id} has no public tags")
-            return problem_id, dict(problem), None
+                return problem_id, dict(problem), True, None
+            return problem_id, dict(problem), False, None
         except Exception as exc:
-            return problem_id, None, exc
+            return problem_id, None, False, exc
 
     if isinstance(client, LuoguClient) and len(selected) >= 4 and workers > 1:
         with ThreadPoolExecutor(
@@ -915,10 +989,17 @@ def enrich_luogu_accepted_problem_tags(
     else:
         fetch_results = [fetch_problem(problem_id) for problem_id in selected]
 
-    for completed, (problem_id, problem, exc) in enumerate(fetch_results, start=1):
+    for completed, (problem_id, problem, is_tagless, exc) in enumerate(fetch_results, start=1):
         if exc is None and problem is not None:
             resolved_rows.append(problem)
             failures.pop(problem_id, None)
+            if is_tagless:
+                tagless[problem_id] = {
+                    "observed_at": now.isoformat(timespec="seconds"),
+                    "source": "public_problem_page",
+                }
+            else:
+                tagless.pop(problem_id, None)
         else:
             failed_problem_ids.add(problem_id)
             previous_attempts = int(failures.get(problem_id, {}).get("attempts") or 0)
@@ -952,6 +1033,7 @@ def enrich_luogu_accepted_problem_tags(
     if selected:
         metadata[LUOGU_TAG_ENRICHMENT_CURSOR_KEY] = selected[-1]
     metadata[LUOGU_TAG_FAILURES_KEY] = failures
+    metadata[LUOGU_TAGLESS_KEY] = tagless
     with db.atomic():
         db.upsert_problems(resolved_rows)
         db.connection.execute(
@@ -961,12 +1043,16 @@ def enrich_luogu_accepted_problem_tags(
             (json.dumps(metadata, ensure_ascii=False),),
         )
 
-    remaining = len(_luogu_accepted_problems_missing_tags(db))
+    remaining = sum(
+        problem_id not in tagless
+        for problem_id in _luogu_accepted_problems_missing_tags(db)
+    )
     resolved = sum(problem_id not in failed_problem_ids for problem_id in selected)
     return {
         "attempted": len(selected),
         "resolved": resolved,
         "failed": len(failed_problem_ids),
+        "tagless": len(tagless),
         "remaining": remaining,
         "cursor": metadata.get(LUOGU_TAG_ENRICHMENT_CURSOR_KEY),
         "errors": errors,

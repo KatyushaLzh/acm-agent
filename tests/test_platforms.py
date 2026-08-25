@@ -168,6 +168,42 @@ class LuoguTests(unittest.TestCase):
         self.assertEqual(problems[1]["tags"], ["线段树"])
         self.assertEqual(parse_luogu_user(fixture("luogu_user.json"), 42)["name"], "fixture_luogu")
 
+    def test_client_retries_narrow_javascript_cookie_challenge(self):
+        calls = []
+        challenge = (
+            '<script>window.open("/user/42/practice?_contentOnly=1", "_self");'
+            'window["document"].cookie="C3VK=abc_123; path=/; max-age=300;"</script>'
+        )
+
+        def request(url, params=None, headers=None):
+            calls.append((url, dict(params or {}), dict(headers or {})))
+            return challenge if len(calls) == 1 else fixture("luogu_practice.html")
+
+        client = LuoguClient(request)
+        self.assertEqual(client.practice(42), {"P1000", "P3372"})
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("Cookie", calls[0][2])
+        self.assertEqual(calls[1][2]["Cookie"], "C3VK=abc_123")
+
+        client.practice(42)
+        self.assertEqual(calls[2][2]["Cookie"], "C3VK=abc_123")
+
+    def test_client_does_not_loop_on_persistent_cookie_challenge(self):
+        calls = []
+        challenge = (
+            '<script>window.open("/user/42/practice?_contentOnly=1", "_self");'
+            'document.cookie="C3VK=still_blocked; path=/; max-age=300;"</script>'
+        )
+
+        def request(url, params=None, headers=None):
+            calls.append(dict(headers or {}))
+            return challenge
+
+        with self.assertRaisesRegex(RemoteAPIError, "challenge persisted"):
+            LuoguClient(request).practice(42)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["Cookie"], "C3VK=still_blocked")
+
     def test_public_problem_page_requires_exact_unique_pid(self):
         tags = parse_luogu_tags(fixture("luogu_tags.json"))
         problem = parse_luogu_problem(fixture("luogu_problems.json"), "P3372", tags)

@@ -10,8 +10,13 @@ from tools.acm_agent.storage import Database
 
 
 class FakeLuoguClient:
-    def __init__(self, failures: set[str] | None = None):
+    def __init__(
+        self,
+        failures: set[str] | None = None,
+        tagless: set[str] | None = None,
+    ):
         self.failures = failures or set()
+        self.tagless = tagless or set()
         self.problem_calls: list[str] = []
         self.tags_calls = 0
 
@@ -30,8 +35,11 @@ class FakeLuoguClient:
             "url": f"https://www.luogu.com.cn/problem/{problem_id}",
             "difficulty": 3,
             "rating": None,
-            "tags": ["动态规划"],
-            "source": {"pid": problem_id, "tags": [1]},
+            "tags": [] if problem_id in self.tagless else ["动态规划"],
+            "source": {
+                "pid": problem_id,
+                "tags": [] if problem_id in self.tagless else [1],
+            },
         }
 
 
@@ -119,6 +127,64 @@ class LuoguTagEnrichmentTests(unittest.TestCase):
             self.assertEqual(second["resolved"], 2)
             self.assertEqual(second["remaining"], 0)
 
+    def test_publicly_tagless_problem_is_a_terminal_success(self):
+        with tempfile.TemporaryDirectory() as tmp, Database(Path(tmp) / "state.db") as db:
+            seed_accepted(db, ["P1000", "P1001"])
+            client = FakeLuoguClient(tagless={"P1000"})
+
+            first = enrich_luogu_accepted_problem_tags(db, client, full=True)
+            second = enrich_luogu_accepted_problem_tags(db, client, full=True)
+            metadata = json.loads(db.sync_state("luogu")["metadata_json"])
+
+        self.assertEqual(first["attempted"], 2)
+        self.assertEqual(first["resolved"], 2)
+        self.assertEqual(first["failed"], 0)
+        self.assertEqual(first["tagless"], 1)
+        self.assertEqual(first["remaining"], 0)
+        self.assertEqual(second["attempted"], 0)
+        self.assertEqual(client.problem_calls, ["P1000", "P1001"])
+        self.assertIn("P1000", metadata["tag_enrichment_tagless"])
+        self.assertNotIn("P1000", metadata["tag_enrichment_failures"])
+
+    def test_legacy_no_public_tags_failure_migrates_without_retry(self):
+        now = "2026-08-25T07:36:56+00:00"
+        with tempfile.TemporaryDirectory() as tmp, Database(Path(tmp) / "state.db") as db:
+            seed_accepted(db, ["P5705"])
+            db.connection.execute(
+                """INSERT INTO sync_state(platform,status,metadata_json)
+                   VALUES('luogu','partial',?)""",
+                (
+                    json.dumps(
+                        {
+                            "tag_enrichment_failures": {
+                                "P5705": {
+                                    "attempts": 1,
+                                    "last_failed_at": now,
+                                    "next_retry_at": "2026-08-26T07:36:56+00:00",
+                                    "error": "Luogu problem P5705 has no public tags",
+                                }
+                            }
+                        }
+                    ),
+                ),
+            )
+            db.connection.commit()
+            client = FakeLuoguClient()
+
+            result = enrich_luogu_accepted_problem_tags(db, client, full=True)
+            metadata = json.loads(db.sync_state("luogu")["metadata_json"])
+
+        self.assertEqual(result["attempted"], 0)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["tagless"], 1)
+        self.assertEqual(result["remaining"], 0)
+        self.assertEqual(client.problem_calls, [])
+        self.assertEqual(metadata["tag_enrichment_failures"], {})
+        self.assertEqual(
+            metadata["tag_enrichment_tagless"]["P5705"]["observed_at"],
+            now,
+        )
+
     def test_full_mode_attempts_every_missing_problem_in_one_call(self):
         with tempfile.TemporaryDirectory() as tmp, Database(Path(tmp) / "state.db") as db:
             problem_ids = [f"P{1000 + index}" for index in range(55)]
@@ -178,6 +244,7 @@ class LuoguTagEnrichmentTests(unittest.TestCase):
                     "attempted": 1,
                     "resolved": 1,
                     "failed": 0,
+                    "tagless": 0,
                     "remaining": 0,
                     "cursor": "P1000",
                     "errors": [],

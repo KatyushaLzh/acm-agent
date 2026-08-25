@@ -42,7 +42,7 @@ Status precedence is `accepted > skipped > attempted > local_only > not_started 
 
 - A validated CLI `init` saves both account identifiers and waits for synchronization; `POST /api/setup` saves them and returns to the Dashboard while the same work runs as a recoverable background job. Fresh global catalogs are reused instead of being force-refetched.
 - Luogu public AC state is committed before catalog maintenance. A complete catalog replaces the cached snapshot only after every requested page passes its structure guards; page failure preserves the previous snapshot and reports `partial`.
-- Luogu tag enrichment uses bounded concurrency and persisted exponential retry backoff. Recent failures are reported as `deferred`; a failed full-catalog crawl caps fallback tag lookups instead of attempting the whole accepted set.
+- Luogu tag enrichment uses bounded concurrency and persisted exponential retry backoff. Recent transport or schema failures are reported as `deferred`; a valid public page with an empty tag list is persisted as `tagless` and does not make the sync partial. A failed full-catalog crawl caps fallback tag lookups instead of attempting the whole accepted set.
 - Sync jobs publish structured `phase`, `platform`, `step`, `total`, `completed`, `failed`, `started_at`, `last_activity_at`, and `usable` progress. Treat the per-platform result status, not the job executor status, as the business outcome.
 - `--skip-validate` / `skip_validate=true` is an offline path: it saves configuration but performs no platform sync or tag request.
 - AI recommendations only consume cached tags and never trigger tag scraping.

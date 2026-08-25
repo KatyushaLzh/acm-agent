@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import shutil
 import tempfile
@@ -83,6 +84,34 @@ class AcmServiceTests(unittest.TestCase):
                 payload["accepted_by_platform"], {"codeforces": 0, "luogu": 0}
             )
             self.assertFalse((root / ".acm/state.db").exists())
+
+    def test_status_exposes_luogu_tagless_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            service = AcmService(root)
+            service.setup("fixture", "42", skip_validate=True)
+            with Database(service.paths.database) as db:
+                db.connection.execute(
+                    """INSERT INTO sync_state(platform,status,last_success_at,metadata_json)
+                       VALUES('luogu','fresh','2026-08-25T00:00:00+00:00',?)""",
+                    (
+                        json.dumps(
+                            {
+                                "tag_enrichment_tagless": {
+                                    "P5705": {
+                                        "observed_at": "2026-08-25T00:00:00+00:00"
+                                    }
+                                }
+                            }
+                        ),
+                    ),
+                )
+                db.connection.commit()
+
+            payload = service.status()
+
+        self.assertEqual(payload["sources"]["luogu"]["tagless"], 1)
+        self.assertEqual(payload["sources"]["luogu"]["last_attempt_status"], "fresh")
 
     def test_validated_setup_immediately_syncs_both_platforms_and_tags(self) -> None:
         class IdentityClient:

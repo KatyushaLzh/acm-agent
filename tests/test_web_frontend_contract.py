@@ -110,6 +110,10 @@ class WebFrontendConcurrencyContractTests(unittest.TestCase):
         self.assertIn('["partial", "failed"].includes(attemptStatus)', self.core)
         self.assertIn("freshnessBadge(displayStatus)", self.core)
 
+    def test_luogu_tagless_count_is_visible_without_partial_status(self) -> None:
+        self.assertIn("item.tagless", self.core)
+        self.assertIn("无公开标签（tagless）", self.core)
+
     def test_ai_plan_import_has_two_modes_and_explicit_privacy_boundary(self) -> None:
         self.assertIn('id="ai-plan-import-button"', self.index)
         self.assertIn('value="organize"', self.index)

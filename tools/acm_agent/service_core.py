@@ -664,12 +664,24 @@ class ServiceCoreMixin:
 
     @staticmethod
     def _source_detail(db: Database, platform: str, state: Any) -> dict[str, Any]:
-        return {
+        detail = {
             "freshness": freshness(db, platform),
             "last_success_at": state["last_success_at"] if state else None,
             "last_attempt_status": state["status"] if state else "never",
             "error": state["error"] if state else None,
         }
+        if platform == "luogu":
+            tagless_count = 0
+            if state:
+                try:
+                    metadata = json.loads(state["metadata_json"] or "{}")
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    metadata = {}
+                tagless = metadata.get("tag_enrichment_tagless")
+                if isinstance(tagless, (Mapping, list)):
+                    tagless_count = len(tagless)
+            detail["tagless"] = tagless_count
+        return detail
 
 
 __all__ = ["ServiceCoreMixin"]

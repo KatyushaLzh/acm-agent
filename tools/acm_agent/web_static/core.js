@@ -354,9 +354,13 @@ function renderSources(sources) {
     const item = asObject(sources[platform]);
     const attemptStatus = String(item.last_attempt_status || "").toLowerCase();
     const displayStatus = ["partial", "failed"].includes(attemptStatus) ? attemptStatus : item.freshness;
-    const detail = item.error
+    const taglessCount = Math.max(0, Number(item.tagless) || 0);
+    const taglessDetail = platform === "luogu" && taglessCount
+      ? ` · 无公开标签（tagless）：${taglessCount}`
+      : "";
+    const detail = (item.error
       ? `最近尝试 ${attemptStatus || "异常"}：${item.error} · 最近成功：${formatTime(item.last_success_at)}`
-      : `最近成功：${formatTime(item.last_success_at)}`;
+      : `最近成功：${formatTime(item.last_success_at)}`) + taglessDetail;
     return `<div class="source-row"><strong>${displayPlatform(platform)}</strong><small title="${escapeHtml(detail)}">${escapeHtml(detail)}</small>${freshnessBadge(displayStatus)}</div>`;
   }).join("");
 }
