@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 import tempfile
 import unittest
 
-from tools.acm_agent.plan import check_plan, load_plan, load_plan_data, plan_task_records
+from tools.acm_agent.plan import check_plan, load_plan, plan_task_records
 from tools.acm_agent.recommend import (
     compute_weakness,
     estimate_cf_baseline,
     luogu_equivalent,
     recommend,
+    recommendation_difficulty_targets,
+    recommendation_slots,
 )
 
 
@@ -45,33 +47,10 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(result.stats["required_by_platform"], {"codeforces": 50, "luogu": 41})
 
     def test_flattened_contest_tasks_keep_unlock_date(self):
-        raw = {
-            "schema_version": 2,
-            "plan_id": "synthetic-dated-plan",
-            "title": "Synthetic dated plan",
-            "description": "Exercises stage date propagation without repository-local dates.",
-            "schedule_mode": "dated",
-            "stages": [
-                {
-                    "stage_key": "contest",
-                    "topic": "Synthetic contest",
-                    "kind": "virtual_contest",
-                    "due_date": "2030-01-02",
-                    "unlock_at": "2030-01-02",
-                    "tasks": [
-                        {
-                            "task_key": f"contest-{index}",
-                            "problem_id": f"CF{index}A",
-                            "platform": "codeforces",
-                        }
-                        for index in range(1, 5)
-                    ],
-                }
-            ],
-        }
-        records = plan_task_records(load_plan_data(raw))
-        self.assertEqual(len(records), 4)
-        self.assertTrue(all(row["unlock_at"] == "2030-01-02" for row in records))
+        records = plan_task_records(load_plan(PLAN))
+        d14 = [row for row in records if row["day"] == 14]
+        self.assertEqual(len(d14), 4)
+        self.assertTrue(all(row["unlock_at"] == "2026-08-09" for row in d14))
 
     def test_check_detects_readme_drift(self):
         text = README.read_text(encoding="utf-8-sig").replace("problem/P3374", "problem/P3375", 1)
@@ -98,19 +77,51 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(estimate_cf_baseline(None, attempts), 1500)
         self.assertEqual(estimate_cf_baseline(None, []), 1600)
 
-    def test_recommendation_difficulty_uses_target_rating(self):
+    def test_recommendation_difficulty_is_split_across_three_targets(self):
         choices = [
-            candidate("CF200A", rating=1650),
-            candidate("CF201A", rating=2050),
+            candidate("CF200A", rating=1500),
+            candidate("CF201A", rating=1700),
+            candidate("CF202A", rating=2000),
         ]
         result = recommend(
             choices,
-            count=1,
+            count=3,
             cf_rating=1600,
             target_cf_rating=2000,
+            recent_solved_equivalents=[1400, 1600],
         )
-        self.assertEqual(result[0].problem_id, "CF201A")
-        self.assertTrue(any("main 目标 2050" in reason for reason in result[0].reasons))
+        self.assertEqual(
+            [item.problem_id for item in result],
+            ["CF201A", "CF200A", "CF202A"],
+        )
+        self.assertEqual(
+            [item.difficulty_target for item in result], [1700, 1500, 2000]
+        )
+        self.assertEqual(
+            [item.difficulty_band for item in result],
+            ["current_plus_100", "recent_solved_average", "target_rating"],
+        )
+
+    def test_slot_cycle_keeps_each_complete_group_one_third(self):
+        self.assertEqual(
+            recommendation_slots(6),
+            ["recovery", "main", "stretch", "recovery-2", "main-2", "stretch-2"],
+        )
+        self.assertEqual(
+            recommendation_difficulty_targets(
+                1600, [1200, 1400, 1600], target_rating=2100
+            ),
+            {"recovery": 1700, "main": 1400, "stretch": 2100},
+        )
+
+    def test_slot_uses_absolute_distance_even_outside_scoring_window(self):
+        result = recommend(
+            [candidate("CF1A", rating=3000), candidate("CF999A", rating=2400)],
+            count=1,
+            cf_rating=1600,
+        )
+        self.assertEqual(result[0].problem_id, "CF999A")
+        self.assertEqual(result[0].difficulty_target, 1700)
 
     def test_luogu_mapping(self):
         self.assertEqual([luogu_equivalent(level) for level in range(1, 8)], [800, 1000, 1300, 1600, 1900, 2200, 2500])
@@ -134,16 +145,36 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(result[0].problem_key, "codeforces:CF1042D")
         self.assertEqual(result[0].problem_id, "1042D")
 
-    def test_overdue_then_today_then_catalog_priority(self):
+    def test_plan_schedule_and_level_never_change_priority(self):
         today = date(2026, 8, 3)
         choices = [
             candidate("CF300A", rating=1650),
             candidate("CF301A", rating=1650, due_date=today.isoformat(), plan_level="B"),
-            candidate("CF302A", rating=1650, due_date=(today - timedelta(days=1)).isoformat(), plan_level="B"),
+            candidate("CF302A", rating=1650, due_date="2026-07-01", plan_level="B"),
         ]
         first = recommend(choices, now=today, count=1)[0]
-        self.assertEqual(first.problem_id, "CF302A")
-        self.assertGreater(first.breakdown["plan_urgency"], 1000)
+        self.assertEqual(first.problem_id, "CF300A")
+        self.assertEqual(first.breakdown["plan_urgency"], 0)
+        self.assertFalse(any("题单" in reason for reason in first.reasons))
+
+    def test_balanced_is_an_unweighted_union_without_a_plan_cap(self):
+        today = date(2026, 8, 3)
+        result = recommend(
+            [candidate("CF399A", rating=800)],
+            plan_tasks=[
+                candidate("CF400A", rating=1850, source="plan", plan_id="p", task_key="a"),
+                candidate("CF401A", rating=2050, source="plan", plan_id="p", task_key="b"),
+                candidate("CF402A", rating=2250, source="plan", plan_id="p", task_key="c"),
+            ],
+            source_mode="balanced",
+            target_cf_rating=2000,
+            now=today,
+            count=3,
+        )
+        self.assertEqual(
+            {item.problem_id for item in result}, {"CF400A", "CF401A", "CF402A"}
+        )
+        self.assertTrue(all(item.plan_sources for item in result))
 
     def test_new_excludes_ac_and_review_selects_only_due_ac(self):
         today = date(2026, 8, 3)
@@ -199,8 +230,8 @@ class RecommendationTests(unittest.TestCase):
     def test_platform_balance_breakdown_and_natural_tie_break(self):
         history = [{"problem_key": f"codeforces:CF{i}A", "platform": "codeforces"} for i in range(20)]
         choices = [
-            candidate("CF100A", rating=1650),
-            candidate("CF99A", rating=1650),
+            candidate("CF100A", rating=1600),
+            candidate("CF99A", rating=1600),
             candidate("P1000", difficulty=4),
         ]
         result = recommend(choices, recommendation_history=history, now=date(2026, 8, 3), count=1)
@@ -223,7 +254,8 @@ class RecommendationTests(unittest.TestCase):
             {"plan_urgency", "review_due", "difficulty_fit", "weakness", "platform_balance", "recent_repeat"},
         )
         self.assertAlmostEqual(result.score, sum(result.breakdown.values()))
-        self.assertEqual(result.to_dict()["slot"], "main")
+        self.assertEqual(result.to_dict()["slot"], "recovery")
+        self.assertEqual(result.to_dict()["difficulty_band"], "current_plus_100")
 
 
 if __name__ == "__main__":

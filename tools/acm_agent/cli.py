@@ -2,18 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 import sys
-import time
 from typing import Any, Mapping, Sequence
 
 from .ai_policy import ALLOWED_MODELS, ALLOWED_REASONING_EFFORTS
-from .config import (
-    STRESS_CACHE_MODES,
-    STRESS_GENERATION_MODES,
-    STRESS_PREPARE_TIMEOUT_MAX_SECONDS,
-    STRESS_PREPARE_TIMEOUT_MIN_SECONDS,
-)
 from .knowledge import PRESET_NAMES
 # Re-exported dependencies keep existing CLI monkey-patch integrations stable.
 from .platforms import CodeforcesClient, LuoguClient, sync_codeforces, sync_luogu
@@ -25,19 +19,20 @@ MODEL_CHOICES = tuple(sorted(ALLOWED_MODELS))
 REASONING_EFFORT_CHOICES = tuple(sorted(ALLOWED_REASONING_EFFORTS))
 KNOWLEDGE_PRESET_CHOICES = (*PRESET_NAMES, "custom")
 KNOWLEDGE_SCHEMA_MODE_CHOICES = ("auto", "stored", "ai")
-STRESS_GENERATION_CLI_CHOICES = tuple(
-    mode.replace("_", "-") for mode in STRESS_GENERATION_MODES
-)
 
 
-def _stress_prepare_timeout(value: str) -> int:
-    seconds = int(value)
-    if not STRESS_PREPARE_TIMEOUT_MIN_SECONDS <= seconds <= STRESS_PREPARE_TIMEOUT_MAX_SECONDS:
-        raise argparse.ArgumentTypeError(
-            "准备耗时上限必须在 "
-            f"{STRESS_PREPARE_TIMEOUT_MIN_SECONDS}..{STRESS_PREPARE_TIMEOUT_MAX_SECONDS} 秒之间"
-        )
-    return seconds
+def _positive_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("必须是大于 0 的有限数值")
+    return number
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("必须是至少为 1 的整数")
+    return number
 
 
 def _service(paths: Any) -> AcmService:
@@ -79,7 +74,17 @@ def command_init(args: argparse.Namespace, paths: Any) -> int:
     _emit(
         payload,
         as_json=args.json,
-        human=f"初始化完成；导入 {payload['local_files_imported']} 个本地题目文件。",
+        human=(
+            f"初始化完成；导入 {payload['local_files_imported']} 个本地题目文件。"
+            if args.skip_validate
+            else "账号已保存，但初始全量同步未完成；请稍后运行 acm sync 重试。"
+            if (payload.get("initial_sync") or {}).get("ok") is False
+            else (
+                f"初始化完成；已同步两平台并全量补齐洛谷标签，"
+                f"成功 {int((payload.get('tag_enrichment') or {}).get('resolved', 0))} 道，"
+                f"失败 {int((payload.get('tag_enrichment') or {}).get('failed', 0))} 道。"
+            )
+        ),
     )
     return 0
 
@@ -169,6 +174,7 @@ def command_next(args: argparse.Namespace, paths: Any) -> int:
     }
     if args.ai:
         kwargs["model"] = args.model
+        kwargs["ai_mode"] = args.ai_mode
     payload = method(**kwargs)
     lines: list[str] = []
     for item in payload["recommendations"]:
@@ -204,13 +210,10 @@ def command_ai_settings(args: argparse.Namespace, paths: Any) -> int:
         recommendation_model=args.recommend_model,
         coaching_model=args.coach_model,
         summary_model=args.summary_model,
-        validation_model=args.validation_model,
         coaching_thinking=args.thinking,
         reasoning_effort=args.reasoning_effort,
         summary_thinking=args.summary_thinking,
         summary_reasoning_effort=args.summary_reasoning_effort,
-        validation_thinking=args.validation_thinking,
-        validation_reasoning_effort=args.validation_reasoning_effort,
     )
     _emit(payload, as_json=args.json, human="AI 设置已保存（API Key 未写入配置）。")
     return 0
@@ -419,102 +422,7 @@ def command_start(args: argparse.Namespace, paths: Any) -> int:
     return 0
 
 
-def _wait_for_stress_cli(
-    service: AcmService,
-    run_id: str,
-    initial: Mapping[str, Any],
-    *,
-    as_json: bool,
-) -> int:
-    terminal = {
-        "stopped", "mismatch", "oracle_conflict", "fault",
-        "interrupted", "completed",
-    }
-    try:
-        while True:
-            current = service.stress_run(run_id)["run"]
-            if str(current.get("status") or "").casefold() in terminal:
-                break
-            time.sleep(0.25)
-    except KeyboardInterrupt:
-        service.stress_stop(run_id)
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline:
-            current = service.stress_run(run_id)["run"]
-            if str(current.get("status") or "").casefold() in terminal:
-                break
-            time.sleep(0.1)
-        else:
-            service.shutdown()
-            current = service.stress_run(run_id)["run"]
-    final_payload = {**dict(initial), "run": current}
-    _emit(
-        final_payload,
-        as_json=as_json,
-        human=f"AI 持续对拍结束：{run_id} · {current.get('status', 'unknown')}",
-    )
-    return 3 if current.get("status") in {"mismatch", "oracle_conflict", "fault"} else 0
-
-
 def command_verify(args: argparse.Namespace, paths: Any) -> int:
-    if args.ai_stress:
-        service = _service(paths)
-        payload = service.ai_stress_start(
-            args.problem,
-            generate_generator=True,
-            prepare_reference_primary=True,
-            prepare_reference_secondary=True,
-            large_profile=not args.no_large,
-            include_validator=args.validator,
-            allow_validator_degradation=not args.strict,
-            unvalidated_large=args.unvalidated_large,
-            minimal_verification=args.minimal,
-            compare="exact" if args.exact else "token",
-            timeout=args.timeout,
-            reference_secondary_timeout=5.0,
-            seed=args.seed,
-            preparation_timeout_seconds=args.prepare_timeout,
-            force_regenerate=args.force_regenerate,
-            cache_mode=args.cache_mode,
-            generation_mode=(
-                args.generation_mode.replace("-", "_")
-                if args.generation_mode is not None
-                else None
-            ),
-            reference_primary_file=args.reference_primary_file,
-            reference_secondary_file=args.reference_secondary_file,
-            brute_file=args.brute_file,
-            reference_file=args.reference_file,
-            generator_file=args.generator_file,
-        )
-        run = payload.get("run", payload)
-        run_id = run.get("id") or run.get("run_id") or payload.get("run_id") or "unknown"
-        if not args.json:
-            for deprecated in payload.get("deprecations", []):
-                replacement = (
-                    "--reference-primary-file"
-                    if deprecated == "reference_file"
-                    else "--reference-secondary-file"
-                )
-                print(f"提示：--{deprecated.replace('_', '-')} 已弃用，请改用 {replacement}")
-            print(f"AI 持续对拍已启动：{run_id}（Ctrl+C 安全停止）")
-            if bool(payload.get("unvalidated")):
-                print(
-                    "警告：validator 认证失败，本次对拍进入降级模式——large case 已关闭，"
-                    "判定仅由小数据双 reference 交叉门禁保证；AI 生成的 helper 仍有小概率出错，"
-                    "若出现 mismatch 请重试一次确认。"
-                )
-        terminal_code = _wait_for_stress_cli(service, run_id, payload, as_json=args.json)
-        if (
-            not args.json
-            and bool(payload.get("unvalidated"))
-            and terminal_code != 0
-        ):
-            print(
-                "提示：以上失败可能来自 AI 生成的 helper 而非题解。"
-                "可重新运行 --ai-stress 重试（不影响你的题解文件）。"
-            )
-        return terminal_code
     payload = _service(paths).verify(
         args.problem,
         exact=args.exact,
@@ -523,46 +431,16 @@ def command_verify(args: argparse.Namespace, paths: Any) -> int:
         stress_iterations=args.stress_iterations,
         seed=args.seed,
     )
-    human = f"{payload['problem_id']}: " + ("验证通过" if payload["passed"] else "验证失败")
+    if payload.get("verification_status") == "inconclusive":
+        human = f"{payload['problem_id']}: 仅编译成功，缺少样例或对拍证据"
+    else:
+        human = f"{payload['problem_id']}: " + ("验证通过" if payload["passed"] else "验证失败")
     if payload["sanitizer"] == "unsupported":
         human += "；当前 MinGW 不支持可用的 ASan/UBSan，已明确跳过"
     if payload["failure_dir"]:
         human += f"；对拍资产：{payload['failure_dir']}"
     _emit(payload, as_json=args.json, human=human)
     return 0 if payload["passed"] else 3
-
-
-def command_stress_status(args: argparse.Namespace, paths: Any) -> int:
-    service = _service(paths)
-    payload = service.stress_run(args.run_id) if args.run_id else service.stress_runs()
-    _emit(payload, as_json=args.json, human=json.dumps(payload, ensure_ascii=False, indent=2, default=str))
-    return 0
-
-
-def command_stress_stop(args: argparse.Namespace, paths: Any) -> int:
-    payload = _service(paths).stress_stop(args.run_id)
-    _emit(payload, as_json=args.json, human=f"已请求停止持续对拍：{args.run_id}")
-    return 0
-
-
-def command_stress_resume(args: argparse.Namespace, paths: Any) -> int:
-    service = _service(paths)
-    payload = service.stress_resume(args.run_id)
-    if not args.json:
-        print(f"已从保存的 seed 继续持续对拍：{args.run_id}（Ctrl+C 安全停止）")
-    return _wait_for_stress_cli(service, args.run_id, payload, as_json=args.json)
-
-
-def command_stress_artifacts(args: argparse.Namespace, paths: Any) -> int:
-    payload = _service(paths).stress_bundle(args.bundle_id)
-    _emit(payload, as_json=args.json, human=json.dumps(payload, ensure_ascii=False, indent=2, default=str))
-    return 0
-
-
-def command_stress_revert(args: argparse.Namespace, paths: Any) -> int:
-    payload = _service(paths).stress_bundle_revert(args.bundle_id)
-    _emit(payload, as_json=args.json, human=f"AI 对拍 helper 已回退：{args.bundle_id}")
-    return 0
 
 
 def _prompt_if_missing(value: Any, prompt: str, cast=lambda value: value) -> Any:
@@ -846,7 +724,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="balanced",
     )
     nxt.add_argument("--plan", dest="plan_ids", action="append", help="限定已启用题单，可重复")
-    nxt.add_argument("--ai", action="store_true", help="显式使用 DeepSeek 对确定性候选重排")
+    nxt.add_argument("--ai", action="store_true", help="显式使用 DeepSeek 按平台 AC 知识覆盖推荐")
+    nxt.add_argument(
+        "--ai-mode",
+        choices=("gap_fill", "specialization"),
+        default="gap_fill",
+        help="AI 推荐模式：查漏补缺或专项强化（默认 gap_fill）",
+    )
     nxt.add_argument("--model", choices=MODEL_CHOICES)
     nxt.add_argument("--json", action="store_true")
     nxt.set_defaults(handler=command_next)
@@ -864,13 +748,10 @@ def build_parser() -> argparse.ArgumentParser:
     ai_settings.add_argument("--recommend-model", choices=MODEL_CHOICES)
     ai_settings.add_argument("--coach-model", choices=MODEL_CHOICES)
     ai_settings.add_argument("--summary-model", choices=MODEL_CHOICES)
-    ai_settings.add_argument("--validation-model", choices=MODEL_CHOICES)
     ai_settings.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=None)
     ai_settings.add_argument("--reasoning-effort", choices=REASONING_EFFORT_CHOICES)
     ai_settings.add_argument("--summary-thinking", action=argparse.BooleanOptionalAction, default=None)
     ai_settings.add_argument("--summary-reasoning-effort", choices=REASONING_EFFORT_CHOICES)
-    ai_settings.add_argument("--validation-thinking", action=argparse.BooleanOptionalAction, default=None)
-    ai_settings.add_argument("--validation-reasoning-effort", choices=REASONING_EFFORT_CHOICES)
     ai_settings.add_argument("--json", action="store_true")
     ai_settings.set_defaults(handler=command_ai_settings)
 
@@ -1003,113 +884,11 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("problem", nargs="?")
     verify.add_argument("--debug", action="store_true")
     verify.add_argument("--exact", action="store_true")
-    verify.add_argument("--timeout", type=float, default=2.0)
-    verify.add_argument("--stress-iterations", type=int, default=100)
+    verify.add_argument("--timeout", type=_positive_float, default=2.0)
+    verify.add_argument("--stress-iterations", type=_positive_int, default=100)
     verify.add_argument("--seed", type=int)
-    verify.add_argument(
-        "--ai-stress",
-        action="store_true",
-        help="显式调用 DeepSeek 准备 helper，并启动持续分层对拍",
-    )
-    verify.add_argument(
-        "--no-large",
-        action="store_true",
-        help="AI 持续对拍只运行可人工验证的小数据，不运行极限大数据",
-    )
-    verify.add_argument(
-        "--strict",
-        action="store_true",
-        help="validator 认证失败时不允许降级：保持原有失败行为",
-    )
-    verify.add_argument(
-        "--minimal",
-        action="store_true",
-        help="最小验证模式：只生成 contract/generator/两份 reference，"
-        "跳过 validator、AI audit 与 manifest/coverage/seed 门禁，"
-        "判定仅靠官方样例与 small 双 reference oracle",
-    )
-    verify.add_argument(
-        "--unvalidated-large",
-        action="store_true",
-        help="降级（无 validator）模式下仍显式运行极限大数据，接受小概率误报风险",
-    )
-    verify.add_argument(
-        "--validator",
-        action="store_true",
-        help="显式生成独立 validator 并启用隐藏 probe 认证；"
-        "默认不生成，输入合法性由 generator 与 manifest 检查负责",
-    )
-    verify.add_argument(
-        "--prepare-timeout",
-        type=_stress_prepare_timeout,
-        metavar="SECONDS",
-        help="AI helper 准备总耗时上限（60..1800 秒，默认读取配置）",
-    )
-    verify.add_argument(
-        "--force-regenerate",
-        action="store_true",
-        help="兼容选项：等价于 --cache-mode cold",
-    )
-    verify.add_argument(
-        "--cache-mode",
-        choices=STRESS_CACHE_MODES,
-        help="准备缓存策略（默认 reuse；cold 绕过所有本地读取）",
-    )
-    verify.add_argument(
-        "--generation-mode",
-        choices=STRESS_GENERATION_CLI_CHOICES,
-        help="helper 生成策略（默认读取配置；full-thinking 映射为 full_thinking）",
-    )
-    verify.add_argument(
-        "--reference-primary-file",
-        type=Path,
-        help="手动指定第一份 reference 源码（仍执行全部机器门禁）",
-    )
-    verify.add_argument(
-        "--reference-secondary-file",
-        type=Path,
-        help="手动指定第二份独立 reference 源码（仍执行全部机器门禁）",
-    )
-    verify.add_argument(
-        "--brute-file",
-        type=Path,
-        help="已弃用：等价于 --reference-secondary-file",
-    )
-    verify.add_argument(
-        "--reference-file",
-        type=Path,
-        help="已弃用：等价于 --reference-primary-file",
-    )
-    verify.add_argument(
-        "--generator-file",
-        type=Path,
-        help="手动指定 generator adapter 源码文件（跳过 AI 生成与 blueprint；仍跑全部机器门禁）",
-    )
     verify.add_argument("--json", action="store_true")
     verify.set_defaults(handler=command_verify)
-
-    stress = sub.add_parser("stress", help="查看和控制 AI 持续对拍")
-    stress_sub = stress.add_subparsers(dest="stress_command", required=True)
-    stress_status = stress_sub.add_parser("status", help="查看全部或指定持续对拍")
-    stress_status.add_argument("run_id", nargs="?")
-    stress_status.add_argument("--json", action="store_true")
-    stress_status.set_defaults(handler=command_stress_status)
-    stress_stop = stress_sub.add_parser("stop", help="停止持续对拍")
-    stress_stop.add_argument("run_id")
-    stress_stop.add_argument("--json", action="store_true")
-    stress_stop.set_defaults(handler=command_stress_stop)
-    stress_resume = stress_sub.add_parser("resume", help="从保存的 seed 继续对拍")
-    stress_resume.add_argument("run_id")
-    stress_resume.add_argument("--json", action="store_true")
-    stress_resume.set_defaults(handler=command_stress_resume)
-    stress_artifacts = stress_sub.add_parser("artifacts", help="查看 helper 与来源")
-    stress_artifacts.add_argument("bundle_id")
-    stress_artifacts.add_argument("--json", action="store_true")
-    stress_artifacts.set_defaults(handler=command_stress_artifacts)
-    stress_revert = stress_sub.add_parser("revert", help="按 hash 校验回退 helper bundle")
-    stress_revert.add_argument("bundle_id")
-    stress_revert.add_argument("--json", action="store_true")
-    stress_revert.set_defaults(handler=command_stress_revert)
 
     close = sub.add_parser("close", help="结束 session 并记录复盘")
     close.add_argument("problem")

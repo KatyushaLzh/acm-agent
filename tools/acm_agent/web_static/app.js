@@ -12,7 +12,8 @@ import {
 import { loadPlans } from "./view_plans.js";
 import { loadReview } from "./view_review.js";
 import { requestRecommendations } from "./view_today.js";
-import { loadAiStressStatus, loadWorkspaceTemplate } from "./view_workbench.js";
+import { loadWorkspaceTemplate, resumeInitialSyncJob } from "./view_workbench.js";
+import { bindAppearanceEvents, loadAppearance } from "./view_appearance.js";
 
 setActiveProblemHandler(switchAiProblem);
 
@@ -48,12 +49,14 @@ async function boot() {
   bindWorkbenchEvents();
   bindReviewEvents();
   bindPlanEvents();
+  bindAppearanceEvents();
 
   const initial = location.hash.replace(/^#/, "");
   if (["today", "workbench", "plans", "review", "settings"].includes(initial)) navigate(initial);
+  await loadAppearance();
   await loadBootstrap();
+  resumeInitialSyncJob();
   await loadAiStatus();
-  await loadAiStressStatus();
   await loadKnowledgeTargets();
   loadWorkspaceTemplate();
   updateAiProblemMode();

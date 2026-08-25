@@ -38,32 +38,36 @@ Status precedence is `accepted > skipped > attempted > local_only > not_started 
 - Do not silently continue when both platform state and cache are unavailable.
 - Keep stdout JSON machine-readable; user-facing explanations belong in the Agent response.
 
+## Initialization and Tag Completion
+
+- A validated `init` / `POST /api/setup` saves both account identifiers, then forces a complete Codeforces and Luogu sync before returning.
+- Luogu sync attempts every currently unresolved accepted-problem tag in that run; individual public-page failures are reported in `tag_enrichment` without rolling back account configuration or successful problems.
+- `--skip-validate` / `skip_validate=true` is an offline path: it saves configuration but performs no platform sync or tag request.
+- AI recommendations only consume cached tags and never trigger tag scraping.
+
 ## DeepSeek AI Rules
 
 - `GET /api/ai/status` returns only detection, source (`secure_store`, `environment`, `injected`, or `none`), persisted state, and a sanitized load error; it never returns the key.
 - `POST /api/ai/credential` is the only endpoint that accepts a key. It is synchronous, loopback-token protected, excluded from the job registry, and persists only a Windows current-user DPAPI ciphertext. `{ "clear": true }` deletes that ciphertext. Browser code must clear the password input after every attempt and must not use browser storage.
 - Models are restricted to `deepseek-v4-flash` and `deepseek-v4-pro`. Recommendation requests always disable thinking.
-- AI recommendation items retain deterministic `score`, `breakdown`, and `reasons`, and add `ranking_basis`, `ai_reason`, `training_focus`, `ai_run_id`, and `ai_usage`. Provider/protocol/candidate failures return deterministic order plus `ai.fallback`.
+- AI recommendation mode is `gap_fill` (low distinct-AC topic coverage) or `specialization` (high coverage), defaulting to `gap_fill`. Items retain deterministic `score`, `breakdown`, and `reasons`, and add `focus_topic`, `ranking_basis`, `ai_reason`, `training_focus`, `ai_run_id`, and `ai_usage`. Responses expose `ai.mode`, `ai.focus_topics`, `ai.submission_coverage`, and `ai.taxonomy_version`; provider/protocol/candidate failures return a deterministic same-mode fallback.
+- Recommendation payloads contain only classified distinct platform-AC summaries and deterministic candidates. They exclude account fields, handles, UIDs, submission IDs, raw JSON, languages, notes, chats, source code, local paths, API keys, and runtime tokens.
 - Coaching conversation messages persist locally. SSE event names are exactly `meta`, `delta`, `usage`, `done`, and `error`; a disconnected partial answer is stored as `interrupted`.
 - `review` and every patch proposal count as hint level 4. `close` stores the maximum of explicit input and persisted AI assistant history.
 - A patch proposal is a complete replacement guarded by a baseline hash. `apply` and `revert` conflicts are HTTP 409 and must never overwrite a newer local edit.
 
-## AI Stress Rules
+## Local Stress Rules
 
-- AI stress is explicit opt-in. The preparation payload contains statement/title/problem ID and a deterministic stress contract, but never account fields, API keys, local paths, conversation history, notes, or the user's solution source.
-- Source tiers are platform-specific: Codeforces uses official editorial, CNBlogs, then CSDN; Luogu uses CNBlogs, Luogu public solution pages, then CSDN. DeepSeek independently generates any still-missing reference slot. The local allowlisted crawler filters exact problem IDs deterministically, and fetched candidates must provide two distinct URLs and source hashes. Ordinary submissions and authenticated/challenge content are out of scope.
-- New bundle artifact kinds are `generator`, `reference_primary`, `reference_secondary`, and optional `validator`; legacy `brute`/`reference` artifacts remain read-only compatibility data. Existing helpers are recorded as `local_existing`; remote provenance records URL, title, content hash, and license when known. Every generated or downloaded reference must satisfy full constraints and pass the applicable safety, compile, sample, audit, and preflight gates before application.
-- Compatible static contracts first compile locally to `generator_recipe/v2`, currently for mutable-permutation operation streams and bracket-string interval queries. This path makes no provider request for a recipe or executable generator and fails closed on local preflight failure. Unsupported shapes may use `generator_recipe/v1` and then the explicit legacy AI C++ fallback.
-- Full and strict preparation use bounded AI audit plus local debug preflight. Dashboard Minimal skips validator and AI audit and relaxes generic manifest/non-recipe coverage, but local recipe coverage and the 16-case seed/output-variation gate still run. A failure returns structured `artifact`, `profile`, `case_kind`, and `seed` when available, leaves previous helper hashes unchanged, and creates neither an applied bundle nor a stress run.
-- Run status is `pending`, `preparing`, `running`, `stop_requested`, `stopped`, `mismatch`, `oracle_conflict`, `fault`, `interrupted`, or `completed`. A restart changes only runs whose owner process is no longer alive to `interrupted`; resume accepts stopped/interrupted/mismatch/oracle-conflict/fault states, reuses and recompiles the applied helpers without an AI call, and continues from persisted `next_seed` with accumulated counters.
-- Profile-v2 runs samples, an exact lower-bound small case, an optional exact upper-bound large case, then a persistent 4:1 small/large cycle. Every profile executes solution, ref1, and ref2; strict mode validates each generated input first. Only `ref1 == ref2 != solution` is a confirmed mismatch, while `ref1 != ref2` is always `oracle_conflict`. Small cases use the normal 2 MiB limits; large cases use 32 MiB input and 16 MiB output limits. The latest mismatch or oracle conflict is atomically exported beside the solution as `<problem>_input.in`, `<problem>_current.out`, `<problem>_ref1.out`, and `<problem>_ref2.out`. History remains under `.acm/failures/`.
-- HTTP endpoints are `GET /api/ai/stress/status`, `POST /api/jobs/ai/stress/start`, `GET /api/stress/runs[/{id}]`, `POST /api/stress/runs/{id}/stop|resume|finish`, `GET /api/stress/bundles/{id}`, and `POST /api/jobs/stress/bundles/{id}/revert`. `stop` is a resumable pause; `finish` waits for the active process tree to stop, then permanently completes the run and releases the single-active-run lock. The start payload uses `large_profile` (default true); removed profile fields are rejected rather than translated. CLI equivalents are `verify --ai-stress [--no-large]` and `stress status/stop/resume/artifacts/revert`.
+- Finite local stress is available only when the problem directory contains hand-written `<problem>.bf.cpp` and `<problem>.gen.cpp` helpers.
+- `verify --stress-iterations <N> --seed <seed>` controls the bounded case count and deterministic starting seed. It does not generate helpers or persist resumable runs.
+- A mismatch keeps the generated input, solution output, brute-force output, seed, and replay command under `.acm/failures/`.
 
 ## Plan and Recommendation Rules
 
-- `source_mode` is `balanced`, `catalog_only`, or `plan_only`. Balanced mode caps plan tasks at `ceil(2 * count / 3)` and does not silently exceed the cap when the catalog is short.
+- Recommendation slots cycle by thirds as `current_plus_100`, `recent_solved_average`, and `target_rating`. Recent difficulty is the combined CF-equivalent arithmetic mean of up to 50 latest distinct solved problems per platform; responses expose the resolved targets and sample coverage in `difficulty_profile`.
+- `source_mode` is `balanced`, `catalog_only`, or `plan_only`. Balanced mode is the ordinary union of catalog and plan candidates: plan membership, dates, levels, and source do not add score, win ties, or impose a plan quota.
 - `plan_ids` optionally restricts recommendations to named enabled plans.
-- CLI equivalents are `next --source-mode <mode> [--plan <plan-id> ...] --json`.
+- CLI equivalents are `next --source-mode <mode> [--plan <plan-id> ...] --json` and `next --ai --ai-mode gap_fill|specialization --json`.
 - A plan edit is an atomic full-document replacement guarded by `expected_revision`. HTTP `409 revision_conflict` means the caller must reload before retrying.
 - Removing a task or plan preserves all platform, attempt, session, review, and local-file state.
 - Platform counts and ratios are read-only derived metadata computed from `stages[].tasks` (replacement alternatives are excluded). They must not be persisted in `plan.json` or sent as editable plan fields.

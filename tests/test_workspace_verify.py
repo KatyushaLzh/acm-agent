@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from datetime import date
-import os
 from pathlib import Path
+import concurrent.futures
+import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
-from tools.acm_agent.verify import outputs_equal, verify_problem
+from tools.acm_agent.verify import _run, outputs_equal, verify_problem
 from tools.acm_agent.workspace import (
     DEFAULT_TEMPLATE,
     find_solution,
@@ -172,6 +174,97 @@ class VerifyTests(unittest.TestCase):
             self.assertFalse(result.passed)
             self.assertIn("compiler not found", result.compile_output)
 
+    def test_compile_only_is_inconclusive_not_passed(self) -> None:
+        import shutil
+
+        if shutil.which("g++") is None:
+            self.skipTest("g++ is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "2026" / "8" / "3" / "CF1A.cpp"
+            source.parent.mkdir(parents=True)
+            source.write_text("int main(){return 0;}\n", encoding="utf-8")
+
+            result = verify_problem(root, "CF1A")
+
+            self.assertTrue(result.compiled)
+            self.assertFalse(result.passed)
+            self.assertEqual(result.verification_level, "compiled_only")
+            self.assertEqual(result.verification_status, "inconclusive")
+
+    def test_verify_rejects_non_positive_runtime_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for timeout in (0, -0.1, float("inf"), float("nan")):
+                with self.subTest(timeout=timeout):
+                    with self.assertRaises(ValueError):
+                        verify_problem(root, "CF1A", timeout=timeout)
+            for iterations in (0, -1):
+                with self.subTest(iterations=iterations):
+                    with self.assertRaises(ValueError):
+                        verify_problem(root, "CF1A", stress_iterations=iterations)
+
+    def test_each_verify_uses_an_independent_build_directory(self) -> None:
+        import shutil
+
+        if shutil.which("g++") is None:
+            self.skipTest("g++ is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "2026" / "8" / "3" / "CF1A.cpp"
+            source.parent.mkdir(parents=True)
+            source.write_text("int main(){return 0;}\n", encoding="utf-8")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(
+                    executor.map(lambda _: verify_problem(root, "CF1A"), range(2))
+                )
+            executables = [Path(result.compile_command[-1]) for result in results]
+            self.assertNotEqual(executables[0].parent, executables[1].parent)
+            self.assertTrue(
+                all(path.is_relative_to(root / ".acm" / "build" / "runs") for path in executables)
+            )
+
+    def test_output_limit_is_a_structured_sample_failure(self) -> None:
+        import shutil
+
+        if shutil.which("g++") is None:
+            self.skipTest("g++ is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "2026" / "8" / "3" / "CF1A.cpp"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "#include <iostream>\nint main(){for(int i=0;i<2000000;i++)std::cout.put('x');}\n",
+                encoding="utf-8",
+            )
+            cases = root / ".acm" / "cases" / "CF1A"
+            cases.mkdir(parents=True)
+            (cases / "sample.in").write_text("", encoding="utf-8")
+            (cases / "sample.out").write_text("", encoding="utf-8")
+
+            result = verify_problem(root, "CF1A", timeout=5)
+
+            self.assertFalse(result.passed)
+            self.assertEqual(result.verification_status, "failed")
+            self.assertIn("output limit exceeded", result.cases[0].reason)
+
+    def test_timeout_terminates_descendant_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "descendant-survived.txt"
+            descendant = (
+                "import pathlib,time;time.sleep(1);"
+                f"pathlib.Path({str(marker)!r}).write_text('alive')"
+            )
+            parent = (
+                "import subprocess,sys,time;"
+                f"subprocess.Popen([sys.executable,'-c',{descendant!r}]);"
+                "time.sleep(30)"
+            )
+            result = _run([sys.executable, "-c", parent], timeout=0.2)
+            self.assertEqual(result.returncode, 124)
+            time.sleep(1.2)
+            self.assertFalse(marker.exists())
+
     def test_verify_samples_when_gpp_available(self) -> None:
         import shutil
 
@@ -194,11 +287,7 @@ class VerifyTests(unittest.TestCase):
             token_result = verify_problem(root, "CF1A")
             self.assertTrue(token_result.passed, token_result.to_dict())
             self.assertTrue(token_result.cases[0].passed)
-            build = os.path.normcase(os.path.realpath(root / ".acm" / "build"))
-            executable = os.path.normcase(
-                os.path.realpath(token_result.compile_command[-1])
-            )
-            self.assertEqual(os.path.commonpath((executable, build)), build)
+            self.assertTrue(Path(token_result.compile_command[-1]).is_relative_to(root / ".acm" / "build"))
 
             exact_result = verify_problem(root, "CF1A", exact=True)
             self.assertFalse(exact_result.passed)
@@ -233,9 +322,7 @@ class VerifyTests(unittest.TestCase):
             self.assertEqual(result.stress_iterations, 1)
             self.assertIsNotNone(result.failure_dir)
             failure = Path(result.failure_dir or "")
-            failures = os.path.normcase(os.path.realpath(root / ".acm" / "failures"))
-            failure_path = os.path.normcase(os.path.realpath(failure))
-            self.assertEqual(os.path.commonpath((failure_path, failures)), failures)
+            self.assertTrue(failure.is_relative_to(root / ".acm" / "failures"))
             self.assertEqual((failure / "input.txt").read_text(), "1\n")
             self.assertEqual((failure / "actual.txt").read_text().strip(), "0")
             self.assertEqual((failure / "expected.txt").read_text().strip(), "1")
@@ -243,6 +330,41 @@ class VerifyTests(unittest.TestCase):
             self.assertEqual(metadata["seed"], 42)
             self.assertIn("generator_command", metadata)
             self.assertEqual(set(metadata["commands"]), {"generator", "solution", "brute_force"})
+
+    def test_stress_accepts_explicit_cpp_sources_with_independent_names(self) -> None:
+        import shutil
+
+        if shutil.which("g++") is None:
+            self.skipTest("g++ is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sources = root / "picked"
+            sources.mkdir()
+            user = sources / "user-program.cpp"
+            reference = sources / "trusted-answer.cpp"
+            generator = sources / "data-maker.cpp"
+            user.write_text(
+                "#include <iostream>\nint main(){long long x;std::cin>>x;std::cout<<x<<'\\n';}\n",
+                encoding="utf-8",
+            )
+            reference.write_text(user.read_text(encoding="utf-8"), encoding="utf-8")
+            generator.write_text(
+                "#include <cstdlib>\n#include <iostream>\nint main(int argc,char** argv){std::cout<<(argc>1?std::atoll(argv[1]):0)<<'\\n';}\n",
+                encoding="utf-8",
+            )
+
+            result = verify_problem(
+                root,
+                user,
+                generator_file=generator,
+                reference_file=reference,
+                stress_iterations=3,
+                seed=42,
+            )
+
+            self.assertTrue(result.passed, result.to_dict())
+            self.assertEqual(result.stress, "passed")
+            self.assertEqual(result.stress_iterations, 3)
 
     @mock.patch(
         "tools.acm_agent.verify.sanitizer_supported",

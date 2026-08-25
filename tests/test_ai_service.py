@@ -19,6 +19,7 @@ from tools.acm_agent.ai_context import (
 from tools.acm_agent.deepseek import ChatResult, JsonChatResult, StreamEvent
 from tools.acm_agent.credentials import DeepSeekCredentialStore
 from tools.acm_agent.service import AcmService
+from tools.acm_agent.service_common import AIConversationConflict
 from tools.acm_agent.storage import Database
 
 
@@ -74,15 +75,47 @@ class FakeDeepSeek:
             }
         else:
             request = json.loads(prompt.splitlines()[-1])
-            ranked = [
-                {
-                    "problem_key": item["problem_key"],
-                    "ai_reason": "针对近期薄弱标签",
-                    "training_focus": "先写出不变量",
-                }
-                for item in reversed(request["candidates"])
-            ]
-            data = {"ranked": ranked, "risk_warning": "难度上浮"}
+            focus_topics = request["eligible_focus_topics"][: min(3, request["requested_count"])]
+            ranked = []
+            seen = set()
+            for topic in focus_topics:
+                item = next(
+                    item
+                    for item in request["candidates"]
+                    if item["problem_key"] not in seen and topic in item["knowledge_topics"]
+                )
+                seen.add(item["problem_key"])
+                ranked.append(
+                    {
+                        "problem_key": item["problem_key"],
+                        "topic": topic,
+                        "ai_reason": "针对近期薄弱标签",
+                        "training_focus": "先写出不变量",
+                    }
+                )
+            for item in request["candidates"]:
+                if len(ranked) >= request["requested_count"]:
+                    break
+                topic = next(
+                    (topic for topic in item["knowledge_topics"] if topic in focus_topics),
+                    None,
+                )
+                if item["problem_key"] in seen or topic is None:
+                    continue
+                seen.add(item["problem_key"])
+                ranked.append(
+                    {
+                        "problem_key": item["problem_key"],
+                        "topic": topic,
+                        "ai_reason": "针对近期薄弱标签",
+                        "training_focus": "先写出不变量",
+                    }
+                )
+            data = {
+                "focus_topics": focus_topics,
+                "ranked": ranked,
+                "risk_warning": "难度上浮",
+            }
         return JsonChatResult(
             json.dumps(data, ensure_ascii=False),
             "stop",
@@ -145,9 +178,6 @@ class AiServiceTests(unittest.TestCase):
                 "summary_model",
                 "summary_thinking",
                 "summary_reasoning_effort",
-                "validation_model",
-                "validation_thinking",
-                "validation_reasoning_effort",
             },
         )
 
@@ -216,6 +246,51 @@ class AiServiceTests(unittest.TestCase):
         )
         self.assertEqual(closed["close"]["hint_level"], 2)
         stream.close()
+
+    def test_conversation_allows_only_one_in_flight_turn_and_releases_on_close(self):
+        self.service.start("CF1A")
+        conversation = self.service.ai_conversation_start("CF1A")
+        conversation_id = conversation["conversation_id"]
+        stream = self.service.ai_chat_stream(
+            conversation_id,
+            message="第一个请求",
+            mode="hint",
+            hint_level=1,
+        )
+
+        with self.assertRaises(AIConversationConflict) as raised:
+            self.service.ai_chat_stream(
+                conversation_id,
+                message="并发请求",
+                mode="hint",
+                hint_level=1,
+            )
+        self.assertEqual(raised.exception.code, "conversation_busy")
+
+        self.assertEqual(next(stream)["event"], "meta")
+        stream.close()
+        with Database(self.service.paths.database) as db:
+            in_flight = db.connection.execute(
+                """SELECT COUNT(*) FROM ai_messages
+                   WHERE conversation_id=? AND status IN ('pending','streaming')""",
+                (conversation_id,),
+            ).fetchone()[0]
+            running = db.connection.execute(
+                """SELECT COUNT(*) FROM ai_runs
+                   WHERE conversation_id=? AND status IN ('pending','running')""",
+                (conversation_id,),
+            ).fetchone()[0]
+        self.assertEqual((in_flight, running), (0, 0))
+
+        events = list(
+            self.service.ai_chat_stream(
+                conversation_id,
+                message="中断后重试",
+                mode="hint",
+                hint_level=1,
+            )
+        )
+        self.assertEqual(events[-1]["event"], "done")
 
     def test_patch_preview_apply_verify_failure_and_revert(self):
         started = self.service.start("CF1A")

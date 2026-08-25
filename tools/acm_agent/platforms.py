@@ -123,6 +123,7 @@ class SyncResult:
     problems: int = 0
     error: str | None = None
     warnings: list[str] = field(default_factory=list)
+    tag_enrichment: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -133,6 +134,7 @@ class SyncResult:
             "problems": self.problems,
             "error": self.error,
             "warnings": self.warnings,
+            "tag_enrichment": self.tag_enrichment,
         }
 
 
@@ -415,8 +417,19 @@ def parse_luogu_tags(payload: Any) -> dict[int, str]:
 
 def parse_luogu_problems(payload: Any, tag_names: Mapping[int, str] | None = None) -> list[dict[str, Any]]:
     context = parse_lentille_context(payload)
+    found = _parse_luogu_problem_nodes(context, tag_names)
+    if not found:
+        raise ResponseShapeError("Luogu problem list contains no recognizable problems")
+    return [found[key] for key in sorted(found)]
+
+
+def _parse_luogu_problem_nodes(
+    payload: Any, tag_names: Mapping[int, str] | None = None
+) -> dict[str, dict[str, Any]]:
+    """Parse supported public Luogu P-series rows without requiring a match."""
+
     found: dict[str, dict[str, Any]] = {}
-    for node in _walk(context):
+    for node in _walk(payload):
         if not isinstance(node, Mapping):
             continue
         pid = node.get("pid")
@@ -442,9 +455,47 @@ def parse_luogu_problems(payload: Any, tag_names: Mapping[int, str] | None = Non
             "tags": tags,
             "source": dict(node),
         }
-    if not found:
-        raise ResponseShapeError("Luogu problem list contains no recognizable problems")
-    return [found[key] for key in sorted(found)]
+    return found
+
+
+def parse_luogu_problem_page(
+    payload: Any, tag_names: Mapping[int, str] | None = None
+) -> dict[str, Any]:
+    """Parse one unfiltered problem-list page and its pagination contract."""
+
+    context = parse_lentille_context(payload)
+    candidates: list[Mapping[str, Any]] = []
+    for node in _walk(context):
+        if not isinstance(node, Mapping) or not isinstance(node.get("result"), list):
+            continue
+        count = node.get("count")
+        per_page = node.get("perPage")
+        if (
+            isinstance(count, int)
+            and not isinstance(count, bool)
+            and isinstance(per_page, int)
+            and not isinstance(per_page, bool)
+        ):
+            candidates.append(node)
+    if len(candidates) != 1:
+        raise ResponseShapeError(
+            f"Luogu problem list returned {len(candidates)} pagination objects"
+        )
+    page = candidates[0]
+    count = int(page["count"])
+    per_page = int(page["perPage"])
+    if count < 0 or per_page <= 0:
+        raise ResponseShapeError("Luogu problem-list pagination is invalid")
+    raw_rows = page["result"]
+    if any(not isinstance(row, Mapping) for row in raw_rows):
+        raise ResponseShapeError("Luogu problem-list result contains a non-object row")
+    found = _parse_luogu_problem_nodes(raw_rows, tag_names)
+    return {
+        "problems": [found[key] for key in sorted(found)],
+        "count": count,
+        "per_page": per_page,
+        "raw_count": len(raw_rows),
+    }
 
 
 def parse_luogu_problem(
@@ -529,6 +580,47 @@ class LuoguClient:
             params["tag"] = tag
         return parse_luogu_problems(self._get("/problem/list", **params), tag_names)
 
+    def problem_page_info(
+        self,
+        *,
+        page: int = 1,
+        tag_names: Mapping[int, str] | None = None,
+    ) -> dict[str, Any]:
+        return parse_luogu_problem_page(
+            self._get("/problem/list", page=page, _contentOnly=1),
+            tag_names,
+        )
+
+    def all_problems(
+        self,
+        *,
+        tag_names: Mapping[int, str] | None = None,
+        max_pages: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Fetch every page of the public catalog, retaining supported P IDs."""
+
+        first = self.problem_page_info(page=1, tag_names=tag_names)
+        if first["count"] and first["raw_count"] == 0:
+            raise ResponseShapeError("Luogu catalog page 1 is unexpectedly empty")
+        total_pages = max(1, (first["count"] + first["per_page"] - 1) // first["per_page"])
+        if total_pages > max_pages:
+            raise ResponseShapeError(
+                f"Luogu catalog requires {total_pages} pages, above limit {max_pages}"
+            )
+        found = {
+            row["problem_id"]: row
+            for row in first["problems"]
+        }
+        for page_number in range(2, total_pages + 1):
+            current = self.problem_page_info(page=page_number, tag_names=tag_names)
+            if current["raw_count"] == 0:
+                raise ResponseShapeError(
+                    f"Luogu catalog page {page_number}/{total_pages} is unexpectedly empty"
+                )
+            for row in current["problems"]:
+                found[row["problem_id"]] = row
+        return [found[key] for key in sorted(found)]
+
     def problem_by_keyword(
         self, problem_id: str, *, tag_names: Mapping[int, str] | None = None
     ) -> dict[str, Any]:
@@ -581,6 +673,165 @@ def _normalise_preview_tags(value: Any) -> list[str]:
             seen.add(folded)
             result.append(tag)
     return result
+
+
+LUOGU_TAG_ENRICHMENT_CURSOR_KEY = "tag_enrichment_cursor"
+LUOGU_TAG_ENRICHMENT_MAX_BATCH = 50
+
+
+def _sync_metadata(db: Database, platform: str) -> dict[str, Any]:
+    state = db.sync_state(platform)
+    if not state:
+        return {}
+    try:
+        decoded = json.loads(state["metadata_json"] or "{}")
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return {}
+    return dict(decoded) if isinstance(decoded, Mapping) else {}
+
+
+def _luogu_accepted_problems_missing_tags(db: Database) -> list[str]:
+    """Return distinct public ACs that have neither raw nor effective tags."""
+
+    rows = db.query(
+        """SELECT DISTINCT s.problem_id,p.tags_json
+           FROM submissions AS s
+           JOIN problems AS p
+             ON p.platform=s.platform AND p.problem_id=s.problem_id
+           WHERE s.platform='luogu' AND UPPER(TRIM(COALESCE(s.verdict,'')))='AC'
+           ORDER BY s.problem_id"""
+    )
+    missing: list[str] = []
+    for row in rows:
+        try:
+            raw_tags = _normalise_preview_tags(json.loads(row["tags_json"] or "[]"))
+        except (json.JSONDecodeError, TypeError):
+            raw_tags = []
+        problem_id = str(row["problem_id"]).strip().upper()
+        if not raw_tags and not db.effective_problem_tags("luogu", problem_id):
+            missing.append(problem_id)
+    return missing
+
+
+def _rotated_problem_batch(
+    problem_ids: Sequence[str], cursor: str | None, limit: int
+) -> list[str]:
+    if not problem_ids or limit <= 0:
+        return []
+    start = 0
+    if cursor:
+        cursor = str(cursor).strip().upper()
+        start = next(
+            (index for index, problem_id in enumerate(problem_ids) if problem_id > cursor),
+            0,
+        )
+    rotated = list(problem_ids[start:]) + list(problem_ids[:start])
+    return rotated[:limit]
+
+
+def _safe_platform_error(exc: BaseException) -> str:
+    """Keep per-problem diagnostics compact and suitable for API responses."""
+
+    message = " ".join(str(exc).split()) or exc.__class__.__name__
+    return message[:300]
+
+
+def enrich_luogu_accepted_problem_tags(
+    db: Database,
+    client: LuoguClient | None = None,
+    *,
+    batch_size: int = LUOGU_TAG_ENRICHMENT_MAX_BATCH,
+    full: bool = False,
+) -> dict[str, Any]:
+    """Incrementally cache public tags for accepted Luogu problems.
+
+    Selection is deterministic and rotates after the last attempted pid.
+    ``full=True`` attempts the complete unresolved set in one call; otherwise
+    the legacy incremental path remains capped at 50.  A malformed or
+    unavailable problem page affects only that pid; the cursor is still
+    advanced so one bad page cannot starve the rest of the accepted set.
+    """
+
+    client = client or LuoguClient()
+    metadata = _sync_metadata(db, "luogu")
+    cursor = metadata.get(LUOGU_TAG_ENRICHMENT_CURSOR_KEY)
+    missing = _luogu_accepted_problems_missing_tags(db)
+    limit = (
+        len(missing)
+        if full
+        else min(max(int(batch_size), 0), LUOGU_TAG_ENRICHMENT_MAX_BATCH)
+    )
+    selected = _rotated_problem_batch(missing, str(cursor) if cursor else None, limit)
+    errors: list[dict[str, str]] = []
+    resolved_rows: list[dict[str, Any]] = []
+
+    tag_names: dict[int, str] = {}
+    cached_tag_names = metadata.get("tags")
+    if isinstance(cached_tag_names, Mapping):
+        for raw_id, raw_name in cached_tag_names.items():
+            try:
+                tag_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(raw_name, str) and raw_name:
+                tag_names[tag_id] = raw_name
+    if selected and not tag_names:
+        try:
+            tag_names = client.tags()
+            metadata["tags"] = {str(key): value for key, value in tag_names.items()}
+        except Exception as exc:
+            errors.append(
+                {
+                    "platform": "luogu",
+                    "problem_id": "*",
+                    "message": _safe_platform_error(exc),
+                }
+            )
+
+    failed_problem_ids: set[str] = set()
+    for problem_id in selected:
+        try:
+            problem = client.problem(problem_id, tag_names=tag_names)
+            returned_id = str(problem.get("problem_id") or "").strip().upper()
+            if returned_id != problem_id or str(problem.get("platform") or "").lower() != "luogu":
+                raise ResponseShapeError(
+                    f"Luogu problem lookup for {problem_id} returned {returned_id or 'no pid'}"
+                )
+            tags = _normalise_preview_tags(problem.get("tags", []))
+            resolved_rows.append(dict(problem))
+            if not tags:
+                raise ResponseShapeError(f"Luogu problem {problem_id} has no public tags")
+        except Exception as exc:
+            failed_problem_ids.add(problem_id)
+            errors.append(
+                {
+                    "platform": "luogu",
+                    "problem_id": problem_id,
+                    "message": _safe_platform_error(exc),
+                }
+            )
+
+    if selected:
+        metadata[LUOGU_TAG_ENRICHMENT_CURSOR_KEY] = selected[-1]
+    with db.atomic():
+        db.upsert_problems(resolved_rows)
+        db.connection.execute(
+            """INSERT INTO sync_state(platform,status,metadata_json)
+               VALUES('luogu','stale',?)
+               ON CONFLICT(platform) DO UPDATE SET metadata_json=excluded.metadata_json""",
+            (json.dumps(metadata, ensure_ascii=False),),
+        )
+
+    remaining = len(_luogu_accepted_problems_missing_tags(db))
+    resolved = sum(problem_id not in failed_problem_ids for problem_id in selected)
+    return {
+        "attempted": len(selected),
+        "resolved": resolved,
+        "failed": len(failed_problem_ids),
+        "remaining": remaining,
+        "cursor": metadata.get(LUOGU_TAG_ENRICHMENT_CURSOR_KEY),
+        "errors": errors,
+    }
 
 
 def preview_plan_task_tags(
@@ -854,6 +1105,7 @@ def sync_luogu(
     refresh_catalog: bool | None = None,
     candidate_pages: Sequence[int] = (1,),
     candidate_queries: Sequence[Mapping[str, Any]] | None = None,
+    full_catalog: bool = False,
     now: datetime | None = None,
 ) -> SyncResult:
     """Sync public Luogu ACs; catalog errors produce a usable partial sync."""
@@ -875,16 +1127,19 @@ def sync_luogu(
     if refresh_catalog:
         try:
             tags = client.tags()
-            queries = candidate_queries or tuple({"page": page} for page in candidate_pages)
-            for query in queries:
-                catalog.extend(
-                    client.problem_page(
-                        page=int(query.get("page", 1)),
-                        difficulty=query.get("difficulty"),
-                        tag=query.get("tag"),
-                        tag_names=tags,
+            if full_catalog:
+                catalog = client.all_problems(tag_names=tags)
+            else:
+                queries = candidate_queries or tuple({"page": page} for page in candidate_pages)
+                for query in queries:
+                    catalog.extend(
+                        client.problem_page(
+                            page=int(query.get("page", 1)),
+                            difficulty=query.get("difficulty"),
+                            tag=query.get("tag"),
+                            tag_names=tags,
+                        )
                     )
-                )
             catalog_ok = True
         except Exception as exc:
             warnings.append(f"catalog refresh failed: {exc}")
@@ -941,6 +1196,24 @@ def sync_luogu(
     except Exception as exc:
         db.record_sync_attempt("luogu", status="failed", error=str(exc), success=False)
         return SyncResult("luogu", "failed", error=str(exc))
+    tag_enrichment: dict[str, Any] | None = None
+    try:
+        tag_enrichment = enrich_luogu_accepted_problem_tags(db, client, full=True)
+        if tag_enrichment["failed"]:
+            warnings.append(
+                "tag enrichment failed for "
+                f"{tag_enrichment['failed']}/{tag_enrichment['attempted']} problem(s)"
+            )
+    except Exception as exc:
+        warnings.append(f"tag enrichment failed: {_safe_platform_error(exc)}")
+
+    status = "fresh" if not warnings else "partial"
+    if status == "partial":
+        with db.atomic():
+            db.connection.execute(
+                "UPDATE sync_state SET status='partial',error=? WHERE platform='luogu'",
+                (warnings[0],),
+            )
     return SyncResult(
         "luogu",
         status,
@@ -948,6 +1221,7 @@ def sync_luogu(
         accepted=len(passed),
         problems=len(catalog),
         warnings=warnings,
+        tag_enrichment=tag_enrichment,
     )
 
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
-from math import ceil
 import re
 import json
 from statistics import median
@@ -15,8 +14,19 @@ from .plan import PlanError, canonical_problem_key
 
 
 LUOGU_CF_EQUIVALENT = {1: 800, 2: 1000, 3: 1300, 4: 1600, 5: 1900, 6: 2200, 7: 2500}
+# Legacy public constant retained for compatibility. Difficulty scoring now
+# uses three explicit targets instead of offsets from one baseline.
 SLOT_OFFSETS = {"recovery": -150, "main": 50, "stretch": 250}
-LEVEL_SLOT = {"A": "recovery", "B": "main", "C": "stretch"}
+DIFFICULTY_BANDS = {
+    "recovery": "current_plus_100",
+    "main": "recent_solved_average",
+    "stretch": "target_rating",
+}
+DIFFICULTY_BAND_LABELS = {
+    "recovery": "当前 rating + 100",
+    "main": "近期已解决均值",
+    "stretch": "目标 rating",
+}
 ACCEPTED_RESULTS = {"AC", "ACCEPTED", "OK"}
 FAILED_RESULTS = {"WA", "WRONG_ANSWER", "TLE", "RE", "RUNTIME_ERROR", "MLE", "ABANDONED"}
 SOURCE_MODES = {"balanced", "catalog_only", "plan_only"}
@@ -206,6 +216,8 @@ class Recommendation:
     title: str
     url: str
     equivalent_rating: int | None
+    difficulty_target: int
+    difficulty_band: str
     score: float
     breakdown: Mapping[str, float]
     reasons: tuple[str, ...] = ()
@@ -223,6 +235,8 @@ class Recommendation:
             "title": self.title,
             "url": self.url,
             "equivalent_rating": self.equivalent_rating,
+            "difficulty_target": self.difficulty_target,
+            "difficulty_band": self.difficulty_band,
             "score": self.score,
             "breakdown": dict(self.breakdown),
             "reasons": list(self.reasons),
@@ -276,6 +290,51 @@ def estimate_cf_baseline(
 
 def luogu_equivalent(difficulty: int | None) -> int | None:
     return LUOGU_CF_EQUIVALENT.get(int(difficulty)) if difficulty is not None else None
+
+
+def _difficulty_distance(equivalent_rating: int | None, target: int) -> float:
+    if equivalent_rating is None:
+        return float("inf")
+    return float(abs(int(equivalent_rating) - int(target)))
+
+
+def recommendation_difficulty_targets(
+    current_cf_rating: int | None,
+    recent_solved_equivalents: Iterable[int],
+    *,
+    target_rating: int | None = None,
+    default: int = 1600,
+) -> dict[str, int]:
+    """Return the three equally represented recommendation difficulty targets."""
+
+    recent: list[int] = []
+    for value in recent_solved_equivalents:
+        try:
+            converted = int(value)
+        except (TypeError, ValueError):
+            continue
+        if converted > 0:
+            recent.append(converted)
+    recent_average = round(sum(recent) / len(recent)) if recent else None
+    current_base = (
+        int(current_cf_rating)
+        if current_cf_rating is not None and int(current_cf_rating) > 0
+        else recent_average
+        if recent_average is not None
+        else int(target_rating)
+        if target_rating is not None and int(target_rating) > 0
+        else int(default)
+    )
+    current_plus_100 = current_base + 100
+    return {
+        "recovery": current_plus_100,
+        "main": recent_average if recent_average is not None else current_plus_100,
+        "stretch": (
+            int(target_rating)
+            if target_rating is not None and int(target_rating) > 0
+            else current_plus_100
+        ),
+    }
 
 
 def compute_weakness(
@@ -504,14 +563,18 @@ def _plan_tie_key(candidate: Candidate, fairness_rank: Mapping[str, int]) -> tup
     return stage_order, fair_rank, ",".join(plan_ids)
 
 
-def _slot_names(count: int) -> list[str]:
+def recommendation_slots(count: int) -> list[str]:
+    """Cycle the three bands so every complete group is split 1/3 each."""
+
     if count <= 0:
         return []
-    if count == 1:
-        return ["main"]
-    if count == 2:
-        return ["recovery", "main"]
-    return ["recovery", "main", "stretch"] + [f"main-{index}" for index in range(2, count - 1)]
+    bases = ("recovery", "main", "stretch")
+    slots: list[str] = []
+    for index in range(count):
+        base = bases[index % len(bases)]
+        group = index // len(bases) + 1
+        slots.append(base if group == 1 else f"{base}-{group}")
+    return slots
 
 
 def _stable_problem_sort_key(candidate: Candidate) -> tuple[int, int, str]:
@@ -529,21 +592,16 @@ def _score_candidate(
     *,
     slot: str,
     today: date,
-    baseline: int,
+    difficulty_targets: Mapping[str, int],
     weakness: Mapping[str, float],
     recent_keys: Sequence[str],
     platform_counts: Counter[str],
 ) -> tuple[float, dict[str, float], tuple[str, ...]]:
     reasons: list[str] = []
-    if candidate.due_date is not None and candidate.due_date < today:
-        days = (today - candidate.due_date).days
-        plan_score = 3000.0 + min(days, 30) * 5.0
-        reasons.append(f"题单逾期 {days} 天")
-    elif candidate.due_date == today:
-        plan_score = 2000.0
-        reasons.append("今日题单")
-    else:
-        plan_score = 0.0
+    # Plan membership, schedule and A/B/C level are provenance only.  They may
+    # filter candidates through source_mode/unlock_at, but never improve the
+    # ranking of an otherwise identical problem.
+    plan_score = 0.0
 
     review_score = 0.0
     if candidate.review_due is not None and candidate.review_due <= today:
@@ -552,14 +610,14 @@ def _score_candidate(
         reasons.append("到期复做" if days == 0 else f"复做逾期 {days} 天")
 
     target_slot = slot.split("-", 1)[0]
-    target = baseline + SLOT_OFFSETS.get(target_slot, SLOT_OFFSETS["main"])
+    target = int(difficulty_targets.get(target_slot, difficulty_targets["main"]))
     equivalent = candidate.equivalent_rating
     difficulty_score = 0.0 if equivalent is None else max(0.0, 180.0 - abs(equivalent - target) * 0.6)
     if equivalent is not None:
-        reasons.append(f"等价难度 {equivalent}，{target_slot} 目标 {target}")
-    if LEVEL_SLOT.get(candidate.plan_level) == target_slot:
-        difficulty_score += 80.0
-        reasons.append(f"题单 {candidate.plan_level} 层与位置匹配")
+        reasons.append(
+            f"等价难度 {equivalent}，"
+            f"{DIFFICULTY_BAND_LABELS.get(target_slot, target_slot)} 目标 {target}"
+        )
 
     tag_values = [weakness.get(tag, 0.0) for tag in candidate.tags]
     weakness_score = min(120.0, sum(tag_values) / len(tag_values) * 20.0) if tag_values else 0.0
@@ -609,15 +667,17 @@ def recommend(
     cf_rating: int | None = None,
     target_cf_rating: int | None = None,
     recent_cf_accepted: Iterable[int | Mapping[str, Any] | Any] = (),
+    recent_solved_equivalents: Iterable[int] = (),
+    return_pool: bool = False,
 ) -> list[Recommendation]:
     """Recommend problems with an explicit score breakdown and stable tie-breaks.
 
     ``mode='new'`` excludes every accepted problem; ``mode='review'`` includes
     only accepted problems whose review date is due; ``mixed`` combines those
     two pools. ``source_mode`` controls catalog/plan participation independently
-    of that acceptance mode. In balanced mode at most ``ceil(2 * count / 3)``
-    selected problems may come from plans; a catalog shortage never relaxes the
-    cap. Future plan tasks are always hidden until ``unlock_at``.
+    of that acceptance mode. In balanced mode catalog and plan rows form one
+    ordinary union: plan provenance never changes scoring or tie-breaking.
+    Future plan tasks are always hidden until ``unlock_at``.
     """
     if mode not in {"mixed", "new", "review"}:
         raise ValueError("mode must be one of: mixed, new, review")
@@ -684,49 +744,87 @@ def recommend(
             continue
         normalised.append(candidate)
 
-    baseline = estimate_cf_baseline(
+    recent_equivalents = list(recent_solved_equivalents)
+    if not recent_equivalents:
+        for item in recent_cf_accepted:
+            rating = item if isinstance(item, int) else _get(item, "rating")
+            if rating not in (None, ""):
+                recent_equivalents.append(int(rating))
+    difficulty_targets = recommendation_difficulty_targets(
         cf_rating,
-        recent_cf_accepted,
+        recent_equivalents,
         target_rating=target_cf_rating,
     )
     weakness = compute_weakness(attempts, now=today)
     recent_keys, recent_platforms = _history_fields(recommendation_history)
     platform_counts = Counter(recent_platforms)
-    all_plan_ids = {
-        source.plan_id
-        for candidate in normalised
-        for source in candidate.plan_sources
-        if source.plan_id
-    }
-    fairness_order = plan_fairness_order(all_plan_ids, recommendation_history)
-    fairness_rank = {plan_id: rank for rank, plan_id in enumerate(fairness_order)}
+    if return_pool:
+        scored_pool: list[tuple[Any, ...]] = []
+        for candidate in normalised:
+            score, breakdown, reasons = _score_candidate(
+                candidate,
+                slot="main",
+                today=today,
+                difficulty_targets=difficulty_targets,
+                weakness=weakness,
+                recent_keys=recent_keys,
+                platform_counts=platform_counts,
+            )
+            scored_pool.append(
+                (
+                    _difficulty_distance(
+                        candidate.equivalent_rating, difficulty_targets["main"]
+                    ),
+                    -score,
+                    _stable_problem_sort_key(candidate),
+                    candidate.problem_key,
+                    Recommendation(
+                        slot="main",
+                        problem_key=candidate.problem_key,
+                        problem_id=candidate.problem_id,
+                        platform=candidate.platform,
+                        title=candidate.title,
+                        url=candidate.url,
+                        equivalent_rating=candidate.equivalent_rating,
+                        difficulty_target=difficulty_targets["main"],
+                        difficulty_band=DIFFICULTY_BANDS["main"],
+                        score=score,
+                        breakdown=breakdown,
+                        reasons=reasons,
+                        task_key=candidate.task_key,
+                        tags=candidate.tags,
+                        source=candidate.source,
+                        plan_sources=candidate.plan_sources,
+                    ),
+                )
+            )
+        return [row[-1] for row in sorted(scored_pool)]
+
     selected: list[Recommendation] = []
     used: set[str] = set()
-    selected_from_plans = 0
-    plan_limit = ceil(2 * max(0, count) / 3) if source_mode == "balanced" else max(0, count)
-    for slot in _slot_names(count):
+    for slot in recommendation_slots(count):
         scored: list[tuple[Any, ...]] = []
         for candidate in normalised:
             if candidate.problem_key in used:
-                continue
-            from_plan = bool(candidate.plan_sources)
-            if source_mode == "balanced" and from_plan and selected_from_plans >= plan_limit:
                 continue
             score, breakdown, reasons = _score_candidate(
                 candidate,
                 slot=slot,
                 today=today,
-                baseline=baseline,
+                difficulty_targets=difficulty_targets,
                 weakness=weakness,
                 recent_keys=recent_keys,
                 platform_counts=platform_counts,
             )
             scored.append(
                 (
+                    _difficulty_distance(
+                        candidate.equivalent_rating,
+                        difficulty_targets[slot.split("-", 1)[0]],
+                    ),
                     -score,
-                    _plan_tie_key(candidate, fairness_rank),
                     _stable_problem_sort_key(candidate),
-                    candidate.task_key,
+                    candidate.problem_key,
                     candidate,
                     breakdown,
                     reasons,
@@ -736,6 +834,7 @@ def recommend(
             break
         _, _, _, _, candidate, breakdown, reasons = min(scored)
         score = round(sum(breakdown.values()), 3)
+        base_slot = slot.split("-", 1)[0]
         selected.append(
             Recommendation(
                 slot=slot,
@@ -745,6 +844,8 @@ def recommend(
                 title=candidate.title,
                 url=candidate.url,
                 equivalent_rating=candidate.equivalent_rating,
+                difficulty_target=difficulty_targets[base_slot],
+                difficulty_band=DIFFICULTY_BANDS[base_slot],
                 score=score,
                 breakdown=breakdown,
                 reasons=reasons,
@@ -755,8 +856,6 @@ def recommend(
             )
         )
         used.add(candidate.problem_key)
-        if candidate.plan_sources:
-            selected_from_plans += 1
         platform_counts[candidate.platform] += 1
     return selected
 

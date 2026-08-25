@@ -6,8 +6,8 @@ import {
   currentAiProblem, loadAiProblemState, previewKnowledgeSummary, switchAiProblem,
 } from "./view_ai.js";
 import {
-  controlStress, renderStart, renderTemplateHighlight, resetWorkspaceTemplate,
-  revertStressBundle, showStressArtifacts, startAiStress, startJob, submitSetup,
+  renderStart, renderTemplateHighlight, resetWorkspaceTemplate,
+  startJob, submitSetup,
 } from "./view_workbench.js";
 import { requestRecommendations } from "./view_today.js";
 
@@ -71,9 +71,13 @@ function bindWorkbenchEvents() {
     const button = $("button[type=submit]", form);
     setBusy(button, true, "任务已提交");
     const seed = form.elements.seed.value;
+    const localFile = name => form.elements[name].value.trim() || null;
     try {
       await startJob("/api/jobs/verify", {
         problem: form.elements.problem.value.trim() || null,
+        generator_file: localFile("generator_file"),
+        reference_file: localFile("reference_file"),
+        user_file: localFile("user_file"),
         exact: form.elements.compare.value === "exact",
         debug: form.elements.debug.checked,
         timeout: Number(form.elements.timeout.value),
@@ -87,24 +91,6 @@ function bindWorkbenchEvents() {
       setBusy(button, false);
     }
   });
-  $("#ai-stress-form").elements.enabled.addEventListener("change", event => {
-    $("#ai-stress-options").disabled = !event.currentTarget.checked;
-  });
-  $("#ai-stress-form").addEventListener("submit", async event => {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const button = $("button[type=submit]", form);
-    try {
-      await startAiStress(form, button);
-    } catch (error) {
-      toast("无法启动 AI 持续对拍", error.message, "error");
-    }
-  });
-  $("#ai-stress-stop").addEventListener("click", event => controlStress("stop", event.currentTarget).catch(error => toast("停止失败", error.message, "error")));
-  $("#ai-stress-resume").addEventListener("click", event => controlStress("resume", event.currentTarget).catch(error => toast("继续失败", error.message, "error")));
-  $("#ai-stress-finish").addEventListener("click", event => controlStress("finish", event.currentTarget).catch(error => toast("结束失败", error.message, "error")));
-  $("#ai-stress-artifacts").addEventListener("click", event => showStressArtifacts(event.currentTarget).catch(error => toast("读取 helper 失败", error.message, "error")));
-  $("#ai-stress-revert").addEventListener("click", event => revertStressBundle(event.currentTarget).catch(error => toast("回退失败", error.message, "error")));
   $("#close-form").addEventListener("submit", async event => {
     event.preventDefault();
     const form = event.currentTarget;

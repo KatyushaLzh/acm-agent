@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 import json
+import math
+from pathlib import Path
 from typing import Any, Mapping
 
 from .config import load_config
@@ -61,9 +63,18 @@ class ServiceProblemMixin:
         timeout: float = 2.0,
         stress_iterations: int = 100,
         seed: int | None = None,
+        generator_file: str | None = None,
+        reference_file: str | None = None,
+        user_file: str | None = None,
     ) -> dict[str, Any]:
         load_config(self.paths)
-        selected = problem
+        timeout = float(timeout)
+        stress_iterations = int(stress_iterations)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout 必须是大于 0 的有限数值")
+        if stress_iterations < 1:
+            raise ValueError("stress_iterations 必须至少为 1")
+        selected: str | Path | None = Path(user_file) if user_file else problem
         if not selected:
             with Database(self.paths.database) as db:
                 active = [row for row in db.attempts() if row["active"]]
@@ -75,9 +86,11 @@ class ServiceProblemMixin:
             selected,
             exact=exact,
             debug=debug,
-            timeout=float(timeout),
-            stress_iterations=int(stress_iterations),
+            timeout=timeout,
+            stress_iterations=stress_iterations,
             seed=seed,
+            generator_file=generator_file,
+            reference_file=reference_file,
         )
         payload = result.to_dict()
         payload["ok"] = result.passed

@@ -44,15 +44,8 @@ DEEPSEEK_ENDPOINT = "https://api.deepseek.com/chat/completions"
 RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 MAX_RETRY_BACKOFF_SECONDS = 30.0
 MAX_RETRY_AFTER_SECONDS = 60.0
-_CANCELLABLE_SLEEP_SLICE_SECONDS = 0.1
-# Transport-level ceiling for a single HTTP request.  This is deliberately
-# looser than the stress preparation policy caps in stress_budget
-# (MAX_THINKING_REQUEST_SECONDS / MAX_NON_THINKING_REQUEST_SECONDS /
-# MAX_AUDIT_REQUEST_SECONDS), which clamp the value before it ever reaches this
-# client.  Keep the names distinct: this one bounds the socket, those bound the
-# preparation budget.
+# Transport-level ceiling for a single HTTP request.
 MAX_TRANSPORT_REQUEST_SECONDS = 300.0
-_READ_CHUNK_BYTES = 64 * 1024
 _NETWORK_EXCEPTIONS = (
     urllib.error.URLError,
     TimeoutError,
@@ -168,133 +161,6 @@ class DeepSeekProtocolError(DeepSeekError):
     pass
 
 
-class DeepSeekCancelledError(DeepSeekError):
-    def __init__(
-        self,
-        *,
-        usage: Mapping[str, Any] | None = None,
-        finish_reason: str | None = None,
-        model: str | None = None,
-        response_id: str | None = None,
-        protocol_details: Mapping[str, Any] | None = None,
-    ) -> None:
-        super().__init__(
-            "request_cancelled",
-            "DeepSeek request was cancelled",
-            retryable=False,
-            usage=usage,
-            finish_reason=finish_reason,
-            model=model,
-            response_id=response_id,
-            protocol_details=protocol_details,
-        )
-
-
-def _abort_response(response: Any) -> None:
-    """Interrupt a blocking urllib read before closing its response wrapper.
-
-    On Windows, ``HTTPResponse.close()`` alone does not reliably wake another
-    thread blocked in ``recv``. Shutting down the owned socket first makes the
-    absolute preparation deadline observable by that reader.
-    """
-
-    for chain in (
-        ("fp", "raw", "_sock"),
-        ("fp", "_sock"),
-        ("raw", "_sock"),
-        ("_sock",),
-        ("sock",),
-    ):
-        candidate = response
-        for attribute in chain:
-            candidate = getattr(candidate, attribute, None)
-            if candidate is None:
-                break
-        shutdown = getattr(candidate, "shutdown", None)
-        if callable(shutdown):
-            try:
-                shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-            break
-    close = getattr(response, "close", None)
-    if callable(close):
-        try:
-            close()
-        except Exception:
-            pass
-
-
-class DeepSeekCancelScope:
-    """Thread-safe cancellation shared by one logical operation tree."""
-
-    def __init__(self) -> None:
-        self._cancelled = threading.Event()
-        self._lock = threading.Lock()
-        self._responses: dict[int, Any] = {}
-
-    @property
-    def cancelled(self) -> bool:
-        return self._cancelled.is_set()
-
-    @property
-    def event(self) -> threading.Event:
-        """Cancellation event for read-only ``is_set``/``wait`` integration."""
-        return self._cancelled
-
-    @property
-    def cancellation_event(self) -> threading.Event:
-        """Deprecated compatibility alias for :attr:`event`."""
-
-        return self._cancelled
-
-    def cancel(self) -> None:
-        with self._lock:
-            self._cancelled.set()
-            responses = list(self._responses.values())
-            self._responses.clear()
-        for response in responses:
-            self._close(response)
-
-    def raise_if_cancelled(self) -> None:
-        if self.cancelled:
-            raise DeepSeekCancelledError()
-
-    def register_response(self, response: Any) -> None:
-        """Track a cancellable response owned by this logical operation."""
-        self._register(response)
-
-    def unregister_response(self, response: Any) -> None:
-        """Stop tracking a response once its owner has closed it."""
-        self._unregister(response)
-
-    def _register(self, response: Any) -> None:
-        with self._lock:
-            if self._cancelled.is_set():
-                should_cancel = True
-            else:
-                self._responses[id(response)] = response
-                should_cancel = False
-        if should_cancel:
-            self._close(response)
-            raise DeepSeekCancelledError()
-
-    def _unregister(self, response: Any) -> None:
-        with self._lock:
-            self._responses.pop(id(response), None)
-
-    @staticmethod
-    def _close(response: Any) -> None:
-        _abort_response(response)
-
-
-# Deprecated compatibility aliases.  Keep them for one transition cycle so
-# embedders importing the old names do not break during the cleanup release.
-CancellationScope = DeepSeekCancelScope
-CancelScope = DeepSeekCancelScope
-CancellationToken = DeepSeekCancelScope
-
-
 def validate_model(model: str) -> str:
     model = str(model).strip()
     if model not in ALLOWED_MODELS:
@@ -398,29 +264,18 @@ def _http_error(
 
 
 @contextmanager
-def _managed_response(
-    response: Any,
-    cancel_scope: DeepSeekCancelScope | None = None,
-) -> Iterator[Any]:
+def _managed_response(response: Any) -> Iterator[Any]:
     enter = getattr(response, "__enter__", None)
     if callable(enter):
-        try:
-            with response as opened:
-                yield opened
-        finally:
-            if cancel_scope is not None:
-                cancel_scope._unregister(response)
+        with response as opened:
+            yield opened
         return
     try:
         yield response
     finally:
         close = getattr(response, "close", None)
-        try:
-            if callable(close):
-                close()
-        finally:
-            if cancel_scope is not None:
-                cancel_scope._unregister(response)
+        if callable(close):
+            close()
 
 
 def _response_status(response: Any) -> int:
@@ -483,7 +338,6 @@ class DeepSeekClient:
         timeout: float = 60.0,
         retries: int = 2,
         sleep: Callable[[float], None] = time.sleep,
-        monotonic: Callable[[], float] = time.monotonic,
         wall_time: Callable[[], float] = time.time,
         random_value: Callable[[], float] = _random.random,
     ) -> None:
@@ -496,7 +350,6 @@ class DeepSeekClient:
         self.timeout = float(timeout)
         self.retries = max(0, int(retries))
         self._sleep = sleep
-        self._monotonic = monotonic
         self._wall_time = wall_time
         self._random_value = random_value
         self._request_count = 0
@@ -546,190 +399,31 @@ class DeepSeekClient:
             method="POST",
         )
 
-    def _operation_deadline(
-        self,
-        *,
-        deadline: float | None,
-        total_timeout: float | None,
-    ) -> float | None:
-        resolved: float | None = None
-        if deadline is not None:
-            resolved = float(deadline)
-            if not math.isfinite(resolved):
-                raise DeepSeekConfigurationError(
-                    "invalid_timeout", "deadline must be a finite monotonic timestamp"
-                )
-        if total_timeout is not None:
-            total = float(total_timeout)
-            if not math.isfinite(total) or total <= 0:
-                raise DeepSeekConfigurationError(
-                    "invalid_timeout", "total_timeout must be positive and finite"
-                )
-            total_deadline = self._monotonic() + total
-            resolved = total_deadline if resolved is None else min(resolved, total_deadline)
-        return resolved
-
-    def _remaining(self, deadline: float | None) -> float | None:
-        return None if deadline is None else deadline - self._monotonic()
-
-    def _deadline_error(
-        self,
-        *,
-        status: int | None = None,
-        usage: Mapping[str, Any] | None = None,
-        finish_reason: str | None = None,
-        model: str | None = None,
-        response_id: str | None = None,
-        protocol_details: Mapping[str, Any] | None = None,
-    ) -> DeepSeekError:
-        return DeepSeekError(
-            "timeout",
-            "DeepSeek operation deadline exceeded",
-            status=status,
-            retryable=False,
-            usage=usage,
-            finish_reason=finish_reason,
-            model=model,
-            response_id=response_id,
-            protocol_details=protocol_details,
-        )
-
-    @staticmethod
-    def _check_cancel(cancel_scope: DeepSeekCancelScope | None) -> None:
-        if cancel_scope is not None:
-            cancel_scope.raise_if_cancelled()
-
-    @staticmethod
-    def _cancelled_error(
-        *,
-        usage: Mapping[str, Any] | None = None,
-        finish_reason: str | None = None,
-        model: str | None = None,
-        response_id: str | None = None,
-        protocol_details: Mapping[str, Any] | None = None,
-    ) -> DeepSeekCancelledError:
-        return DeepSeekCancelledError(
-            usage=usage,
-            finish_reason=finish_reason,
-            model=model,
-            response_id=response_id,
-            protocol_details=protocol_details,
-        )
-
-    def _provider_timeout(
-        self,
-        request_timeout: float | None,
-        deadline: float | None,
-    ) -> float:
+    def _provider_timeout(self, request_timeout: float | None) -> float:
         configured = self.timeout if request_timeout is None else float(request_timeout)
         if not math.isfinite(configured) or configured <= 0:
             raise DeepSeekConfigurationError(
                 "invalid_timeout", "request_timeout must be positive and finite"
             )
-        timeout = min(MAX_TRANSPORT_REQUEST_SECONDS, configured)
-        remaining = self._remaining(deadline)
-        if remaining is not None:
-            if remaining <= 0:
-                raise self._deadline_error()
-            timeout = min(timeout, remaining)
-        return timeout
+        return min(MAX_TRANSPORT_REQUEST_SECONDS, configured)
 
     @staticmethod
     def _close_response(response: Any) -> None:
-        _abort_response(response)
+        close = getattr(response, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
-    def _read_response_body(
-        self,
-        response: Any,
-        *,
-        deadline: float | None,
-        status: int | None = None,
-        cancel_scope: DeepSeekCancelScope | None = None,
-    ) -> bytes:
-        """Read a body without allowing repeated chunks to reset the deadline.
-
-        The provider socket timeout bounds each blocking read. The watchdog also
-        closes a live response at the absolute deadline so a read already in
-        progress cannot continue indefinitely on keep-alive traffic.
-        """
-        expired = threading.Event()
-        timer: threading.Timer | None = None
-        if deadline is not None:
-            remaining = self._remaining(deadline)
-            if remaining is None or remaining <= 0:
-                self._close_response(response)
-                raise self._deadline_error(status=status)
-
-            def close_at_deadline() -> None:
-                expired.set()
-                self._close_response(response)
-
-            timer = threading.Timer(remaining, close_at_deadline)
-            timer.daemon = True
-            timer.start()
-
-        chunks: list[bytes] = []
-
-        def available_details(extra: Any = None) -> dict[str, Any]:
-            available = list(chunks)
-            if isinstance(extra, str):
-                available.append(extra.encode("utf-8"))
-            elif isinstance(extra, (bytes, bytearray, memoryview)):
-                available.append(bytes(extra))
-            if available:
-                try:
-                    decoded = json.loads(b"".join(available).decode("utf-8-sig"))
-                except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
-                    return {}
-                else:
-                    return _response_error_details(decoded)
-            return {}
-
-        def deadline_with_available_details(extra: Any = None) -> DeepSeekError:
-            return self._deadline_error(status=status, **available_details(extra))
-
-        def cancelled_with_available_details(extra: Any = None) -> DeepSeekCancelledError:
-            return self._cancelled_error(**available_details(extra))
-
-        try:
-            while True:
-                if cancel_scope is not None and cancel_scope.cancelled:
-                    self._close_response(response)
-                    raise cancelled_with_available_details()
-                remaining = self._remaining(deadline)
-                if expired.is_set() or (remaining is not None and remaining <= 0):
-                    self._close_response(response)
-                    raise deadline_with_available_details()
-                try:
-                    chunk = response.read(_READ_CHUNK_BYTES)
-                except Exception:
-                    if cancel_scope is not None and cancel_scope.cancelled:
-                        self._close_response(response)
-                        raise cancelled_with_available_details() from None
-                    remaining = self._remaining(deadline)
-                    if expired.is_set() or (remaining is not None and remaining <= 0):
-                        self._close_response(response)
-                        raise deadline_with_available_details() from None
-                    raise
-                if cancel_scope is not None and cancel_scope.cancelled:
-                    self._close_response(response)
-                    raise cancelled_with_available_details(chunk)
-                remaining = self._remaining(deadline)
-                if expired.is_set() or (remaining is not None and remaining <= 0):
-                    self._close_response(response)
-                    raise deadline_with_available_details(chunk)
-                if chunk in (b"", "", None):
-                    break
-                if isinstance(chunk, str):
-                    chunks.append(chunk.encode("utf-8"))
-                elif isinstance(chunk, (bytes, bytearray, memoryview)):
-                    chunks.append(bytes(chunk))
-                else:
-                    raise TypeError("DeepSeek response read returned a non-byte chunk")
-            return b"".join(chunks)
-        finally:
-            if timer is not None:
-                timer.cancel()
+    @staticmethod
+    def _read_response_body(response: Any) -> bytes:
+        raw = response.read()
+        if isinstance(raw, str):
+            return raw.encode("utf-8")
+        if isinstance(raw, (bytes, bytearray, memoryview)):
+            return bytes(raw)
+        raise TypeError("DeepSeek response read returned a non-byte chunk")
 
     def _payload(
         self,
@@ -826,35 +520,20 @@ class DeepSeekClient:
         payload: Mapping[str, Any],
         *,
         request_timeout: float | None = None,
-        deadline: float | None = None,
-        cancel_scope: DeepSeekCancelScope | None = None,
     ) -> Any:
-        self._check_cancel(cancel_scope)
         request = self._request(payload)
-        timeout = self._provider_timeout(request_timeout, deadline)
+        timeout = self._provider_timeout(request_timeout)
         with self._request_count_lock:
             self._request_count += 1
         try:
             response = self._transport(request, timeout)
         except urllib.error.HTTPError as exc:
             retry_after = _retry_after_seconds(exc, now=self._wall_time())
-            if cancel_scope is not None:
-                cancel_scope._register(exc)
             try:
-                body = self._read_response_body(
-                    exc,
-                    deadline=deadline,
-                    status=int(exc.code),
-                    cancel_scope=cancel_scope,
-                )
-            except DeepSeekError:
-                raise
+                with _managed_response(exc) as opened:
+                    body = self._read_response_body(opened)
             except Exception:
                 body = b""
-            finally:
-                self._close_response(exc)
-                if cancel_scope is not None:
-                    cancel_scope._unregister(exc)
             raise _http_error(
                 int(exc.code),
                 body,
@@ -862,39 +541,18 @@ class DeepSeekClient:
                 retry_after_seconds=retry_after,
             ) from None
         except _NETWORK_EXCEPTIONS as exc:
-            self._check_cancel(cancel_scope)
-            remaining = self._remaining(deadline)
-            if remaining is not None and remaining <= 0:
-                raise self._deadline_error() from None
             code = "timeout" if isinstance(exc, (TimeoutError, socket.timeout)) else "network_error"
             raise DeepSeekError(
                 code,
                 _sanitize(f"DeepSeek network request failed: {exc}", self._api_key),
                 retryable=True,
             ) from None
-        if cancel_scope is not None:
-            cancel_scope._register(response)
-        self._check_cancel(cancel_scope)
-        remaining = self._remaining(deadline)
-        if remaining is not None and remaining <= 0:
-            self._close_response(response)
-            if cancel_scope is not None:
-                cancel_scope._unregister(response)
-            raise self._deadline_error(status=_response_status(response))
         status = _response_status(response)
-        self._check_cancel(cancel_scope)
         if status >= 400:
             retry_after = _retry_after_seconds(response, now=self._wall_time())
-            with _managed_response(response, cancel_scope) as opened:
+            with _managed_response(response) as opened:
                 try:
-                    body = self._read_response_body(
-                        opened,
-                        deadline=deadline,
-                        status=status,
-                        cancel_scope=cancel_scope,
-                    )
-                except DeepSeekError:
-                    raise
+                    body = self._read_response_body(opened)
                 except Exception:
                     body = b""
             raise _http_error(
@@ -912,11 +570,8 @@ class DeepSeekClient:
         code: str,
         retry_callback: RetryCallback | None = None,
         retry_limit: int | None = None,
-        deadline: float | None = None,
-        cancel_scope: DeepSeekCancelScope | None = None,
         retry_after_seconds: float | None = None,
     ) -> None:
-        self._check_cancel(cancel_scope)
         total = self.retries if retry_limit is None else int(retry_limit)
         base_delay = min(MAX_RETRY_BACKOFF_SECONDS, float(2**attempt))
         try:
@@ -934,34 +589,12 @@ class DeepSeekClient:
             )
             delay = max(delay, retry_after)
         delay = min(MAX_RETRY_AFTER_SECONDS, delay)
-        remaining = self._remaining(deadline)
-        if remaining is not None:
-            if remaining <= 0:
-                raise self._deadline_error()
-            delay = min(delay, remaining)
         if retry_callback is not None:
             try:
                 retry_callback(attempt + 1, total, code, delay)
             except Exception:
-                # Observability callbacks must never change provider behavior.
                 pass
-        self._check_cancel(cancel_scope)
-        if cancel_scope is None:
-            self._sleep(delay)
-        else:
-            sleep_deadline = self._monotonic() + delay
-            while True:
-                self._check_cancel(cancel_scope)
-                remaining_sleep = sleep_deadline - self._monotonic()
-                if remaining_sleep <= 0:
-                    break
-                self._sleep(
-                    min(_CANCELLABLE_SLEEP_SLICE_SECONDS, remaining_sleep)
-                )
-        self._check_cancel(cancel_scope)
-        remaining = self._remaining(deadline)
-        if remaining is not None and remaining <= 0:
-            raise self._deadline_error()
+        self._sleep(delay)
 
     def _retry_exhausted(
         self,
@@ -994,8 +627,6 @@ class DeepSeekClient:
         retry_callback: RetryCallback | None = None,
         request_timeout: float | None = None,
         request_retries: int | None = None,
-        deadline: float | None = None,
-        cancel_scope: DeepSeekCancelScope | None = None,
     ) -> Mapping[str, Any]:
         retry_limit = self.retries if request_retries is None else int(request_retries)
         if retry_limit < 0:
@@ -1004,21 +635,11 @@ class DeepSeekClient:
             )
         for attempt in range(retry_limit + 1):
             try:
-                self._check_cancel(cancel_scope)
-                response = self._open(
-                    payload,
-                    request_timeout=request_timeout,
-                    deadline=deadline,
-                    cancel_scope=cancel_scope,
-                )
-                with _managed_response(response, cancel_scope) as opened:
-                    raw = self._read_response_body(
-                        opened,
-                        deadline=deadline,
-                        cancel_scope=cancel_scope,
-                    )
+                response = self._open(payload, request_timeout=request_timeout)
+                with _managed_response(response) as opened:
+                    raw = self._read_response_body(opened)
                 try:
-                    data = json.loads(raw.decode("utf-8-sig") if isinstance(raw, bytes) else raw)
+                    data = json.loads(raw.decode("utf-8-sig"))
                 except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
                     raise DeepSeekProtocolError(
                         "invalid_response",
@@ -1028,33 +649,18 @@ class DeepSeekClient:
                     raise DeepSeekProtocolError(
                         "invalid_response", "DeepSeek response must be a JSON object"
                     )
-                if cancel_scope is not None and cancel_scope.cancelled:
-                    raise self._cancelled_error(**_response_error_details(data))
-                remaining = self._remaining(deadline)
-                if remaining is not None and remaining <= 0:
-                    raise self._deadline_error(**_response_error_details(data))
                 return data
             except DeepSeekError as exc:
                 if not exc.retryable or attempt >= retry_limit:
-                    raise self._retry_exhausted(
-                        exc, retry_limit=retry_limit
-                    ) from None
+                    raise self._retry_exhausted(exc, retry_limit=retry_limit) from None
                 self._sleep_before_retry(
                     attempt,
                     code=exc.code,
                     retry_callback=retry_callback,
                     retry_limit=retry_limit,
-                    deadline=deadline,
-                    cancel_scope=cancel_scope,
-                    retry_after_seconds=exc.protocol_details.get(
-                        "retry_after_seconds"
-                    ),
+                    retry_after_seconds=exc.protocol_details.get("retry_after_seconds"),
                 )
             except _NETWORK_EXCEPTIONS as exc:
-                self._check_cancel(cancel_scope)
-                remaining = self._remaining(deadline)
-                if remaining is not None and remaining <= 0:
-                    raise self._deadline_error() from None
                 code = "timeout" if isinstance(exc, (TimeoutError, socket.timeout)) else "network_error"
                 mapped = DeepSeekError(
                     code,
@@ -1062,22 +668,14 @@ class DeepSeekClient:
                     retryable=True,
                 )
                 if attempt >= retry_limit:
-                    raise self._retry_exhausted(
-                        mapped, retry_limit=retry_limit
-                    ) from None
+                    raise self._retry_exhausted(mapped, retry_limit=retry_limit) from None
                 self._sleep_before_retry(
                     attempt,
                     code=mapped.code,
                     retry_callback=retry_callback,
                     retry_limit=retry_limit,
-                    deadline=deadline,
-                    cancel_scope=cancel_scope,
                 )
-            except Exception:
-                self._check_cancel(cancel_scope)
-                raise
         raise AssertionError("unreachable")
-
     def _nonstream(
         self,
         payload: Mapping[str, Any],
@@ -1085,8 +683,6 @@ class DeepSeekClient:
         retry_callback: RetryCallback | None = None,
         request_timeout: float | None = None,
         request_retries: int | None = None,
-        deadline: float | None = None,
-        cancel_scope: DeepSeekCancelScope | None = None,
     ) -> ChatResult:
         return self._parse_chat_result(
             self._nonstream_data(
@@ -1094,8 +690,6 @@ class DeepSeekClient:
                 retry_callback=retry_callback,
                 request_timeout=request_timeout,
                 request_retries=request_retries,
-                deadline=deadline,
-                cancel_scope=cancel_scope,
             )
         )
 
@@ -1157,11 +751,7 @@ class DeepSeekClient:
         retry_callback: RetryCallback | None = None,
         request_timeout: float | None = None,
         request_retries: int | None = None,
-        deadline: float | None = None,
-        total_timeout: float | None = None,
-        cancel_scope: DeepSeekCancelScope | None = None,
     ) -> ChatResult:
-        self._check_cancel(cancel_scope)
         payload = self._payload(
             messages,
             model=model,
@@ -1171,16 +761,11 @@ class DeepSeekClient:
             max_tokens=max_tokens,
             temperature=temperature,
         )
-        operation_deadline = self._operation_deadline(
-            deadline=deadline, total_timeout=total_timeout
-        )
         return self._nonstream(
             payload,
             retry_callback=retry_callback,
             request_timeout=request_timeout,
             request_retries=request_retries,
-            deadline=operation_deadline,
-            cancel_scope=cancel_scope,
         )
 
     def chat_json(
@@ -1196,11 +781,7 @@ class DeepSeekClient:
         request_timeout: float | None = None,
         request_retries: int | None = None,
         json_retries: int = 1,
-        deadline: float | None = None,
-        total_timeout: float | None = None,
-        cancel_scope: DeepSeekCancelScope | None = None,
     ) -> JsonChatResult:
-        self._check_cancel(cancel_scope)
         payload = self._payload(
             messages,
             model=model,
@@ -1216,23 +797,17 @@ class DeepSeekClient:
             raise DeepSeekConfigurationError(
                 "invalid_json_retries", "json_retries must be 0 or 1"
             )
-        operation_deadline = self._operation_deadline(
-            deadline=deadline, total_timeout=total_timeout
-        )
         last_error = "DeepSeek JSON Output was empty"
         current_payload = payload
         total_usage: dict[str, Any] = {}
         last_result: ChatResult | None = None
         for json_attempt in range(protocol_retry_limit + 1):
             try:
-                self._check_cancel(cancel_scope)
-                result = self._nonstream(
+                        result = self._nonstream(
                     current_payload,
                     retry_callback=retry_callback,
                     request_timeout=request_timeout,
                     request_retries=request_retries,
-                    deadline=operation_deadline,
-                    cancel_scope=cancel_scope,
                 )
             except DeepSeekError as exc:
                 if total_usage:
@@ -1255,23 +830,6 @@ class DeepSeekClient:
             except json.JSONDecodeError as exc:
                 parsed = None
                 last_error = f"DeepSeek JSON Output was invalid: {exc.msg}"
-            remaining = self._remaining(operation_deadline)
-            if remaining is not None and remaining <= 0:
-                raise self._deadline_error(
-                    usage=total_usage,
-                    finish_reason=result.finish_reason,
-                    model=result.model,
-                    response_id=result.response_id,
-                    protocol_details={"json_attempts_completed": json_attempt + 1},
-                )
-            if cancel_scope is not None and cancel_scope.cancelled:
-                raise self._cancelled_error(
-                    usage=total_usage,
-                    finish_reason=result.finish_reason,
-                    model=result.model,
-                    response_id=result.response_id,
-                    protocol_details={"json_attempts_completed": json_attempt + 1},
-                )
             if isinstance(parsed, dict):
                 return JsonChatResult(
                     content=result.content,
@@ -1332,10 +890,8 @@ class DeepSeekClient:
         max_rounds: int = 6,
         max_tool_calls: int = 12,
         retry_callback: RetryCallback | None = None,
-        cancel_scope: DeepSeekCancelScope | None = None,
     ) -> ToolChatResult:
         """Run a bounded function-tool loop using caller-owned safe tools."""
-        self._check_cancel(cancel_scope)
         if not callable(tool_handler):
             raise DeepSeekConfigurationError("invalid_tools", "tool_handler must be callable")
         rounds_limit = int(max_rounds)
@@ -1368,7 +924,6 @@ class DeepSeekClient:
             data = self._nonstream_data(
                 payload,
                 retry_callback=retry_callback,
-                cancel_scope=cancel_scope,
             )
             choices = data.get("choices")
             if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):
@@ -1483,9 +1038,7 @@ class DeepSeekClient:
         reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         max_tokens: int | None = None,
         temperature: float | None = None,
-        cancel_scope: DeepSeekCancelScope | None = None,
     ) -> Iterator[StreamEvent]:
-        self._check_cancel(cancel_scope)
         payload = self._payload(
             messages,
             model=model,
@@ -1495,14 +1048,9 @@ class DeepSeekClient:
             max_tokens=max_tokens,
             temperature=temperature,
         )
-        return self._stream(payload, cancel_scope=cancel_scope)
+        return self._stream(payload)
 
-    def _stream(
-        self,
-        payload: Mapping[str, Any],
-        *,
-        cancel_scope: DeepSeekCancelScope | None = None,
-    ) -> Iterator[StreamEvent]:
+    def _stream(self, payload: Mapping[str, Any]) -> Iterator[StreamEvent]:
         emitted_content = False
         for attempt in range(self.retries + 1):
             finish_reason: str | None = None
@@ -1510,11 +1058,9 @@ class DeepSeekClient:
             response_model: str | None = None
             response_id: str | None = None
             try:
-                self._check_cancel(cancel_scope)
-                response = self._open(payload, cancel_scope=cancel_scope)
-                with _managed_response(response, cancel_scope) as opened:
+                response = self._open(payload)
+                with _managed_response(response) as opened:
                     for event_data in _iter_sse_data(opened):
-                        self._check_cancel(cancel_scope)
                         if event_data == "[DONE]":
                             yield StreamEvent(
                                 "done",
@@ -1561,11 +1107,8 @@ class DeepSeekClient:
                             delta = choice.get("delta")
                             if not isinstance(delta, Mapping):
                                 continue
-                            # reasoning_content is intentionally neither returned nor persisted.
                             reasoning = delta.get("reasoning_content")
                             if isinstance(reasoning, str) and reasoning:
-                                # A content-free pulse lets the downstream SSE
-                                # writer notice disconnects during long thinking.
                                 yield StreamEvent(
                                     "heartbeat",
                                     model=response_model,
@@ -1580,7 +1123,6 @@ class DeepSeekClient:
                                     model=response_model,
                                     response_id=response_id,
                                 )
-                self._check_cancel(cancel_scope)
                 raise DeepSeekProtocolError(
                     "incomplete_stream", "DeepSeek SSE stream ended before [DONE]"
                 )
@@ -1590,13 +1132,11 @@ class DeepSeekClient:
                 self._sleep_before_retry(
                     attempt,
                     code=exc.code,
-                    cancel_scope=cancel_scope,
                     retry_after_seconds=exc.protocol_details.get(
                         "retry_after_seconds"
                     ),
                 )
             except _NETWORK_EXCEPTIONS as exc:
-                self._check_cancel(cancel_scope)
                 code = (
                     "timeout"
                     if isinstance(exc, (TimeoutError, socket.timeout))
@@ -1604,19 +1144,10 @@ class DeepSeekClient:
                 )
                 mapped = DeepSeekError(
                     code,
-                    _sanitize(
-                        f"DeepSeek stream failed: {exc}", self._api_key
-                    ),
+                    _sanitize(f"DeepSeek stream failed: {exc}", self._api_key),
                     retryable=True,
                 )
                 if emitted_content or attempt >= self.retries:
                     raise mapped from None
-                self._sleep_before_retry(
-                    attempt,
-                    code=mapped.code,
-                    cancel_scope=cancel_scope,
-                )
-            except Exception:
-                self._check_cancel(cancel_scope)
-                raise
+                self._sleep_before_retry(attempt, code=mapped.code)
         raise AssertionError("unreachable")

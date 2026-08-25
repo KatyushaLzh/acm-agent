@@ -4,14 +4,27 @@ const state = {
   token: "",
   bootstrap: null,
   recommendations: [],
+  recommendationEpoch: 0,
+  recommendationController: null,
   plans: [],
   selectedPlanId: "",
   selectedPlan: null,
   selectedPlanMeta: null,
+  planSelectionEpoch: 0,
+  planSelectionController: null,
   editingPlanMeta: false,
   editingStageKey: "",
   importContent: "",
   importPreview: null,
+  aiPlanImportEpoch: 0,
+  aiPlanImportController: null,
+  aiPlanJobId: "",
+  aiPlanDraft: null,
+  aiPlanPreview: null,
+  aiPlanMetadata: null,
+  aiPlanValidationEpoch: 0,
+  aiPlanValidationController: null,
+  aiPlanValidationTimer: null,
   tagPreview: null,
   tagPreviewPlanId: "",
   tagPreviewRevision: null,
@@ -34,10 +47,9 @@ const state = {
   knowledgeProposalRevision: null,
   knowledgeProposalDirty: false,
   knowledgeTargetInspection: null,
-  stressRunId: "",
-  stressBundleId: "",
-  stressPollTimer: null,
   templateDirty: false,
+  initialSyncJobId: "",
+  initialSyncEpoch: 0,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -76,6 +88,7 @@ async function api(path, options = {}) {
   const method = options.method || (Object.hasOwn(options, "body") ? "POST" : "GET");
   const headers = { Accept: "application/json", "X-ACM-Token": state.token, ...(options.headers || {}) };
   const request = { method, headers };
+  if (options.signal) request.signal = options.signal;
   if (Object.hasOwn(options, "body")) {
     headers["Content-Type"] = "application/json";
     request.body = JSON.stringify(options.body);
@@ -387,72 +400,18 @@ async function loadBootstrap() {
   }
 }
 
-function jobProgressLabel(progress, fallback) {
+function jobProgressLabel(progress, fallback, nowMs = Date.now()) {
   const current = asObject(progress);
   const label = String(current.label || fallback || "后台任务处理中…");
   const step = Number(current.step);
   const total = Number(current.total);
-  const preparation = {
-    ...asObject(current.budget),
-    ...asObject(current.preparation),
-    ...asObject(current.generation),
-    ...current,
-  };
-  const firstFinite = (...values) => values.map(Number).find(Number.isFinite);
-  const remaining = firstFinite(preparation.remaining_seconds, preparation.absolute_remaining_seconds);
-  const elapsed = firstFinite(preparation.elapsed_seconds, preparation.total_elapsed_seconds);
-  const stageElapsed = firstFinite(preparation.stage_elapsed_seconds, preparation.current_stage_elapsed_seconds);
-  const softBudget = firstFinite(preparation.soft_budget_seconds, preparation.stage_soft_budget_seconds);
-  const usableRemaining = firstFinite(preparation.usable_remaining_seconds, preparation.usable_seconds);
-  const reservedValidation = firstFinite(preparation.reserved_validation_seconds, preparation.validation_reserve_seconds);
-  const reasoningTokens = firstFinite(
-    preparation.reasoning_tokens,
-    preparation.usage?.reasoning_tokens,
-    preparation.usage?.completion_tokens_details?.reasoning_tokens,
-  );
-  const attempt = firstFinite(preparation.attempt, preparation.generation_attempt);
-  const generationMode = preparation.generation_mode || preparation.mode;
-  const hasFastFallback = Object.hasOwn(preparation, "fast_fallback")
-    || Object.hasOwn(preparation, "fast_fallback_used")
-    || Object.hasOwn(preparation, "fallback_to_fast");
-  const fastFallback = preparation.fast_fallback
-    ?? preparation.fast_fallback_used
-    ?? preparation.fallback_to_fast;
-  const deadline = preparation.deadline_at || preparation.absolute_deadline;
-  const timing = [];
-  if (generationMode) timing.push(`模式 ${generationMode}`);
-  if (hasFastFallback) timing.push(`Fast 降级 ${fastFallback ? "是" : "否"}`);
-  if (Number.isFinite(attempt)) timing.push(`尝试 ${Math.max(0, attempt).toFixed(0)}`);
-  if (Number.isFinite(reasoningTokens)) timing.push(`推理 token ${Math.max(0, reasoningTokens).toFixed(0)}`);
-  if (Number.isFinite(usableRemaining)) timing.push(`可用剩余 ${Math.max(0, usableRemaining).toFixed(1)}s`);
-  if (Number.isFinite(reservedValidation)) timing.push(`验证预留 ${Math.max(0, reservedValidation).toFixed(1)}s`);
-  if (Number.isFinite(remaining)) timing.push(`剩余 ${Math.max(0, remaining).toFixed(1)}s`);
-  if (Number.isFinite(elapsed)) timing.push(`总耗时 ${Math.max(0, elapsed).toFixed(1)}s`);
-  if (Number.isFinite(stageElapsed)) timing.push(`阶段耗时 ${Math.max(0, stageElapsed).toFixed(1)}s`);
-  if (Number.isFinite(softBudget)) timing.push(`软预算 ${Math.max(0, softBudget).toFixed(1)}s`);
-  if (deadline) timing.push(`截止 ${formatTime(deadline)}`);
-  const suffix = timing.length ? ` · ${timing.join(" · ")}` : "";
   if (Number.isInteger(step) && step > 0 && Number.isInteger(total) && total > 0 && !label.includes(`${step}/${total}`)) {
-    return `${step}/${total} ${label}${suffix}`;
+    return `${step}/${total} ${label}`;
   }
-  return `${label}${suffix}`;
+  return label;
 }
 
-function jobFailureDetails(error) {
-  const current = asObject(error);
-  const labels = {
-    artifact: "产物",
-    profile: "profile",
-    case_kind: "case",
-    seed: "seed",
-  };
-  return Object.entries(labels)
-    .filter(([key]) => current[key] !== undefined && current[key] !== null && String(current[key]).trim())
-    .map(([key, label]) => `${label}：${String(current[key]).trim()}`)
-    .join(" · ");
-}
-
-const JOB_FAILED = new Set(["failed", "error", "cancelled"]);
+const JOB_FAILED = new Set(["failed", "error", "canceled", "cancelled"]);
 const JOB_SUCCEEDED = new Set(["done", "success", "succeeded", "finished", "complete", "completed"]);
 
 function jobIdOf(payload) {
@@ -466,6 +425,16 @@ function defaultJobError(job) {
   return new Error(raw?.message || raw || job?.message || "后台任务失败");
 }
 
+async function cancelQueuedJob(jobId) {
+  try {
+    await api(`/api/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" });
+  } catch (error) {
+    // A running or just-finished job cannot be cancelled.  The stale caller
+    // still stops polling; only unexpected transport/server failures surface.
+    if (error.status !== 404 && error.status !== 409) throw error;
+  }
+}
+
 async function pollJob(jobId, {
   interval = 600,
   onPoll = null,
@@ -474,9 +443,15 @@ async function pollJob(jobId, {
   rejectWaiting = false,
 } = {}) {
   for (;;) {
-    if (typeof shouldCancel === "function" && shouldCancel()) return null;
+    if (typeof shouldCancel === "function" && shouldCancel()) {
+      await cancelQueuedJob(jobId);
+      return null;
+    }
     const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
-    if (typeof shouldCancel === "function" && shouldCancel()) return null;
+    if (typeof shouldCancel === "function" && shouldCancel()) {
+      await cancelQueuedJob(jobId);
+      return null;
+    }
     const status = String(job.status || job.state || "running").toLowerCase();
     if (typeof onPoll === "function") onPoll(job, status);
     if (rejectWaiting && status.startsWith("waiting_")) {
@@ -489,28 +464,22 @@ async function pollJob(jobId, {
 }
 
 function detailedJobError(job) {
-  const progress = asObject(job.progress);
   const error = asObject(job.error);
-  const stageLabel = String(error.stage_label || progress.label || "").trim();
   const message = String(error.message || job.error || "后台任务失败");
-  const rootCauseLabel = String(error.root_cause_label || "").trim();
-  const rootCauseMessage = String(error.root_cause_message || "").trim();
-  const summary = rootCauseMessage
-    ? `根因${rootCauseLabel ? `（${rootCauseLabel}）` : ""}：${rootCauseMessage}`
-    : stageLabel ? `阶段“${stageLabel}”失败：${message}` : message;
-  const details = jobFailureDetails(error);
-  const unchanged = error.helpers_unchanged === true && error.run_created === false
-    ? "旧 helper 未修改，run 未创建。"
-    : job.kind === "ai_stress_start" ? "旧 helper 未修改，run 未创建。" : "";
-  const failure = new Error([summary, details, unchanged].filter(Boolean).join("\n"));
+  const failure = new Error(message);
   failure.jobError = error;
   return failure;
 }
 
-async function waitForJob(jobId, label = "AI 任务处理中…", onProgress = null) {
+async function waitForJob(jobId, label = "AI 任务处理中…", onProgress = null, {
+  interval = 600,
+  shouldCancel = null,
+} = {}) {
   showJobProgress(label);
   try {
     return await pollJob(jobId, {
+      interval,
+      shouldCancel,
       rejectWaiting: true,
       toError: detailedJobError,
       onPoll(job) {
@@ -530,12 +499,16 @@ function showJobProgress(label) {
 }
 
 function renderVerify(result) {
-  const passed = result?.passed ?? result?.ok === true;
+  const status = String(result?.verification_status || "").toLowerCase();
+  const inconclusive = status === "inconclusive";
+  const passed = !inconclusive && (status === "passed" || (result?.passed ?? result?.ok === true));
   const badge = $("#verify-state");
-  badge.className = `badge ${passed ? "good" : "bad"}`;
-  badge.textContent = passed ? "验证通过" : "验证失败";
+  badge.className = `badge ${inconclusive ? "warn" : passed ? "good" : "bad"}`;
+  badge.textContent = inconclusive ? "证据不足" : passed ? "验证通过" : "验证失败";
   const lines = [];
   if (result.problem_id) lines.push(`Problem: ${result.problem_id}`);
+  if (result.verification_level) lines.push(`Evidence: ${result.verification_level}`);
+  if (inconclusive) lines.push("Conclusion: 仅编译成功；没有样例或对拍证据，不能判定正确性。");
   if (result.compile?.command || result.compile_command) lines.push(`Compile: ${result.compile?.command || result.compile_command}`);
   if (result.compile?.stdout) lines.push(`\n[compiler stdout]\n${result.compile.stdout}`);
   if (result.compile?.stderr) lines.push(`\n[compiler stderr]\n${result.compile.stderr}`);
@@ -556,6 +529,6 @@ export {
   setLocalFileSelection, pickLocalFile, clearLocalFileSelection, syncLocalFileSelections,
   escapeHtml, renderCppSource, safeHref, toast, setBusy,
   asObject, displayPlatform, navigate, formatTime, statCard, renderActive,
-  renderRecentSessions, loadBootstrap, jobIdOf, pollJob, waitForJob,
-  showJobProgress, renderVerify, setActiveProblemHandler,
+  renderRecentSessions, loadBootstrap, jobIdOf, jobProgressLabel, pollJob, waitForJob,
+  cancelQueuedJob, showJobProgress, renderVerify, setActiveProblemHandler,
 };

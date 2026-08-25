@@ -109,13 +109,18 @@ function renderPlanEditorEmpty(title, description) {
 
 async function selectPlan(planId, force = false) {
   if (!force && state.selectedPlanId === planId && state.selectedPlan) return;
+  if (state.planSelectionController) state.planSelectionController.abort();
+  const controller = new AbortController();
+  const epoch = ++state.planSelectionEpoch;
+  state.planSelectionController = controller;
   state.editingPlanMeta = false;
   state.editingStageKey = "";
   state.selectedPlanId = planId;
   renderPlanList();
   $("#plan-editor").innerHTML = '<div class="empty-state plan-editor-empty">正在读取题单…</div>';
   try {
-    const data = await api(`/api/plans/${encodeURIComponent(planId)}`);
+    const data = await api(`/api/plans/${encodeURIComponent(planId)}`, { signal: controller.signal });
+    if (state.planSelectionEpoch !== epoch || state.selectedPlanId !== planId || state.planSelectionController !== controller) return;
     const document = planDocument(data);
     state.selectedPlan = JSON.parse(JSON.stringify(document));
     state.selectedPlanMeta = {
@@ -129,7 +134,11 @@ async function selectPlan(planId, force = false) {
     };
     renderPlanEditor();
   } catch (error) {
-    renderPlanEditorEmpty("题单读取失败", error.message);
+    if (error.name !== "AbortError" && state.planSelectionEpoch === epoch && state.selectedPlanId === planId) {
+      renderPlanEditorEmpty("题单读取失败", error.message);
+    }
+  } finally {
+    if (state.planSelectionController === controller) state.planSelectionController = null;
   }
 }
 
@@ -314,12 +323,19 @@ function markSaving(saving, message = "") {
 
 async function savePlan(nextPlan, successMessage = "修改已保存") {
   const meta = state.selectedPlanMeta || {};
+  const planId = nextPlan.plan_id;
   markSaving(true);
   try {
-    const data = await api("/api/plans/edit", { body: { plan_id: nextPlan.plan_id, expected_revision: meta.revision, plan: nextPlan } });
+    const data = await api("/api/plans/edit", { body: { plan_id: planId, expected_revision: meta.revision, plan: nextPlan } });
     const responseHasStatuses = Object.hasOwn(asObject(data), "task_statuses");
+    const savedRevision = planRevision(data, meta.revision + 1);
+    if (state.selectedPlanId !== planId) {
+      await refreshPlanSummaries();
+      toast(successMessage, `${planId} 已保存为修订 ${savedRevision}；当前题单保持不变。`);
+      return true;
+    }
     state.selectedPlan = JSON.parse(JSON.stringify(planDocument(data)?.plan_id ? planDocument(data) : nextPlan));
-    meta.revision = planRevision(data, meta.revision + 1);
+    meta.revision = savedRevision;
     if (data.source) meta.source = data.source;
     if (data.has_override != null) meta.has_override = data.has_override;
     if (responseHasStatuses) meta.task_statuses = asObject(data.task_statuses);
@@ -328,7 +344,8 @@ async function savePlan(nextPlan, successMessage = "修改已保存") {
     else {
       const editingMeta = state.editingPlanMeta;
       const editingStageKey = state.editingStageKey;
-      await selectPlan(nextPlan.plan_id, true);
+      await selectPlan(planId, true);
+      if (state.selectedPlanId !== planId) return true;
       state.editingPlanMeta = editingMeta;
       state.editingStageKey = state.selectedPlan && stagesOf(state.selectedPlan).some(stage => stage.stage_key === editingStageKey) ? editingStageKey : "";
       if (state.selectedPlan) renderPlanEditor();
@@ -337,6 +354,10 @@ async function savePlan(nextPlan, successMessage = "修改已保存") {
     toast(successMessage, `当前修订：${meta.revision}`);
     return true;
   } catch (error) {
+    if (state.selectedPlanId !== planId) {
+      toast("后台保存失败", `${planId}: ${error.message}`, "error");
+      return false;
+    }
     markSaving(false, "保存失败");
     if (error.status === 409) {
       const conflict = $("#plan-conflict");
@@ -631,19 +652,36 @@ async function previewPlanFile(file) {
 async function confirmPlanImport(button) {
   if (!state.importPreview || !state.importContent) return;
   const confirmReplace = $("#plan-replace-confirm input").checked;
+  try {
+    await submitPlanImport({
+      button,
+      content: state.importContent,
+      preview: state.importPreview,
+      confirmReplace,
+      dialog: $("#plan-import-dialog"),
+    });
+  } catch { /* submitPlanImport already reports the failure. */ }
+}
+
+async function submitPlanImport({ button, content, preview, confirmReplace = false, dialog = null }) {
+  if (!preview || !content) return null;
   setBusy(button, true, "导入中…");
   try {
     const data = await api("/api/plans/import", { body: {
-      content: state.importContent,
+      content,
       confirm_replace: confirmReplace,
-      expected_revision: state.importPreview.current_revision ?? null,
+      expected_revision: preview.current_revision ?? null,
     } });
-    $("#plan-import-dialog").close();
-    const planId = data.plan_id || data.plan?.plan_id || state.importPreview.plan_id || state.importPreview.plan?.plan_id;
+    if (dialog?.open) dialog.close();
+    const planId = data.plan_id || data.plan?.plan_id || preview.plan_id || preview.plan?.plan_id;
     toast("题单已导入", planId || "导入内容已保存");
     state.selectedPlanId = ""; state.selectedPlan = null;
     await loadPlans({ select: planId });
-  } catch (error) { toast("导入失败", error.message, "error"); }
+    return data;
+  } catch (error) {
+    toast("导入失败", error.message, "error");
+    throw error;
+  }
   finally { setBusy(button, false); }
 }
 
@@ -765,6 +803,6 @@ export {
   selectPlan, renderPlanEditor, savePlan, refreshPlanSummaries, downloadJson,
   toggleSelectedPlan, deleteSelectedPlan, loadRevisions, restoreRevision,
   startTagPreview, applyTagPreview, importErrors, previewPlanFile,
-  confirmPlanImport, downloadPlanTemplate, mutatePlanField, mutateStageField,
+  confirmPlanImport, submitPlanImport, downloadPlanTemplate, mutatePlanField, mutateStageField,
   mutateTaskField, handleStageAction, addTaskFromForm, handleTaskAction,
 };

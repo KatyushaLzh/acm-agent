@@ -92,26 +92,22 @@ class WebEndToEndTest(unittest.TestCase):
         )
 
     def request(self, method: str, path: str, payload: dict[str, object] | None = None):
-        connection = http.client.HTTPConnection(
-            "127.0.0.1", self.server.port, timeout=10
-        )
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=3)
         headers = {"X-ACM-Token": "e2e-token"}
         body = None
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        try:
-            connection.request(method, path, body=body, headers=headers)
-            response = connection.getresponse()
-            decoded = json.loads(response.read())
-        finally:
-            connection.close()
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        decoded = json.loads(response.read())
+        connection.close()
         self.assertIn(response.status, {200, 202}, decoded)
         self.assertTrue(decoded["ok"], decoded)
         return decoded["data"]
 
     def wait_job(self, job_id: str) -> dict[str, object]:
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             job = self.request("GET", f"/api/jobs/{job_id}")
             if job["status"] == "succeeded":

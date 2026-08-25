@@ -25,17 +25,12 @@ from .service_common import (
     AIConversationConflict,
     FAILURE_MODES,
     RESULTS,
-    STRESS_AI_REQUEST_TIMEOUT_SECONDS,
 )
 from .service_core import ServiceCoreMixin
 from .service_knowledge import ServiceKnowledgeMixin
 from .service_plan import ServicePlanMixin
 from .service_problem import ServiceProblemMixin
-from .service_stress import ServiceStressMixin
 from .storage import Database
-from .stress import SandboxBackend, WindowsAppContainerBackend
-from .stress_runtime import StressCoordinator
-from .stress_sources import AllowlistedCrawler
 from .verify import verify_problem
 from .workspace import ProblemRef
 
@@ -44,7 +39,6 @@ class AcmService(
     ServiceCoreMixin,
     ServiceAIMixin,
     ServiceKnowledgeMixin,
-    ServiceStressMixin,
     ServiceProblemMixin,
     ServicePlanMixin,
 ):
@@ -67,8 +61,6 @@ class AcmService(
         recommend_fn: Callable[..., Any] | None = None,
         problem_context_fetcher: Callable[[ProblemRef], tuple[str, str]] | None = None,
         credential_store: DeepSeekCredentialStore | None = None,
-        stress_sandbox_factory: Callable[[], SandboxBackend] | None = None,
-        stress_crawler_factory: Callable[[], AllowlistedCrawler] = AllowlistedCrawler,
     ) -> None:
         self.paths = Paths.for_root(Path(root))
         self._codeforces_client_factory = codeforces_client_factory
@@ -84,15 +76,6 @@ class AcmService(
         )
         self._deepseek_api_key: str | None = None
         self._credential_error: str | None = None
-        self._stress = StressCoordinator(
-            self.paths,
-            sandbox_factory=(
-                stress_sandbox_factory
-                if stress_sandbox_factory is not None
-                else lambda: WindowsAppContainerBackend(root=self.paths.root)
-            ),
-            crawler_factory=stress_crawler_factory,
-        )
         try:
             self._deepseek_api_key = self._credential_store.load()
         except CredentialStoreError as exc:
@@ -115,5 +98,4 @@ __all__ = [
     "AcmService",
     "FAILURE_MODES",
     "RESULTS",
-    "STRESS_AI_REQUEST_TIMEOUT_SECONDS",
 ]

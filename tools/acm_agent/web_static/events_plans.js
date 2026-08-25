@@ -7,8 +7,10 @@ import {
   restoreRevision, savePlan, selectPlan, stableKey, stagesOf, startTagPreview,
   toggleSelectedPlan,
 } from "./view_plans.js";
+import { bindAiPlanImportEvents } from "./view_plan_ai_import.js";
 
 function bindPlanEvents() {
+  bindAiPlanImportEvents();
   $("#plan-list").addEventListener("click", event => {
     const button = event.target.closest("[data-plan-id]");
     if (button) selectPlan(button.dataset.planId);

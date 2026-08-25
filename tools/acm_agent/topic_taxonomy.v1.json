@@ -1,0 +1,32 @@
+{
+  "version": "1",
+  "topics": [
+    {"key": "range_data_structures", "label": "区间数据结构", "aliases": ["segment tree", "fenwick tree", "线段树", "树状数组", "st 表", "rmq", "扫描线", "李超线段树", "吉司机线段树 segment tree beats", "线段树合并", "二维线段树", "颜色段均摊（珂朵莉树 odt）"], "contains": ["segment tree", "线段树", "树状数组", "st 表"]},
+    {"key": "balanced_trees", "label": "平衡树与动态树", "aliases": ["balanced tree", "平衡树", "treap", "splay", "avl", "sbt", "替罪羊树", "动态树", "动态树 lct", "link cut tree", "fhq treap", "笛卡尔树", "全局平衡二叉树"], "contains": ["treap", "splay", "平衡树", "lct", "动态树"]},
+    {"key": "persistent_multidimensional_ds", "label": "可持久化与高维数据结构", "aliases": ["persistent data structures", "可持久化", "可持久化线段树", "树套树", "k-d tree", "主席树", "分散层叠"], "contains": ["可持久化", "树套树", "k-d tree", "主席树"]},
+    {"key": "trie_xor_structures", "label": "Trie 与异或结构", "aliases": ["trie", "字典树 trie", "linear basis", "线性基", "bitset"], "contains": ["trie", "字典树", "线性基"]},
+    {"key": "dsu_connectivity", "label": "并查集", "aliases": ["dsu", "并查集", "rollback dsu", "回滚 dsu"], "contains": ["并查集", "rollback dsu"]},
+    {"key": "matching_flows", "label": "匹配与网络流", "aliases": ["flows", "graph matchings", "网络流", "dinic", "sap", "最小割", "费用流", "匈牙利算法", "km算法", "二分图匹配", "一般图的最大匹配", "带权二分图匹配", "dilworth 定理"], "contains": ["网络流", "dinic", "费用流", "最小割", "匹配"]},
+    {"key": "shortest_paths_constraints", "label": "最短路与约束", "aliases": ["shortest paths", "最短路", "floyd 算法", "差分约束", "负权环", "最小环"], "contains": ["最短路", "floyd", "差分约束", "负权环"]},
+    {"key": "spanning_trees", "label": "生成树", "aliases": ["minimum spanning tree", "生成树", "最小生成树", "次小生成树", "kruskal 重构树", "矩阵树定理", "特殊生成树"], "contains": ["生成树", "kruskal"]},
+    {"key": "tree_algorithms", "label": "树上算法", "aliases": ["trees", "tree algorithms", "树论", "树的遍历", "树上距离", "最近公共祖先 lca", "树链剖分", "点分治", "树上启发式合并", "虚树", "树的重心", "圆方树", "prüfer 序列", "dsu on tree", "倍增"], "contains": ["树链剖分", "点分治", "树上", "lca", "虚树", "树的直径", "圆方树"]},
+    {"key": "graph_connectivity", "label": "图遍历与连通性", "aliases": ["graphs", "dfs and similar", "2-sat", "图论建模", "图遍历", "拓扑排序", "连通块", "强连通分量", "双连通分量", "tarjan", "欧拉回路", "二分图", "仙人掌", "基环树", "弦图"], "contains": ["连通", "tarjan", "欧拉", "2-sat", "图遍历", "拓扑"]},
+    {"key": "dynamic_programming", "label": "动态规划", "aliases": ["dp", "dynamic programming", "动态规划", "背包 dp", "数位 dp", "区间 dp", "树形 dp", "状压 dp", "动态 dp", "线性 dp", "轮廓线 dp", "dp 套 dp", "记忆化搜索"], "contains": [" dp", "dp ", "动态规划", "记忆化"]},
+    {"key": "greedy", "label": "贪心", "aliases": ["greedy", "贪心", "反悔贪心", "schedules"], "contains": ["贪心"]},
+    {"key": "binary_search_two_pointers", "label": "二分与双指针", "aliases": ["binary search", "two pointers", "ternary search", "二分", "三分", "整体二分", "双指针 two-pointer", "wqs 二分", "二分答案"], "contains": ["二分", "双指针", "two-pointer", "ternary search"]},
+    {"key": "search", "label": "搜索", "aliases": ["brute force", "枚举", "递归", "广度优先搜索 bfs", "深度优先搜索 dfs", "剪枝", "启发式搜索", "迭代加深搜索", "启发式迭代加深搜索 ida*", "dancing links", "a*  算法", "折半搜索 meet in the middle", "meet-in-the-middle"], "contains": ["搜索", "bfs", "dfs", "枚举", "meet in the middle"]},
+    {"key": "divide_conquer_offline", "label": "分治与离线算法", "aliases": ["divide and conquer", "分治", "cdq 分治", "莫队", "整体二分", "根号分治", "离线处理", "二区间合并（猫树分治）", "折半搜索 meet in the middle"], "contains": ["分治", "莫队", "离线"]},
+    {"key": "string_algorithms", "label": "字符串算法", "aliases": ["strings", "string suffix structures", "hashing", "字符串（入门）", "哈希 hashing", "哈希表", "kmp 算法", "ac 自动机", "后缀数组 sa", "后缀自动机 sam", "回文自动机 pam", "manacher 算法", "z 函数", "lyndon 分解"], "contains": ["字符串", "后缀", "自动机", "kmp", "manacher", "hash"]},
+    {"key": "number_theory", "label": "数论", "aliases": ["number theory", "chinese remainder theorem", "数论", "素数判断", "最大公约数 gcd", "扩展欧几里德算法", "不定方程", "中国剩余定理 crt", "莫比乌斯反演", "逆元", "原根", "欧拉函数", "线性筛法", "bsgs", "二次剩余", "欧拉降幂", "dirichlet 卷积"], "contains": ["数论", "欧几里得", "莫比乌斯", "crt", "逆元", "素数", "欧拉函数"]},
+    {"key": "combinatorics_probability", "label": "组合与概率", "aliases": ["combinatorics", "probabilities", "组合数学", "排列组合", "容斥原理", "生成函数", "概率论", "简单概率", "bayes", "期望", "catalan 数", "stirling 数", "lucas 定理", "lgv 引理"], "contains": ["组合", "概率", "期望", "catalan", "stirling", "生成函数"]},
+    {"key": "linear_algebra_polynomials", "label": "线性代数与多项式", "aliases": ["fft", "matrices", "多项式", "矩阵运算", "矩阵加速", "线性代数", "矩阵乘法", "高斯消元", "行列式", "快速傅里叶变换 fft", "快速数论变换 ntt", "快速沃尔什变换 fwt", "berlekamp-massey(bm) 算法"], "contains": ["矩阵", "多项式", "fft", "ntt", "fwt", "高斯消元", "行列式"]},
+    {"key": "geometry", "label": "计算几何", "aliases": ["geometry", "计算几何", "平面几何", "三维计算几何", "凸包", "叉积", "线段相交", "半平面交", "最近点对", "旋转卡壳", "极角排序", "闵可夫斯基和 minkowski sum"], "contains": ["几何", "凸包", "半平面", "旋转卡壳", "minkowski"]},
+    {"key": "game_theory", "label": "博弈论", "aliases": ["games", "博弈论", "博弈树", "sg 函数", "nim 积"], "contains": ["博弈", "sg 函数", "nim"]},
+    {"key": "constructive_adhoc", "label": "构造与 Ad-hoc", "aliases": ["constructive algorithms", "constructive", "构造", "ad-hoc", "分类讨论"], "contains": ["构造", "ad-hoc"]},
+    {"key": "randomized_optimization", "label": "随机化与启发式优化", "aliases": ["randomized", "randomized algorithms", "randomization", "随机化", "随机算法", "随机调整", "模拟退火", "爬山算法 local search", "遗传算法", "近似算法", "梯度下降法"], "contains": ["随机", "模拟退火", "爬山", "遗传算法"]},
+    {"key": "basic_data_structures", "label": "基础数据结构", "aliases": ["data structures", "basic data structures", "数据结构", "线性数据结构", "树形数据结构", "高级数据结构", "基本数组", "数组", "栈", "队列", "链表", "堆", "优先队列", "单调队列", "单调栈", "分块", "离散化"], "contains": ["数据结构", "单调队列", "单调栈", "优先队列"]},
+    {"key": "math_general", "label": "数学与代数", "aliases": ["math", "数学", "高精度", "递推", "进制", "矩阵", "信息论", "线性规划", "分数规划", "微积分", "导数", "积分", "级数"], "contains": ["高精度", "递推", "线性规划", "微积分"]},
+    {"key": "implementation", "label": "实现与基础算法", "aliases": ["implementation", "sortings", "expression parsing", "语言入门", "基础算法", "﻿基础算法", "模拟", "排序", "快速排序", "堆排序", "前缀和", "差分", "位运算", "bitmasks", "stl"], "contains": ["排序", "前缀和", "差分", "位运算", "模拟"]}
+  ],
+  "ignored": ["algorithm", "算法", "other", "其他", "区域", "时间", "来源", "special", "*special", "特殊题目", "interactive", "交互题", "communication", "通信题", "submit answer", "提交答案", "special judge", "模板题", "洛谷原创", "noip 提高组", "noip 普及组", "ceoi（中欧）", "cerc", "coi（克罗地亚）", "高校校赛"]
+}

@@ -19,14 +19,6 @@ from .storage_common import (
     MarkdownSummaryTargetRevisionConflict,
     PlanRevisionConflict,
     ProblemContextConflict,
-    StressArtifactBundleRevisionConflict,
-    StressArtifactCandidateConflict,
-    StressArtifactProofConflict,
-    StressBundleCertificationConflict,
-    StressCacheAliasRevisionConflict,
-    StressPreparationCacheConflict,
-    StressRunRevisionConflict,
-    StressSetupSlotConflict,
     TagOverrideRevisionConflict,
     utc_now,
 )
@@ -34,23 +26,21 @@ from .storage_markdown import _MarkdownStorageMixin
 from .storage_plan import _PlanStorageMixin
 from .storage_problem import _ProblemStorageMixin
 from .storage_schema import MIGRATIONS, SCHEMA_VERSION
-from .storage_stress import _StressStorageMixin
 
 
 # Schema versions whose *preceding* schema is snapshotted when the database is
 # opened directly at that schema (the upgrade's first step).
-_BACKUP_ON_DIRECT_OPEN = frozenset(range(5, 15))
+_BACKUP_ON_DIRECT_OPEN = frozenset((*range(5, 15), 17))
 # Subset that is also snapshotted when the schema is merely passed through as an
 # intermediate step of a longer upgrade.  Versions 5 and 6 keep the legacy
 # direct-open-only behavior.
-_BACKUP_AS_INTERMEDIATE = frozenset(range(7, 15))
+_BACKUP_AS_INTERMEDIATE = frozenset((*range(7, 15), 17))
 
 
 class Database(
     _ProblemStorageMixin,
     _AiStorageMixin,
     _MarkdownStorageMixin,
-    _StressStorageMixin,
     _PlanStorageMixin,
 ):
     """Small repository-style wrapper around a versioned SQLite database."""
@@ -79,6 +69,7 @@ class Database(
             return
         backup_path = self.path.with_name(f"{self.path.name}.v{source_version}.bak")
         if backup_path.exists():
+            self._validate_migration_backup(backup_path, source_version)
             return
         temporary = backup_path.with_name(f".{backup_path.name}.tmp")
         temporary.unlink(missing_ok=True)
@@ -89,9 +80,30 @@ class Database(
         finally:
             destination.close()
         try:
+            self._validate_migration_backup(temporary, source_version)
             os.replace(temporary, backup_path)
         finally:
             temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _validate_migration_backup(path: Path, expected_version: int) -> None:
+        """Fail closed unless a migration backup is readable and consistent."""
+
+        try:
+            connection = sqlite3.connect(path)
+            try:
+                version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]
+            finally:
+                connection.close()
+        except sqlite3.Error as exc:
+            raise RuntimeError(f"migration backup is not readable: {path}") from exc
+        if version != expected_version:
+            raise RuntimeError(
+                f"migration backup schema {version} does not match {expected_version}: {path}"
+            )
+        if quick_check != "ok":
+            raise RuntimeError(f"migration backup failed integrity check: {path}")
 
     def __enter__(self) -> "Database":
         return self
@@ -117,20 +129,12 @@ class Database(
             migration = MIGRATIONS.get(version)
             if migration is None:
                 raise RuntimeError(f"missing database migration {version}")
-            problems_table_exists = self.connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='problems'"
-            ).fetchone()
-            incomplete_legacy_v10 = version == 10 and problems_table_exists is None
-            rebuilds_fk_parent = version in {13, 14, 16}
-            if incomplete_legacy_v10 or rebuilds_fk_parent:
-                # v10: some pre-plan test/preview databases only carried a version
-                # marker and unrelated tables.  SQLite resolves every foreign
-                # key target while rebuilding stress_runs, so temporarily
-                # disable enforcement for this already-incomplete legacy shape.
-                # v13/v14/v16: stress_artifact_candidates is referenced by the proofs
-                # and certifications tables, so its rebuild also requires
-                # enforcement off for the duration of the DDL.
-                # Normal ACM databases retain enforcement throughout.
+            rebuilds_fk_parent = version == 17
+            if rebuilds_fk_parent:
+                # v17 retires persistent stress state and rebuilds ai_runs to
+                # remove its stress-only preparation metadata column.  Child
+                # tables keep referencing the replacement table by the same
+                # name, so enforcement is disabled only for the DDL window.
                 self.connection.execute("PRAGMA foreign_keys = OFF")
             try:
                 # ``executescript`` commits any pending transaction before it
@@ -146,7 +150,7 @@ class Database(
                     self.connection.execute("ROLLBACK")
                 raise
             finally:
-                if incomplete_legacy_v10 or rebuilds_fk_parent:
+                if rebuilds_fk_parent:
                     self.connection.execute("PRAGMA foreign_keys = ON")
 
 
@@ -193,14 +197,6 @@ __all__ = [
     "PlanRevisionConflict",
     "ProblemContextConflict",
     "Store",
-    "StressArtifactBundleRevisionConflict",
-    "StressArtifactCandidateConflict",
-    "StressArtifactProofConflict",
-    "StressBundleCertificationConflict",
-    "StressCacheAliasRevisionConflict",
-    "StressPreparationCacheConflict",
-    "StressRunRevisionConflict",
-    "StressSetupSlotConflict",
     "TagOverrideRevisionConflict",
     "open_database",
     "utc_now",

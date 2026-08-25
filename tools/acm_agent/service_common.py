@@ -17,16 +17,12 @@ PUBLIC_AI_SETTING_KEYS = (
     "recommendation_model",
     "coaching_model",
     "summary_model",
-    "validation_model",
     "recommendation_thinking",
     "coaching_thinking",
     "summary_thinking",
-    "validation_thinking",
     "reasoning_effort",
     "summary_reasoning_effort",
-    "validation_reasoning_effort",
 )
-STRESS_AI_REQUEST_TIMEOUT_SECONDS = 300.0
 AI_CHAT_SOURCE_MAX_BYTES = 128 * 1024
 AI_CHAT_CONTEXT_BUDGET_BYTES = 256 * 1024
 AI_SUMMARY_STATEMENT_MAX_BYTES = 128 * 1024
@@ -71,7 +67,6 @@ __all__ = [
     "FAILURE_MODES",
     "PUBLIC_AI_SETTING_KEYS",
     "RESULTS",
-    "STRESS_AI_REQUEST_TIMEOUT_SECONDS",
     "_db_problem_id",
     "_display_problem_id",
     "_problem_key",

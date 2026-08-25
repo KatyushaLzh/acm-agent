@@ -11,6 +11,10 @@
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
+  <div id="app-background-stage" class="app-background-stage" aria-hidden="true">
+    <img id="app-background-fill" class="app-background-fill" alt="">
+    <img id="app-background" class="app-background" alt="">
+  </div>
   <div class="app-shell">
     <aside class="sidebar">
       <a class="brand" href="#today" aria-label="ACM Agent 首页">
@@ -48,14 +52,14 @@
         <div class="setup-copy">
           <span class="kicker">首次使用</span>
           <h2 id="setup-title">连接你的做题记录</h2>
-          <p>平台 AC 是权威状态，本地文件只会记为 <code>local_only</code>。账号信息仅保存在这台电脑。</p>
+          <p>平台 AC 是权威状态，本地文件只会记为 <code>local_only</code>。验证账号后会立即进入主界面，完整题库与已 AC 洛谷题标签将在后台抓取。账号信息仅保存在这台电脑。</p>
         </div>
         <form id="setup-form" class="form-grid">
           <label>Codeforces handle<input name="codeforces" autocomplete="off" required placeholder="例如 tourist"></label>
           <label>洛谷数字 UID<input name="luogu" inputmode="numeric" pattern="[0-9]+" required placeholder="例如 123456"></label>
           <label>目标 CF rating（可选）<input name="target_rating" inputmode="numeric" type="number" min="800" max="4000" step="100"></label>
           <details class="advanced"><summary>高级选项</summary><label class="check"><input name="skip_validate" type="checkbox">离线保存，不验证账号 <span class="warning-text">可能导致账号填写错误</span></label></details>
-          <button class="button primary wide" type="submit">保存并进入仪表盘</button>
+          <button id="setup-save-button" class="button primary wide" type="submit">保存并进入仪表盘</button>
         </form>
       </section>
 
@@ -68,17 +72,18 @@
           <div><p class="eyebrow">NEXT SET</p><h2>下一组训练</h2></div>
           <form id="recommend-controls" class="inline-controls">
             <label><span class="sr-only">推荐模式</span><select name="mode"><option value="mixed">混合模式</option><option value="new">只做新题</option><option value="review">只做复习</option></select></label>
-            <label><span class="sr-only">推荐来源</span><select name="source_mode"><option value="balanced">题单与题库均衡</option><option value="catalog_only">仅题库</option><option value="plan_only">仅题单</option></select></label>
+            <label><span class="sr-only">推荐来源</span><select name="source_mode"><option value="balanced">题单与题库并集</option><option value="catalog_only">仅题库</option><option value="plan_only">仅题单</option></select></label>
             <details id="recommend-plan-filter" class="plan-filter">
               <summary>全部已启用题单</summary>
               <div id="recommend-plan-options" class="plan-filter-options"><span class="subtle">暂无已启用题单</span></div>
             </details>
             <label><span class="sr-only">推荐数量</span><select name="count"><option value="3">3 题</option><option value="6">6 题</option><option value="9">9 题</option></select></label>
             <button class="button secondary" type="submit">重新推荐</button>
-            <button id="ai-recommend-button" class="button primary" type="button">AI 个性化</button>
+            <button id="ai-gap-fill-button" class="button primary" type="button">查漏补缺</button>
+            <button id="ai-specialization-button" class="button primary" type="button">专项强化</button>
           </form>
         </div>
-        <p class="subtle">“AI 个性化”会发送最近 90 天内最多 50 次结构化尝试、冻结标签、薄弱度、目标 rating 与确定性候选；不会发送账号、notes、聊天、源码或本地路径。</p>
+        <p class="subtle">“查漏补缺”和“专项强化”会发送“已分类的去重平台 AC 摘要 + 确定性候选”；不会发送账号、handle、UID、submission ID、raw JSON、语言、notes、聊天、源码、本机路径、API Key 或运行 token。</p>
         <div id="recommend-basis" class="basis-banner plan_only">尚未生成推荐</div>
         <div id="recommendations" class="recommend-grid empty-state"><p>同步平台状态或直接生成一组训练。</p></div>
 
@@ -104,6 +109,7 @@
           </div>
           <div class="plans-toolbar-actions">
             <input id="plan-file-input" type="file" accept="application/json,.json" class="sr-only">
+            <button id="ai-plan-import-button" class="button primary" type="button">AI 快速导入</button>
             <button id="plan-import-button" class="button secondary" type="button">导入 JSON</button>
             <button id="plan-template-button" class="button secondary" type="button">下载 v2 模板</button>
             <button id="plan-refresh-button" class="icon-button" type="button" title="刷新题单" aria-label="刷新题单">↻</button>
@@ -153,7 +159,7 @@
             </section>
           </article>
           <article class="panel">
-            <div class="panel-heading"><div><p class="eyebrow">VERIFY</p><h2>本地验证</h2></div></div>
+            <div class="panel-heading"><div><p class="eyebrow">VERIFY</p><h2>本地对拍</h2></div></div>
             <form id="verify-form" class="stack-form">
               <label>题号（留空时使用 active session）<input name="problem" autocomplete="off" placeholder="CF1234A"></label>
               <div class="form-row">
@@ -164,86 +170,36 @@
                 <label>对拍次数<input name="stress_iterations" type="number" min="1" max="10000" value="100"></label>
                 <label>随机种子（可选）<input name="seed" type="number"></label>
               </div>
+              <div class="local-stress-file-row" aria-label="本地对拍 C++ 源文件">
+                <div class="file-picker-field" data-file-picker-field="generator_file" role="group" aria-labelledby="local-generator-file-label">
+                  <span id="local-generator-file-label" class="file-picker-label">数据生成器</span>
+                  <input name="generator_file" type="hidden">
+                  <div class="file-picker-actions"><button class="button secondary" type="button" data-file-picker="generator_file" data-kind="cpp" aria-label="选择数据生成器文件">选择</button><button class="button secondary" type="button" data-file-clear="generator_file" aria-label="清除数据生成器文件">清除</button></div>
+                  <output class="file-picker-status" aria-live="polite">未选择</output>
+                </div>
+                <div class="file-picker-field" data-file-picker-field="reference_file" role="group" aria-labelledby="local-reference-file-label">
+                  <span id="local-reference-file-label" class="file-picker-label">参考程序</span>
+                  <input name="reference_file" type="hidden">
+                  <div class="file-picker-actions"><button class="button secondary" type="button" data-file-picker="reference_file" data-kind="cpp" aria-label="选择参考程序文件">选择</button><button class="button secondary" type="button" data-file-clear="reference_file" aria-label="清除参考程序文件">清除</button></div>
+                  <output class="file-picker-status" aria-live="polite">未选择</output>
+                </div>
+                <div class="file-picker-field" data-file-picker-field="user_file" role="group" aria-labelledby="local-user-file-label">
+                  <span id="local-user-file-label" class="file-picker-label">用户程序</span>
+                  <input name="user_file" type="hidden">
+                  <div class="file-picker-actions"><button class="button secondary" type="button" data-file-picker="user_file" data-kind="cpp" aria-label="选择用户程序文件">选择</button><button class="button secondary" type="button" data-file-clear="user_file" aria-label="清除用户程序文件">清除</button></div>
+                  <output class="file-picker-status" aria-live="polite">未选择</output>
+                </div>
+              </div>
+              <span class="subtle">未选择时仍按题号定位用户程序，并使用同目录的 <code>.gen.cpp</code> / <code>.bf.cpp</code>。</span>
               <label class="check"><input name="debug" type="checkbox">探测并启用 ASan / UBSan（检测内存错误与未定义行为）</label>
               <button class="button secondary" type="submit">编译并验证</button>
             </form>
-            <details id="ai-stress-panel" class="ai-stress-panel">
-              <summary>AI 持续对拍（可选，默认关闭）</summary>
-              <p class="subtle">启用后会将公开题面发送给 DeepSeek，并按 Codeforces 官方题解 / 洛谷题解、博客园、CSDN 的顺序搜索对拍代码；不会发送账号、API Key、本机路径或你的主解源码。</p>
-              <form id="ai-stress-form" class="stack-form">
-                <label class="check"><input name="enabled" type="checkbox">我确认启用 AI 准备、自动备份并替换对拍 helper</label>
-                <fieldset id="ai-stress-options" class="ai-stress-options" disabled>
-                  <div class="ai-stress-checks">
-                    <label class="check"><input name="generate_generator" type="checkbox" checked>补全数据生成器</label>
-                    <label class="check"><input name="prepare_reference_primary" type="checkbox" checked>搜索 / 生成第一份 reference</label>
-                    <label class="check"><input name="prepare_reference_secondary" type="checkbox" checked>搜索 / 生成第二份 reference</label>
-                    <label class="check"><input name="large_profile" type="checkbox" checked>启用极限大数据（双 reference 同时运行）</label>
-                    <label class="check"><input name="include_validator" type="checkbox">启用 validator（启用后升级为完整严格认证，正确性更高但生成成功率显著下降）</label>
-                  </div>
-                  <span class="subtle">取消前三项时会复用对应的现有 helper；文件不存在则安全停止准备。</span>
-                  <div class="form-row">
-                    <label>模型<select name="model"><option value="">使用验证模型设置</option><option value="deepseek-v4-flash">DeepSeek Flash</option><option value="deepseek-v4-pro">DeepSeek Pro</option></select></label>
-                    <label>起始 seed（可选）<input name="seed" type="number" min="0"></label>
-                  </div>
-                  <div class="form-row">
-                    <label>对拍代码最长运行时间（秒）<input name="timeout" type="number" min="0.1" max="60" step="0.1" value="2"></label>
-                    <label>第二份 reference 最长运行时间（秒）<input name="reference_secondary_timeout" type="number" min="0.1" max="60" step="0.1" value="5"></label>
-                  </div>
-                  <div class="form-row">
-                    <label>准备耗时上限（秒）<input name="preparation_timeout_seconds" type="number" min="60" max="1800" step="1" value="600"></label>
-                    <label>helper 生成模式<select name="generation_mode"><option value="fast">Fast（非 thinking）</option><option value="hybrid" selected>Hybrid（默认）</option><option value="full_thinking">Full thinking</option></select></label>
-                  </div>
-                  <label>缓存模式<select name="cache_mode"><option value="reuse" selected>Reuse（复用已认证结果）</option><option value="refresh_helpers">Refresh helpers（保留 contract/recipe）</option><option value="cold">Cold（不读取任何本地生成缓存）</option></select></label>
-                  <div class="form-row">
-                    <div class="file-picker-field" data-file-picker-field="generator_file" role="group" aria-labelledby="generator-file-label">
-                      <span id="generator-file-label" class="file-picker-label">手动 generator 文件（可选）</span>
-                      <input name="generator_file" type="hidden">
-                      <div class="file-picker-actions"><button class="button secondary" type="button" data-file-picker="generator_file" data-kind="cpp">选择文件</button><button class="button secondary" type="button" data-file-clear="generator_file">清除</button></div>
-                      <output id="generator-file-status" class="file-picker-status" aria-live="polite">未选择</output>
-                    </div>
-                    <div class="file-picker-field" data-file-picker-field="reference_primary_file" role="group" aria-labelledby="reference-primary-file-label">
-                      <span id="reference-primary-file-label" class="file-picker-label">第一份 reference（可选）</span>
-                      <input name="reference_primary_file" type="hidden">
-                      <div class="file-picker-actions"><button class="button secondary" type="button" data-file-picker="reference_primary_file" data-kind="cpp">选择文件</button><button class="button secondary" type="button" data-file-clear="reference_primary_file">清除</button></div>
-                      <output id="reference-primary-file-status" class="file-picker-status" aria-live="polite">未选择</output>
-                    </div>
-                  </div>
-                  <div class="form-row">
-                    <div class="file-picker-field" data-file-picker-field="reference_secondary_file" role="group" aria-labelledby="reference-secondary-file-label">
-                      <span id="reference-secondary-file-label" class="file-picker-label">第二份 reference（可选）</span>
-                      <input name="reference_secondary_file" type="hidden">
-                      <div class="file-picker-actions"><button class="button secondary" type="button" data-file-picker="reference_secondary_file" data-kind="cpp">选择文件</button><button class="button secondary" type="button" data-file-clear="reference_secondary_file">清除</button></div>
-                      <output id="reference-secondary-file-status" class="file-picker-status" aria-live="polite">未选择</output>
-                    </div>
-                  </div>
-                  <span id="ai-stress-generation-mode-hint" class="subtle">默认按 10 分钟预算设计；第 8 分钟硬停止 provider，为本地验证保留 110 秒、清理保留 10 秒。Hybrid 初次使用 Fast，仅在收到明确机器诊断后启用 thinking。</span>
-                  <div class="ai-stress-safety">
-                    <span>small：2 MiB 输入输出 · large：32 MiB 输入、16 MiB 输出 · 两份 reference 均执行 · 来源顺序：官方题解 → 博客园 → CSDN → AI 生成</span>
-                    <span id="ai-stress-isolation" class="badge neutral">正在检查隔离环境</span>
-                  </div>
-                  <button class="button primary" type="submit">AI 准备并开始持续对拍</button>
-                </fieldset>
-              </form>
-            </details>
           </article>
         </div>
 
         <article class="panel output-panel">
           <div class="panel-heading"><div><p class="eyebrow">OUTPUT</p><h2>验证输出</h2></div><span id="verify-state" class="badge neutral">尚未运行</span></div>
           <pre id="verify-output">编译信息、样例结果和对拍诊断会显示在这里。</pre>
-        </article>
-
-        <article id="ai-stress-run-panel" class="panel ai-stress-run-panel hidden">
-          <div class="panel-heading"><div><p class="eyebrow">AI STRESS</p><h2>持续对拍</h2></div><span id="ai-stress-run-state" class="badge neutral">未启动</span></div>
-          <div id="ai-stress-run-summary" class="ai-stress-progress"></div>
-          <div class="card-actions">
-            <button id="ai-stress-stop" class="button secondary" type="button">暂停</button>
-            <button id="ai-stress-resume" class="button secondary" type="button">继续</button>
-            <button id="ai-stress-finish" class="button danger" type="button">结束对拍</button>
-            <button id="ai-stress-artifacts" class="button secondary" type="button">查看 helper 来源</button>
-            <button id="ai-stress-revert" class="button secondary" type="button">回退 helper</button>
-          </div>
-          <pre id="ai-stress-detail" class="stress-detail hidden"></pre>
         </article>
 
         <article class="panel ai-workbench-panel">
@@ -331,7 +287,7 @@
       </section>
 
       <section id="settings-view" class="view">
-        <div class="two-column">
+        <div class="settings-grid">
           <article class="panel">
             <div class="panel-heading"><div><p class="eyebrow">ACCOUNT</p><h2>平台账号</h2></div></div>
             <form id="settings-form" class="stack-form">
@@ -339,7 +295,7 @@
               <label>洛谷数字 UID<input name="luogu" inputmode="numeric" pattern="[0-9]+"></label>
               <label>目标 CF rating<input name="target_rating" type="number" min="800" max="4000" step="100"></label>
               <label class="check"><input name="skip_validate" type="checkbox">离线保存（跳过账号验证）</label>
-              <button class="button primary" type="submit">保存设置</button>
+              <button id="settings-save-button" class="button primary" type="submit">保存设置</button>
             </form>
           </article>
           <article class="panel">
@@ -348,7 +304,32 @@
             <div class="settings-actions"><button id="plan-check-button" class="button secondary">校验 30 天题单</button><button id="shutdown-button" class="button danger">停止本地服务</button></div>
             <div id="plan-result" class="result-box hidden"></div>
           </article>
-          <article class="panel">
+          <article class="panel appearance-panel">
+            <div class="panel-heading"><div><p class="eyebrow">APPEARANCE</p><h2>外观</h2></div></div>
+            <div class="appearance-preview" id="appearance-preview">
+              <img id="appearance-preview-image" alt="当前背景预览">
+              <div id="appearance-preview-empty" class="appearance-preview-empty">未设置背景</div>
+            </div>
+            <input id="background-file-input" class="sr-only" type="file" accept="image/jpeg,image/png,image/webp" aria-hidden="true" tabindex="-1">
+            <div class="appearance-actions">
+              <button id="background-select-button" class="button primary" type="button">选择图片</button>
+              <button id="background-remove-button" class="button secondary" type="button" disabled>移除背景</button>
+            </div>
+            <p class="subtle appearance-note">图片仅保存在当前浏览器 · 支持 JPG、PNG、WebP，最大 20 MiB</p>
+            <fieldset class="appearance-fieldset">
+              <legend>裁剪比例</legend>
+              <div class="ratio-options" id="appearance-ratio-options">
+                <label><input class="sr-only" type="radio" name="appearance_ratio" value="16:9" checked><span>16:9</span></label>
+                <label><input class="sr-only" type="radio" name="appearance_ratio" value="16:10"><span>16:10</span></label>
+                <label><input class="sr-only" type="radio" name="appearance_ratio" value="4:3"><span>4:3</span></label>
+              </div>
+            </fieldset>
+            <label class="appearance-opacity-label" for="appearance-opacity"><span>面板不透明度</span><output id="appearance-opacity-value" for="appearance-opacity">72%</output></label>
+            <input id="appearance-opacity" class="appearance-range" type="range" min="60" max="92" step="4" value="72">
+            <div class="appearance-mini-preview" aria-hidden="true"><span></span><span></span></div>
+            <button id="appearance-reset-button" class="button secondary wide" type="button">恢复默认</button>
+          </article>
+          <article class="panel ai-settings-panel">
             <div class="panel-heading"><div><p class="eyebrow">DEEPSEEK BYOK</p><h2>AI 设置</h2></div><span id="ai-key-state" class="badge neutral">未检测</span></div>
             <p class="subtle">可直接在这里保存并启用。密钥由 Windows DPAPI 按当前登录用户加密，服务重启后自动恢复；明文不会写入 JSON、SQLite、日志或接口响应。</p>
             <form id="ai-credential-form" class="stack-form credential-form">
@@ -373,6 +354,28 @@
   </div>
 
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <dialog id="background-crop-dialog" class="dialog background-crop-dialog" aria-labelledby="background-crop-title">
+    <form method="dialog" class="dialog-shell background-crop-shell">
+      <div class="dialog-heading"><div><p class="eyebrow">BACKGROUND</p><h2 id="background-crop-title">裁剪背景图片</h2></div><button class="icon-button dialog-close" value="cancel" aria-label="关闭裁剪对话框">×</button></div>
+      <p class="subtle crop-instruction">拖动图片调整位置；聚焦画布后可使用方向键微调。</p>
+      <div class="crop-canvas-shell">
+        <canvas id="background-crop-canvas" tabindex="0" aria-label="背景图片裁剪区域，可拖动或使用方向键调整位置"></canvas>
+      </div>
+      <div class="crop-controls">
+        <label class="crop-zoom-label" for="background-crop-zoom"><span>缩放</span><output id="background-crop-zoom-value" for="background-crop-zoom">100%</output></label>
+        <input id="background-crop-zoom" class="appearance-range" type="range" min="100" max="300" step="1" value="100">
+        <fieldset class="appearance-fieldset crop-ratio-fieldset">
+          <legend>裁剪比例</legend>
+          <div class="ratio-options" id="crop-ratio-options">
+            <label><input class="sr-only" type="radio" name="crop_ratio" value="16:9" checked><span>16:9</span></label>
+            <label><input class="sr-only" type="radio" name="crop_ratio" value="16:10"><span>16:10</span></label>
+            <label><input class="sr-only" type="radio" name="crop_ratio" value="4:3"><span>4:3</span></label>
+          </div>
+        </fieldset>
+      </div>
+      <div class="dialog-actions"><button class="button secondary" value="cancel">取消</button><button id="background-crop-apply" class="button primary" type="button">应用背景</button></div>
+    </form>
+  </dialog>
   <dialog id="plan-import-dialog" class="dialog plan-import-dialog">
     <form method="dialog" class="dialog-shell">
       <div class="dialog-heading"><div><p class="eyebrow">IMPORT</p><h2>导入题单 JSON</h2></div><button class="icon-button dialog-close" value="cancel" aria-label="关闭">×</button></div>
@@ -381,6 +384,43 @@
       <div id="plan-import-errors" class="import-errors hidden" role="alert"></div>
       <label id="plan-replace-confirm" class="check hidden"><input type="checkbox">我确认用导入内容替换同 ID 题单</label>
       <div class="dialog-actions"><button class="button secondary" value="cancel">取消</button><button id="plan-import-confirm" class="button primary" type="button" disabled>确认导入</button></div>
+    </form>
+  </dialog>
+  <dialog id="ai-plan-import-dialog" class="dialog ai-plan-import-dialog" aria-labelledby="ai-plan-import-title">
+    <form method="dialog" class="dialog-shell ai-plan-import-shell">
+      <div class="dialog-heading"><div><p class="eyebrow">AI PLAN IMPORT</p><h2 id="ai-plan-import-title">AI 快速导入题单</h2></div><button class="icon-button dialog-close" value="cancel" aria-label="关闭 AI 快速导入">×</button></div>
+      <section id="ai-plan-request-step" class="ai-plan-request-step" aria-label="生成题单草稿">
+        <fieldset class="ai-plan-mode-fieldset">
+          <legend>导入方式</legend>
+          <div class="ai-plan-mode-options">
+            <label><input type="radio" name="ai_plan_mode" value="organize" checked><span><strong>整理已有题目</strong><small>识别自然语言、Markdown、题号和链接，最多 200 题</small></span></label>
+            <label><input type="radio" name="ai_plan_mode" value="generate"><span><strong>按目标生成</strong><small>从本地题库选择匹配训练目标的题目</small></span></label>
+          </div>
+        </fieldset>
+        <label>自然语言描述<textarea id="ai-plan-text" rows="6" maxlength="20000" placeholder="例如：第一阶段整理 CF1A、P3374；第二阶段做 P3372，并标记为提高。"></textarea></label>
+        <div id="ai-plan-generate-controls" class="ai-plan-generate-controls hidden">
+          <label>题目数量<input id="ai-plan-task-count" type="number" min="1" max="30" value="12"></label>
+          <label class="check"><input id="ai-plan-include-completed" type="checkbox">允许纳入 AC 或 Skip 题目</label>
+        </div>
+        <details class="ai-plan-privacy">
+          <summary>发送给 AI 的数据边界</summary>
+          <div><p>两种模式都会发送你在上方主动输入的文本。</p><p>整理模式还会发送识别题目的公共名称和平台原始标签。生成模式首轮只发送核心提示、目标文本、题数与输出约束；补题轮次还会发送已接受、需排除的题号和剩余数量，但不会说明题号是否为 AC 或 Skip。</p><p>生成模式不发送候选摘要、题名、平台标签或完成状态；进行中的题目始终在本地排除。不会发送账号、UID、提交详情、源码、聊天、现有题单、用户标签覆盖、本机路径、API Key 或运行 token。</p></div>
+        </details>
+        <div id="ai-plan-request-error" class="import-errors hidden" role="alert"></div>
+        <div class="dialog-actions"><button class="button secondary" value="cancel">取消</button><button id="ai-plan-generate" class="button primary" type="button">生成可编辑草稿</button></div>
+      </section>
+      <div id="ai-plan-progress" class="ai-plan-progress hidden" aria-live="polite" aria-atomic="true">
+        <progress max="100"></progress><div><strong>AI 正在整理题单…</strong><span class="ai-plan-progress-facts"><small id="ai-plan-progress-round"></small><small id="ai-plan-progress-count"></small></span><small>预览阶段不会写入任何题单。</small></div><button id="ai-plan-cancel-job" class="button secondary" type="button">取消生成</button>
+      </div>
+      <section id="ai-plan-draft-step" class="ai-plan-draft-step hidden" aria-label="编辑并校验题单草稿">
+        <div id="ai-plan-summary" class="import-summary" aria-live="polite"></div>
+        <div id="ai-plan-errors" class="import-errors hidden" role="alert"></div>
+        <div id="ai-plan-warnings" class="import-warnings hidden" role="status"></div>
+        <div id="ai-plan-draft-editor" class="ai-plan-draft-editor"></div>
+        <details class="ai-plan-json-details"><summary>查看 canonical JSON</summary><pre id="ai-plan-json" class="json-preview"></pre></details>
+        <label id="ai-plan-replace-confirm" class="check hidden"><input type="checkbox">我确认用导入内容替换同 ID 题单</label>
+        <div class="dialog-actions"><button id="ai-plan-back" class="button secondary" type="button">返回重新生成</button><button class="button secondary" value="cancel">取消</button><button id="ai-plan-import-confirm" class="button primary" type="button" disabled>确认导入</button></div>
+      </section>
     </form>
   </dialog>
   <dialog id="plan-tags-dialog" class="dialog plan-tags-dialog" aria-labelledby="plan-tags-title">

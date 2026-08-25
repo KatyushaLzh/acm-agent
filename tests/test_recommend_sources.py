@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import date
-from math import ceil
 import unittest
 
 from tools.acm_agent.recommend import plan_fairness_order, recommend
@@ -69,23 +68,21 @@ class RecommendationSourceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "source_mode"):
             recommend(catalogs, source_mode="anything")
 
-    def test_balanced_cap_uses_ceiling_and_never_overflows(self):
+    def test_balanced_is_an_uncapped_union(self):
         plans = [plan_task(f"CF{100 + index}A", "p1") for index in range(6)]
         for count in (1, 2, 3, 4, 5):
             result = recommend([], plan_tasks=plans, now=TODAY, count=count)
-            expected_cap = ceil(2 * count / 3)
-            self.assertEqual(len(result), min(len(plans), expected_cap))
-            self.assertLessEqual(sum(item.source == "plan" for item in result), expected_cap)
+            self.assertEqual(len(result), min(len(plans), count))
 
         result = recommend(
-            [catalog("CF1A")],
+            [catalog("CF999A")],
             plan_tasks=plans,
             source_mode="balanced",
             now=TODAY,
             count=3,
         )
         self.assertEqual(len(result), 3)
-        self.assertEqual(sum(item.source == "plan" for item in result), 2)
+        self.assertEqual(sum(item.source == "plan" for item in result), 3)
 
     def test_duplicate_problem_merges_catalog_metadata_and_every_plan_source(self):
         result = recommend(
@@ -128,7 +125,7 @@ class RecommendationSourceTests(unittest.TestCase):
             [item.problem_id for item in backward],
         )
 
-    def test_plan_fairness_prefers_unseen_then_least_recent(self):
+    def test_plan_fairness_helper_is_not_a_recommendation_tie_break(self):
         history = [
             {"plan_sources": [{"plan_id": "alpha"}]},
             {"plan_id": "gamma"},
@@ -147,7 +144,7 @@ class RecommendationSourceTests(unittest.TestCase):
             now=TODAY,
             count=1,
         )
-        self.assertEqual(result[0].plan_sources[0].plan_id, "beta")
+        self.assertEqual(result[0].plan_sources[0].plan_id, "alpha")
 
     def test_plan_ids_filter_applies_before_duplicate_merge(self):
         result = recommend(

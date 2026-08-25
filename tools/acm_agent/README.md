@@ -22,12 +22,13 @@ Python 3.13 标准库驱动的本地训练系统。网页是主要入口，CLI �
 .\acm.ps1 status
 .\acm.ps1 next
 .\acm.ps1 ai status
-.\acm.ps1 next --ai
+.\acm.ps1 next --ai --ai-mode gap_fill
+.\acm.ps1 next --ai --ai-mode specialization
 .\acm.ps1 plan list
 .\acm.ps1 plan import .\my-plan.json
 ```
 
-`init` 会验证 Codeforces handle 和洛谷数字 UID。只有需要先离线建库时才使用 `--skip-validate`。
+网页首次保存 Codeforces handle 和洛谷数字 UID 时会先验证并持久化账号，然后直接进入主界面；完整 CF/洛谷目录与已 AC 洛谷题标签改由后台 job 抓取，“设置 → 保存设置”在 job 运行期间显示“正在抓取…”。CLI `init` 仍等待同步完成。任一洛谷目录分页失败都不会写入残缺目录，但账号与公开 AC 记录会保留并报告 partial。只有需要先离线建库时才使用 `--skip-validate`；该选项不发起同步或标签请求。
 
 ## 一次做题闭环
 
@@ -35,18 +36,15 @@ Python 3.13 标准库驱动的本地训练系统。网页是主要入口，CLI �
 .\acm.ps1 next --count 3 --mode mixed
 .\acm.ps1 start CF1234A --with-stress
 .\acm.ps1 verify CF1234A
-.\acm.ps1 verify CF1234A --ai-stress
-.\acm.ps1 verify CF1234A --ai-stress --validator --strict  # validator 完整严格认证，失败不创建 run
-.\acm.ps1 verify CF1234A --ai-stress --minimal --unvalidated-large  # Dashboard 默认验证 + 极限大数据
 .\acm.ps1 close CF1234A
 .\acm.ps1 review week
 ```
 
-样例放在 `.acm/cases/CF1234A/name.in` 与同名 `.out`。默认按 token 比较；`verify --exact` 改为字节比较。存在同目录的 `CF1234A.bf.cpp` 和 `CF1234A.gen.cpp` 时会自动对拍，失败资产保存在 `.acm/failures/`。
+样例放在 `.acm/cases/CF1234A/name.in` 与同名 `.out`。默认按 token 比较；`verify --exact` 改为字节比较。存在同目录的 `CF1234A.bf.cpp` 和 `CF1234A.gen.cpp` 时会自动执行有限本地对拍，可用 `--stress-iterations` 与 `--seed` 控制次数和种子，失败资产保存在 `.acm/failures/`。
 
 所有读取状态的命令都支持 `--json`。推荐输出包含数据新鲜度、位置、总分、每项分数和选择原因；平台同步失败不会删除最后一次成功快照。
 
-网页与 CLI 直接调用同一业务服务层，不通过子进程互相调用。受支持的旧版 `.acm/state.db` 会自动升级到当前 schema v16；直接打开 v4–v13 数据库时，会在首个受保护迁移前通过 SQLite backup API 创建相邻的版本化 `.bak`，已有备份不会被覆盖。
+网页与 CLI 直接调用同一业务服务层，不通过子进程互相调用。受支持的旧版 `.acm/state.db` 会自动升级到当前 schema v17。v16→v17 会删除已退役的持久化 stress 状态，因此无论直接从 v16 打开还是从更早版本跨版本升级，迁移前都会通过 SQLite backup API 创建相邻的 `state.db.v16.bak`；该备份保留 v16 stress 表与记录，失败重试或后续重复打开都不会覆盖已有备份。
 
 ## DeepSeek BYOK 与 AI 工作台
 
@@ -56,26 +54,19 @@ AI 功能是显式 opt-in：普通 `next` 和原有工作流不会因为检测�
 $env:DEEPSEEK_API_KEY = "你的密钥"
 .\acm.ps1 ai status
 .\acm.ps1 ai test
-.\acm.ps1 next --ai --count 3
+.\acm.ps1 next --ai --ai-mode gap_fill --count 3
+.\acm.ps1 next --ai --ai-mode specialization --count 3
 ```
 
 网页可随时替换或清除已加密凭据。若同时存在 DPAPI 凭据和环境变量，DPAPI 凭据优先；清除后仍可回退到环境变量。
 
-推荐和对话默认使用 `deepseek-v4-flash`，可分别改为 `deepseek-v4-pro`。推荐始终先由确定性引擎生成合规候选，DeepSeek 只重排候选；网络、鉴权、余额、限流、非法 JSON 或越权题号都会回退到原确定性顺序，并保留原有分数、分项和原因。
+推荐和对话默认使用 `deepseek-v4-flash`，可分别改为 `deepseek-v4-pro`。`gap_fill`（查漏补缺）从不同 AC 题数较少的知识板块选择，`specialization`（专项强化）从不同 AC 题数较多的知识板块选择。两者始终先由确定性引擎生成合规候选，保留当前题数、训练模式、来源模式和题单过滤；网络、鉴权、余额、限流、非法 JSON 或越权题号都会在同一知识覆盖模式内确定性回退，并保留原有分数、分项和原因。
+
+普通推荐与 AI 推荐共用三段难度分布，按三题一组循环：当前 CF rating +100、Codeforces 与洛谷各最近 50 道不同已解决题目的 CF 等效难度合并平均值、目标 CF rating。每个位置优先选择最接近本槽难度的候选；AI 候选构造、最终重排和模式内回退也遵循同一槽位目标。响应的 `difficulty_profile` 会给出三个目标与近期样本覆盖情况。
 
 做题工作台支持按题目持久化的流式对话、1–3 级提示、4 级代码诊断，以及“生成带错误说明注释的完整候选源码 → C++ 语法高亮预览 → 用户确认 → 备份并验证”的补丁流程。预览区只显示修改后的完整代码，不展示 unified diff；diff 仍由服务端生成并保留用于审计和安全应用。切换题号时会恢复该 active attempt 对应的会话，不会把另一道题的消息混入当前面板。“清除本题对话”会归档旧会话并创建新的空会话；旧消息不再参与后续模型上下文，但仍保留提示等级、token 用量和补丁审计。题面自动抓取仅读取 Codeforces 的 `.problem-statement` 或洛谷公开题面字段，不读取题解；失败时可粘贴人工题面，人工版本优先并可显式恢复自动版本。补丁应用前校验受管 `.cpp` 路径与基线 SHA-256，冲突不会覆盖新修改，验证失败也不会自动回滚。
 
-首次发送前，Dashboard 会提示数据出站范围。AI 推荐只发送最多 90 天/50 次尝试的结构化结果与冻结标签，不发送账号、notes、聊天、源码或本地路径；工作台对话会发送当前题面、有效标签、源码、attempt 和最近对话，但不会发送账号、文件路径或 API Key。`reasoning_content` 不展示也不保存。
-
-“本地验证”的 AI 持续对拍同样默认关闭。准备总 deadline 默认 600 秒，可配置为 60–1800 秒；默认档在 480 秒关闭 provider、590 秒结束本地门禁，最后 10 秒 shutdown/清理。AI 不再生成 brute，而是优先从白名单来源搜索两份不同 URL、不同源码哈希的完整正确解候选；不足时以互相不可见、也不可见用户源码的独立请求生成满足最大约束的 reference。生成或下载的 artifact 会按机器诊断做有界修复，generator、每份 reference 与 validator 的具体上限由失败类别决定，部分源码安全或样例失败允许第二次修复。AppContainer、官方样例、16-case 变异检查、边界和 large 门禁均保留；Dashboard 的默认 Minimal 会跳过 validator 与 AI audit，并放宽通用 manifest/非-recipe coverage，但本地 recipe coverage 和 seed/output variation 仍执行。任何失败或超时都保留旧 helper 且不创建 run。
-
-validator 是可选的输入认证角色。默认不生成 validator，small 与 large 均运行 `reference_primary/reference_secondary`；两者一致后才能裁决用户解，两者不一致立即 `oracle_conflict`，不自动猜测或修复任一方。Dashboard 提供默认未勾选的“启用 validator（启用该选项会执行完整严格认证，显著提高AI对拍器正确性，但是成功生成率会显著下降）”选项；勾选后会要求 validator 生成、隐藏正负 probe 认证、源码安全、编译、AI audit、机器门禁和联合 preflight 全部成功。修复耗尽后任一步失败都不允许降级，不应用 helper、不创建 run，并统一报告 validator 严格认证失败。CLI 的等价用法是 `verify <ID> --ai-stress --validator --strict`；只有显式使用 `--validator` 且未加 `--strict` 时，才保留 `unvalidated` 降级与 `--unvalidated-large` 选项。新 helper 为 `<ID>.ref1.cpp/.ref2.cpp`，手动 CLI 入口为 `--generator-file/--reference-primary-file/--reference-secondary-file`；旧 `--reference-file/--brute-file` 仅作弃用别名。
-
-Dashboard 的 generator、两份 reference 和新增 Markdown 目标都通过系统原生文件选择器选择，不接受网页文本框手输路径。手动 helper 可以位于工作区外，但必须是现有的本机普通 `.cpp` 文件；服务只读原文件，将副本放入受管 staging 后仍执行源码审查、编译与 AppContainer 门禁。Markdown 选择器可选现有 `.md`，也可指定一个尚不存在的新 `.md`，注册时仍需完成“检查路径/schema → 再次确认保存”。AI 对拍准备不会暂停等待人工审核 contract 或输入修复提示；机器门禁失败时仅使用有界的模型自动修复，最终失败则直接安全停止。
-
-contract schema v3 与 generator blueprint 在源码生成前本地验证证据、seed、覆盖闭合和 large 复杂度。新 bundle 以 `dual_reference_v1` 保存双 reference candidate/proof/联合认证并与旧 `legacy_trio` 缓存隔离；validator 开关也是缓存身份的一部分。严格模式只复用同时具有 validator 源码 artifact、release executable、完整认证记录和 validator preflight 成功证据的 bundle；无 validator、曾降级或历史缓存不能满足严格模式。这里的“零误放”是针对这套现有门禁的 fail-closed 运行保证，不代表数学上证明 AI validator 绝对正确。旧 `.bf.cpp/.ref.cpp` bundle 只用于历史 run 的查看、恢复和回滚。
-
-静态输入 contract 先尝试完全本地的 `generator_recipe/v2`。当前 v2 只识别 `mutable_permutation` 与 `bracket_interval_queries` 两类 wire shape：本地编译器把 contract 的字段、范围、状态机和四个 profile-v2 case 绑定到内置、哈希绑定的 C++17 机器 runtime，不发送 recipe 请求，也不接收模型生成的 executable generator。受支持 v2 contract 的预验失败会 fail-closed，不回退到 AI。其他 contract 才尝试 `generator_recipe/v1`：AI 只选择白名单 `template_id`、serializer、参数绑定和语义目标，本地 composer 内联审计过的 primitive；再不支持才记录 `legacy_ai_cpp:<reason>`。两版都输出 `acm_generate_case(seed, profile, case_kind, out)` ABI；recipe/contract hash、catalog hash 与 composer version 进入 cache/checkpoint/certification identity，模板、license 或 provenance 变化会使缓存失效。v2 只消除 generator 的 provider 请求；contract 提取和两份 reference 的获取仍可能使用网络或模型。
+首次发送前，Dashboard 会提示数据出站范围。AI 推荐只发送已分类的去重平台 AC 摘要（题号、平台、难度、可用的接受日期和知识板块）与确定性候选；不发送账号、handle、UID、submission ID、raw JSON、语言、notes、聊天、源码、本机路径、API Key 或运行 token。AI 题单导入会发送用户主动输入的文本；整理模式额外发送已识别题目的公共名称和平台原始标签。生成模式不批量发送本地候选摘要：首轮只发送文本、题数、支持平台与 JSON 约束，补题轮次额外发送此前接受/排除的严格 `problem_ids` 和剩余数，不发送拒绝原因、本地完成状态或题库存在性细节。题单导入不发送账号、UID、提交详情、源码、聊天、现有题单、用户标签覆盖、本机路径、API Key 或运行 token；`ai_runs` 记录 `kind=plan_import`、聚合模型用量、轮数和脱敏请求摘要，不保存输入原文、题号或 thinking 内容。工作台对话会发送当前题面、有效标签、源码、attempt 和最近对话，但不会发送账号、文件路径或 API Key。`reasoning_content` 不展示也不保存。
 
 常用 CLI：
 
@@ -94,11 +85,29 @@ contract schema v3 与 generator blueprint 在源码生成前本地验证证据�
 
 题单使用 `plan.json` v2，可包含任意数量的阶段和题目。网页“题单”页默认只读；进入某个阶段的编辑模式后，可增删题目并修改题号、名称和标签。解锁/截止日期统一属于阶段。编辑即时保存，每个写操作带修订号；冲突时会要求刷新，最近 5 个版本可以恢复。
 
+题单页同时保留“导入 JSON”和“AI 快速导入”。后者先提交异步 job，再进入可编辑预览：
+
+```text
+POST /api/jobs/ai/plans/preview
+{"mode":"organize","text":"第一阶段：CF1A、P3374"}
+
+POST /api/jobs/ai/plans/preview
+{"mode":"generate","text":"生成一份线段树与树状数组强化题单","task_count":12,"include_completed":false}
+```
+
+`organize` 会从自然语言、Markdown、题号和官方链接识别最多 200 道 Codeforces/洛谷题。服务端固定允许题目集合，模型只能返回标题、描述、阶段、题目 level 与 note；增加、遗漏、重复题目，网络失败或非法 JSON 都会显示 `ai.fallback`，并生成保持原始顺序的单阶段草稿。缺少 API Key 时任务直接提示进入设置，不执行降级。
+
+`generate` 默认生成 12 道、上限 30 道，固定开启 thinking 并使用 `reasoning_effort=high`。模型每轮只能返回严格 JSON `{"problem_ids":[...]}`；服务端规范化并去重后，只接受本地题库中存在、没有 active session，并且在默认情况下不是 AC/Skip 的题号，`include_completed=true` 才允许后两类。有效题会跨轮累计，最多请求 5 轮；连续 2 轮没有新增时提前结束，全程不自动联网同步。
+
+生成结果始终由服务端确定性 lowering 为单阶段 canonical plan v2，模型不能生成阶段、URL 或最终题单结构。若 5 轮后有效题仍少于请求数量，job 返回带 `insufficient_valid_problems` error 的可编辑部分草稿，而不是填入无关题；部分草稿的确认导入按钮保持禁用，手工补足题目并重新预览通过后才可导入，也可调整目标或题数重新生成。
+
+成功 job 返回普通题单预览字段（`plan`、`errors`、`warnings`、`assumptions`、`unresolved`、`duplicate`、`current_revision`、`diff`）以及 `ai.run_id/model/usage/mode/fallback`；生成模式还报告脱敏的轮数、已接受题数和停止原因。模型复用 `recommendation_model`；生成模式固定使用 thinking/high，但 `reasoning_content` 不展示或保存。稳定 `plan_id`、阶段/任务键、官方 URL、公共题名与 canonical plan v2 都由本地服务生成。预览不会创建 `.acm/plans/` 文件或题单数据库记录；编辑后的完整草稿必须重新通过 `POST /api/plans/preview`，最后仍以 `POST /api/plans/import` 显式写入。带 `insufficient_valid_problems` error 的部分草稿不能导入。替换同 ID 题单必须确认并携带 `expected_revision`，HTTP 409 后重新预览。
+
 Codeforces/洛谷题量和占比无需写入题单文件。网页与 API 会从各阶段的主任务实时计算，替换候选不计入分母；增删题目后立即更新。旧题单中的 `platform_target` 可兼容导入，但规范化、导出或保存时会自动移除。
 
 导入文件会作为托管副本写入 `.acm/plans/`。删除题单或从题单删题只解除关联，不会删除平台 AC、session、复做记录或本地源码。内置数据结构题单的仓库源文件始终保持只读。
 
-推荐默认使用 `balanced` 来源：三题中最多两题来自已启用题单，其余从 Codeforces/洛谷题库补充。也可选择 `catalog_only`、`plan_only`，或限定参与推荐的题单。
+推荐默认使用 `balanced` 来源：已启用题单与 Codeforces/洛谷题库组成普通并集，题单身份、日期和层级不加分、不参与平分优先级，也没有题单数量配额。也可选择 `catalog_only`、`plan_only`，或限定参与推荐的题单。
 
 ### 有效题目标签
 
@@ -118,7 +127,7 @@ Agent 在网页服务未运行时可使用同一事务流程：
 
 preview JSON 会携带题单和全局覆盖两个修订号，CLI apply 会自动读取并校验。平台没有公开标签且用户明确要求补充时，仓库 `acm-workflow` skill 允许 Agent 只读取题面和元数据来生成专题标签，再通过上述 apply/API 写回托管题单；不得直接修改内置题单源文件。标签只描述题目专题，不代表 AC。
 
-`close` 始终先独立保存 attempt，不会自动修改知识库。“结束与复盘”可显式启用 DeepSeek Markdown 总结：发行树根目录经维护者授权公开的 `algorithms.md`、`tricks.md` 题目知识记录会以固定 schema 自动成为已保存目标，其他 `.md` 可推断或自定义 schema。Dashboard 只显示可编辑 Markdown 与安全渲染预览，不展示 unified diff；确认 apply 前目标保持零修改。若 `Source` 题号完全相同，服务只把对应旧条目发送给 DeepSeek，与本次知识语义合并；标题相似但题号不同则新增条目。服务端继续以 proposal revision、基线哈希、备份、原子替换和 hash-guarded revert 保护写入。
+`close` 始终先独立保存 attempt，不会自动修改知识库。“结束与复盘”可显式启用 DeepSeek Markdown 总结：发行树根目录的脱敏 `algorithms.md`、`tricks.md` 示例模板会以固定 schema 自动成为已保存目标，其他 `.md` 可推断或自定义 schema。Dashboard 只显示可编辑 Markdown 与安全渲染预览，不展示 unified diff；确认 apply 前目标保持零修改。若 `Source` 题号完全相同，服务只把对应旧条目发送给 DeepSeek，与本次知识语义合并；标题相似但题号不同则新增条目。服务端继续以 proposal revision、基线哈希、备份、原子替换和 hash-guarded revert 保护写入。
 
 ## 开发验证
 

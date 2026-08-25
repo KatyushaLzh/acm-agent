@@ -1,22 +1,22 @@
 """AI conversation, message, run, and patch proposal persistence."""
 
 from __future__ import annotations
-import json
+
+import hashlib
 import sqlite3
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
+
 from .storage_common import (
-    StressSetupSlotConflict,
     _UNSET,
     _json,
     _merge_json_objects,
-    _process_is_alive,
     utc_now,
 )
 
 class _AiStorageMixin:
     def reconcile_interrupted_ai_state(self) -> None:
-        """Close AI and stress state left in-flight by a previous process."""
+        """Close AI state left in-flight by a previous process."""
 
         stamp = utc_now()
         with self.atomic():
@@ -27,28 +27,9 @@ class _AiStorageMixin:
             )
             self.connection.execute(
                 """UPDATE ai_runs SET status='interrupted',completed_at=?
-                   WHERE status IN ('pending','running')
-                     AND kind<>'stress_setup'""",
+                   WHERE status IN ('pending','running')""",
                 (stamp,),
             )
-            setup_rows = self.query(
-                """SELECT id,preparation_meta_json FROM ai_runs
-                   WHERE kind='stress_setup' AND status='running'"""
-            )
-            for row in setup_rows:
-                try:
-                    metadata = json.loads(str(row["preparation_meta_json"] or "{}"))
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    metadata = {}
-                owner_pid = metadata.get("owner_pid") if isinstance(metadata, Mapping) else None
-                if _process_is_alive(owner_pid):
-                    continue
-                self.connection.execute(
-                    """UPDATE ai_runs SET status='interrupted',completed_at=?
-                       WHERE id=? AND status='running'""",
-                    (stamp, str(row["id"])),
-                )
-            self._reconcile_interrupted_stress_state(stamp)
 
     def get_or_create_ai_conversation(
         self,
@@ -293,44 +274,24 @@ class _AiStorageMixin:
         status: str = "pending",
         conversation_id: str | None = None,
         message_id: str | None = None,
-        preparation_meta: Mapping[str, Any] | None = None,
         created_at: str | None = None,
     ) -> sqlite3.Row:
-        try:
-            self.connection.execute(
-                """INSERT INTO ai_runs(
-                       id,kind,model,conversation_id,message_id,
-                       request_summary_json,status,preparation_meta_json,created_at)
-                   VALUES(?,?,?,?,?,?,?,?,?)""",
-                (
-                    str(run_id),
-                    kind,
-                    model,
-                    conversation_id,
-                    message_id,
-                    _json(request_summary or {}),
-                    status,
-                    _json(preparation_meta or {}),
-                    created_at or utc_now(),
-                ),
-            )
-        except sqlite3.IntegrityError as exc:
-            constraint = getattr(exc, "sqlite_errorcode", None)
-            if (
-                str(kind) == "stress_setup"
-                and str(status) == "running"
-                and constraint
-                in {
-                    sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY,
-                    sqlite3.SQLITE_CONSTRAINT_UNIQUE,
-                }
-            ):
-                active = self.active_stress_setup_run()
-                if active is not None:
-                    raise StressSetupSlotConflict(
-                        str(run_id), str(active["id"])
-                    ) from None
-            raise
+        self.connection.execute(
+            """INSERT INTO ai_runs(
+                   id,kind,model,conversation_id,message_id,
+                   request_summary_json,status,created_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                str(run_id),
+                kind,
+                model,
+                conversation_id,
+                message_id,
+                _json(request_summary or {}),
+                status,
+                created_at or utc_now(),
+            ),
+        )
         row = self.ai_run(str(run_id))
         assert row is not None
         return row
@@ -339,15 +300,18 @@ class _AiStorageMixin:
         self,
         run_id: str,
         *,
+        request_summary: Mapping[str, Any] | object = _UNSET,
         status: str | object = _UNSET,
         finish_reason: str | None | object = _UNSET,
         usage: Mapping[str, Any] | object = _UNSET,
         error: Mapping[str, Any] | object = _UNSET,
-        preparation_meta: Mapping[str, Any] | object = _UNSET,
         completed_at: str | None | object = _UNSET,
     ) -> sqlite3.Row:
         assignments: list[str] = []
         values: list[Any] = []
+        if request_summary is not _UNSET:
+            assignments.append("request_summary_json=?")
+            values.append(_json(request_summary))
         for column, value in (
             ("status", status),
             ("finish_reason", finish_reason),
@@ -362,32 +326,12 @@ class _AiStorageMixin:
         if error is not _UNSET:
             assignments.append("error_json=?")
             values.append(_json(error))
-        if preparation_meta is not _UNSET and not isinstance(
-            preparation_meta, Mapping
-        ):
-            raise TypeError("preparation_meta must be a mapping")
         if not assignments:
-            if preparation_meta is not _UNSET:
-                return self.merge_ai_run_preparation_meta(
-                    str(run_id), preparation_meta
-                )
             row = self.ai_run(str(run_id))
             if row is None:
                 raise KeyError(f"AI run {run_id!r} not found")
             return row
         with self.atomic():
-            if preparation_meta is not _UNSET:
-                current = self.ai_run(str(run_id))
-                if current is None:
-                    raise KeyError(f"AI run {run_id!r} not found")
-                assignments.append("preparation_meta_json=?")
-                values.append(
-                    _json(
-                        _merge_json_objects(
-                            current["preparation_meta_json"], preparation_meta
-                        )
-                    )
-                )
             values.append(str(run_id))
             cursor = self.connection.execute(
                 f"UPDATE ai_runs SET {','.join(assignments)} WHERE id=?", values
@@ -398,30 +342,157 @@ class _AiStorageMixin:
         assert row is not None
         return row
 
-    def merge_ai_run_preparation_meta(
-        self, run_id: str, updates: Mapping[str, Any]
-    ) -> sqlite3.Row:
-        """Deep-merge durable preparation timings/cache/failure metadata."""
-
-        if not isinstance(updates, Mapping):
-            raise TypeError("updates must be a mapping")
-        with self.atomic():
-            row = self.ai_run(str(run_id))
-            if row is None:
-                raise KeyError(f"AI run {run_id!r} not found")
-            merged = _merge_json_objects(row["preparation_meta_json"], updates)
-            self.connection.execute(
-                "UPDATE ai_runs SET preparation_meta_json=? WHERE id=?",
-                (_json(merged), str(run_id)),
-            )
-        updated = self.ai_run(str(run_id))
-        assert updated is not None
-        return updated
-
     def ai_run(self, run_id: str) -> sqlite3.Row | None:
         return self.connection.execute(
             "SELECT * FROM ai_runs WHERE id=?", (str(run_id),)
         ).fetchone()
+
+    def upsert_problem_sample(
+        self,
+        platform: str,
+        problem_id: str,
+        sample_key: str,
+        *,
+        input_data: bytes | bytearray | memoryview | str,
+        expected_output: bytes | bytearray | memoryview | str,
+        source: str = "problem_context",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> sqlite3.Row:
+        """Insert or refresh one named statement sample, deduplicating content."""
+
+        selected_platform = str(platform).strip()
+        selected_problem = str(problem_id).strip()
+        selected_key = str(sample_key).strip()
+        selected_source = str(source).strip() or "problem_context"
+        if not selected_platform or not selected_problem or not selected_key:
+            raise ValueError("platform, problem_id, and sample_key must not be empty")
+        if metadata is not None and not isinstance(metadata, Mapping):
+            raise TypeError("metadata must be a mapping")
+
+        def as_bytes(value: bytes | bytearray | memoryview | str) -> bytes:
+            if isinstance(value, str):
+                return value.encode("utf-8")
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return bytes(value)
+            raise TypeError("sample input and output must be bytes or strings")
+
+        input_bytes = as_bytes(input_data)
+        output_bytes = as_bytes(expected_output)
+        digest = hashlib.sha256()
+        digest.update(len(input_bytes).to_bytes(8, "big"))
+        digest.update(input_bytes)
+        digest.update(len(output_bytes).to_bytes(8, "big"))
+        digest.update(output_bytes)
+        content_hash = digest.hexdigest()
+        stamp = utc_now()
+        with self.atomic():
+            by_key = self.connection.execute(
+                """SELECT * FROM problem_samples
+                   WHERE platform=? AND problem_id=? AND sample_key=?""",
+                (selected_platform, selected_problem, selected_key),
+            ).fetchone()
+            by_content = self.connection.execute(
+                """SELECT * FROM problem_samples
+                   WHERE platform=? AND problem_id=? AND content_hash=?""",
+                (selected_platform, selected_problem, content_hash),
+            ).fetchone()
+            if by_content is not None and (
+                by_key is None or int(by_content["id"]) != int(by_key["id"])
+            ):
+                if metadata:
+                    merged = _merge_json_objects(by_content["metadata_json"], metadata)
+                    self.connection.execute(
+                        """UPDATE problem_samples
+                           SET metadata_json=?,updated_at=? WHERE id=?""",
+                        (_json(merged), stamp, int(by_content["id"])),
+                    )
+                row_id = int(by_content["id"])
+            elif by_key is None:
+                cursor = self.connection.execute(
+                    """INSERT INTO problem_samples(
+                           platform,problem_id,sample_key,input_data,expected_output,
+                           content_hash,source,metadata_json,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        selected_platform,
+                        selected_problem,
+                        selected_key,
+                        sqlite3.Binary(input_bytes),
+                        sqlite3.Binary(output_bytes),
+                        content_hash,
+                        selected_source,
+                        _json(metadata or {}),
+                        stamp,
+                        stamp,
+                    ),
+                )
+                row_id = int(cursor.lastrowid)
+            else:
+                merged = _merge_json_objects(by_key["metadata_json"], metadata or {})
+                self.connection.execute(
+                    """UPDATE problem_samples
+                       SET input_data=?,expected_output=?,content_hash=?,source=?,
+                           metadata_json=?,updated_at=? WHERE id=?""",
+                    (
+                        sqlite3.Binary(input_bytes),
+                        sqlite3.Binary(output_bytes),
+                        content_hash,
+                        selected_source,
+                        _json(merged),
+                        stamp,
+                        int(by_key["id"]),
+                    ),
+                )
+                row_id = int(by_key["id"])
+        row = self.connection.execute(
+            "SELECT * FROM problem_samples WHERE id=?", (row_id,)
+        ).fetchone()
+        assert row is not None
+        return row
+
+    def problem_samples(self, platform: str, problem_id: str) -> list[sqlite3.Row]:
+        return self.query(
+            """SELECT * FROM problem_samples
+               WHERE platform=? AND problem_id=? ORDER BY id""",
+            (str(platform), str(problem_id)),
+        )
+
+    def replace_problem_samples(
+        self,
+        platform: str,
+        problem_id: str,
+        samples: Sequence[Mapping[str, Any]],
+        *,
+        source: str = "problem_context",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> list[sqlite3.Row]:
+        """Atomically replace statement samples owned by one source."""
+
+        selected_platform = str(platform).strip()
+        selected_problem = str(problem_id).strip()
+        selected_source = str(source).strip() or "problem_context"
+        if not selected_platform or not selected_problem:
+            raise ValueError("platform and problem_id must not be empty")
+        normalized = list(samples)
+        with self.atomic():
+            self.connection.execute(
+                """DELETE FROM problem_samples
+                   WHERE platform=? AND problem_id=? AND source=?""",
+                (selected_platform, selected_problem, selected_source),
+            )
+            for ordinal, sample in enumerate(normalized, 1):
+                if not isinstance(sample, Mapping):
+                    raise TypeError("each sample must be a mapping")
+                self.upsert_problem_sample(
+                    selected_platform,
+                    selected_problem,
+                    str(sample.get("name") or f"sample{ordinal}"),
+                    input_data=sample.get("input", b""),
+                    expected_output=sample.get("output", b""),
+                    source=selected_source,
+                    metadata=metadata,
+                )
+        return self.problem_samples(selected_platform, selected_problem)
 
     def create_ai_patch_proposal(
         self,

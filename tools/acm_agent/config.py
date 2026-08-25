@@ -10,13 +10,7 @@ from typing import Any
 from .ai_policy import DEFAULT_MODEL, DEFAULT_REASONING_EFFORT
 
 
-CONFIG_VERSION = 7
-STRESS_PREPARE_TIMEOUT_DEFAULT_SECONDS = 600
-STRESS_PREPARE_TIMEOUT_MIN_SECONDS = 60
-STRESS_PREPARE_TIMEOUT_MAX_SECONDS = 1800
-STRESS_GENERATION_MODE_DEFAULT = "hybrid"
-STRESS_GENERATION_MODES = ("fast", "hybrid", "full_thinking")
-STRESS_CACHE_MODES = ("reuse", "refresh_helpers", "cold")
+CONFIG_VERSION = 8
 
 
 @dataclass(frozen=True)
@@ -84,16 +78,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "recommendation_model": DEFAULT_MODEL,
         "coaching_model": DEFAULT_MODEL,
         "summary_model": DEFAULT_MODEL,
-        "validation_model": DEFAULT_MODEL,
         "recommendation_thinking": False,
         "coaching_thinking": True,
         "summary_thinking": True,
-        "validation_thinking": True,
-        "stress_prepare_timeout_seconds": STRESS_PREPARE_TIMEOUT_DEFAULT_SECONDS,
-        "stress_generation_mode": STRESS_GENERATION_MODE_DEFAULT,
         "reasoning_effort": DEFAULT_REASONING_EFFORT,
         "summary_reasoning_effort": DEFAULT_REASONING_EFFORT,
-        "validation_reasoning_effort": DEFAULT_REASONING_EFFORT,
     },
 }
 
@@ -120,28 +109,9 @@ def _merge_defaults(defaults: Any, current: Any) -> Any:
     return merged
 
 
-def validate_stress_prepare_timeout_seconds(value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError("ai.stress_prepare_timeout_seconds must be an integer")
-    if not STRESS_PREPARE_TIMEOUT_MIN_SECONDS <= value <= STRESS_PREPARE_TIMEOUT_MAX_SECONDS:
-        raise ValueError(
-            "ai.stress_prepare_timeout_seconds must be between "
-            f"{STRESS_PREPARE_TIMEOUT_MIN_SECONDS} and "
-            f"{STRESS_PREPARE_TIMEOUT_MAX_SECONDS}"
-        )
-    return value
-
-
-def validate_stress_generation_mode(value: Any) -> str:
-    if not isinstance(value, str) or value not in STRESS_GENERATION_MODES:
-        allowed = ", ".join(STRESS_GENERATION_MODES)
-        raise ValueError(f"ai.stress_generation_mode must be one of: {allowed}")
-    return value
-
-
 def _upgrade_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     version = data.get("version")
-    if version not in (1, 2, 3, 4, 5, 6, CONFIG_VERSION):
+    if version not in (1, 2, 3, 4, 5, 6, 7, CONFIG_VERSION):
         raise ValueError(f"Unsupported config version: {version!r}")
     upgraded = _merge_defaults(DEFAULT_CONFIG, data)
     ai = upgraded.get("ai")
@@ -164,32 +134,17 @@ def _upgrade_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
                     "reasoning_effort",
                     DEFAULT_CONFIG["ai"]["summary_reasoning_effort"],
                 )
-        if version in (1, 2, 3):
-            # Stress verification is another coaching-style request: preserve
-            # an existing user's chosen model and reasoning settings during
-            # the v4 migration instead of silently switching them to defaults.
-            if "validation_model" not in source_ai:
-                ai["validation_model"] = ai.get(
-                    "coaching_model", DEFAULT_CONFIG["ai"]["validation_model"]
-                )
-            if "validation_thinking" not in source_ai:
-                ai["validation_thinking"] = ai.get(
-                    "coaching_thinking", DEFAULT_CONFIG["ai"]["validation_thinking"]
-                )
-            if "validation_reasoning_effort" not in source_ai:
-                ai["validation_reasoning_effort"] = ai.get(
-                    "reasoning_effort",
-                    DEFAULT_CONFIG["ai"]["validation_reasoning_effort"],
-                )
+        for retired_key in (
+            "validation_model",
+            "validation_thinking",
+            "validation_reasoning_effort",
+            "stress_prepare_timeout_seconds",
+            "stress_generation_mode",
+        ):
+            ai.pop(retired_key, None)
         for key in list(ai):
             if _is_sensitive_ai_key(key):
                 del ai[key]
-        ai["stress_prepare_timeout_seconds"] = validate_stress_prepare_timeout_seconds(
-            ai.get("stress_prepare_timeout_seconds")
-        )
-        ai["stress_generation_mode"] = validate_stress_generation_mode(
-            ai.get("stress_generation_mode")
-        )
     upgraded["version"] = CONFIG_VERSION
     return upgraded, upgraded != data
 

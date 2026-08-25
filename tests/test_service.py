@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from tools.acm_agent.service import AcmService
+from tools.acm_agent.platforms import SyncResult
 from tools.acm_agent.storage import Database
 from tools.acm_agent.config import Paths
 
@@ -83,6 +84,165 @@ class AcmServiceTests(unittest.TestCase):
             )
             self.assertFalse((root / ".acm/state.db").exists())
 
+    def test_validated_setup_immediately_syncs_both_platforms_and_tags(self) -> None:
+        class IdentityClient:
+            def user_info(self, identifier):
+                return {
+                    "handle": str(identifier),
+                    "name": str(identifier),
+                    "rating": 1600,
+                }
+
+        calls: list[tuple[str, str, bool]] = []
+        luogu_difficulties: list[int] = []
+        luogu_full_catalog: list[bool] = []
+
+        def sync_cf(db, handle, *, refresh_catalog=None):
+            calls.append(("codeforces", str(handle), bool(refresh_catalog)))
+            return SyncResult("codeforces", "fresh", problems=100)
+
+        def sync_lg(
+            db,
+            uid,
+            *,
+            refresh_catalog=None,
+            candidate_queries=None,
+            full_catalog=False,
+        ):
+            calls.append(("luogu", str(uid), bool(refresh_catalog)))
+            luogu_full_catalog.append(bool(full_catalog))
+            luogu_difficulties.extend(
+                int(query["difficulty"]) for query in candidate_queries or []
+            )
+            return SyncResult(
+                "luogu",
+                "partial",
+                accepted=55,
+                warnings=["one public problem page failed"],
+                tag_enrichment={
+                    "attempted": 55,
+                    "resolved": 54,
+                    "failed": 1,
+                    "remaining": 1,
+                    "cursor": "P1054",
+                    "errors": [],
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as temp:
+            service = AcmService(
+                Path(temp),
+                codeforces_client_factory=IdentityClient,
+                luogu_client_factory=IdentityClient,
+                sync_codeforces_fn=sync_cf,
+                sync_luogu_fn=sync_lg,
+            )
+            payload = service.setup("fixture", "42", target_rating=2100)
+
+        self.assertEqual(
+            calls,
+            [("codeforces", "fixture", True), ("luogu", "42", True)],
+        )
+        self.assertTrue(payload["initial_sync"]["ok"])
+        self.assertEqual(luogu_full_catalog, [True])
+        self.assertEqual(luogu_difficulties, [])
+        self.assertEqual(payload["tag_enrichment"]["attempted"], 55)
+        self.assertEqual(payload["tag_enrichment"]["failed"], 1)
+
+    def test_offline_setup_does_not_sync_or_complete_tags(self) -> None:
+        def unexpected_sync(*args, **kwargs):
+            self.fail("offline setup must not perform platform I/O")
+
+        with tempfile.TemporaryDirectory() as temp:
+            service = AcmService(
+                Path(temp),
+                sync_codeforces_fn=unexpected_sync,
+                sync_luogu_fn=unexpected_sync,
+            )
+            payload = service.setup("fixture", "42", skip_validate=True)
+
+        self.assertIsNone(payload["initial_sync"])
+        self.assertIsNone(payload["tag_enrichment"])
+
+    def test_deferred_setup_validates_and_saves_without_syncing(self) -> None:
+        class IdentityClient:
+            def user_info(self, identifier):
+                return {
+                    "handle": str(identifier),
+                    "name": str(identifier),
+                    "rating": 1600,
+                }
+
+        def unexpected_sync(*args, **kwargs):
+            self.fail("deferred web setup must leave synchronization to its job")
+
+        with tempfile.TemporaryDirectory() as temp:
+            service = AcmService(
+                Path(temp),
+                codeforces_client_factory=IdentityClient,
+                luogu_client_factory=IdentityClient,
+                sync_codeforces_fn=unexpected_sync,
+                sync_luogu_fn=unexpected_sync,
+            )
+            payload = service.setup("fixture", "42", defer_sync=True)
+            with Database(Path(temp) / ".acm" / "state.db") as db:
+                self.assertEqual(db.account("codeforces")["identifier"], "fixture")
+                self.assertEqual(db.account("luogu")["identifier"], "42")
+
+        self.assertTrue(payload["validated"])
+        self.assertTrue(payload["initial_sync_deferred"])
+        self.assertIsNone(payload["initial_sync"])
+        self.assertIsNone(payload["tag_enrichment"])
+
+    def test_recent_solved_difficulty_uses_latest_fifty_from_each_platform(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, Database(
+            Path(temp) / "state.db"
+        ) as db:
+            for index in range(51):
+                cf_id = f"{1000 + index}A"
+                luogu_id = f"P{1000 + index}"
+                db.upsert_problem(
+                    {
+                        "platform": "codeforces",
+                        "problem_id": cf_id,
+                        "rating": 1000 + index * 10,
+                    }
+                )
+                db.upsert_submission(
+                    {
+                        "platform": "codeforces",
+                        "submission_id": str(index),
+                        "problem_id": cf_id,
+                        "verdict": "OK",
+                        "submitted_at": f"2026-01-01T00:00:{index:02d}+00:00",
+                    }
+                )
+                db.upsert_problem(
+                    {
+                        "platform": "luogu",
+                        "problem_id": luogu_id,
+                        "difficulty": 1 if index == 0 else 5,
+                    }
+                )
+                db.upsert_submission(
+                    {
+                        "platform": "luogu",
+                        "submission_id": f"accepted:{luogu_id}",
+                        "problem_id": luogu_id,
+                        "verdict": "AC",
+                        "submitted_at": None,
+                    }
+                )
+
+            profile = AcmService._recent_solved_difficulty_profile(db)
+
+        self.assertEqual(profile["platforms"]["codeforces"]["selected"], 50)
+        self.assertEqual(profile["platforms"]["luogu"]["selected"], 50)
+        self.assertEqual(profile["sample_count"], 100)
+        self.assertEqual(profile["platforms"]["codeforces"]["average"], 1255)
+        self.assertEqual(profile["platforms"]["luogu"]["average"], 1900)
+        self.assertEqual(profile["average"], 1578)
+
     def test_setup_start_close_and_bootstrap_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -128,17 +288,38 @@ class AcmServiceTests(unittest.TestCase):
             service.setup("fixture", "42", skip_validate=True)
             recommendations = service.recommendations(count=3, mode="new")
             self.assertEqual(recommendations["recommendation_basis"], "plan_only")
-            # Balanced mode never exceeds the plan quota when no catalog
-            # snapshot is available: ceil(2 * 3 / 3) == 2.
-            self.assertEqual(len(recommendations["recommendations"]), 2)
+            # Balanced mode is an ordinary union; plan provenance does not
+            # impose a quota even when only plan candidates are available.
+            self.assertEqual(len(recommendations["recommendations"]), 3)
             self.assertTrue(recommendations["warnings"])
             self.assertTrue(all("breakdown" in row for row in recommendations["recommendations"]))
 
-            verified = service.verify("CF1A", exact=True, timeout=3.5, stress_iterations=7, seed=9)
+            user_file = root / "picked-user.cpp"
+            generator_file = root / "picked-generator.cpp"
+            reference_file = root / "picked-reference.cpp"
+            verified = service.verify(
+                "CF1A",
+                exact=True,
+                timeout=3.5,
+                stress_iterations=7,
+                seed=9,
+                user_file=str(user_file),
+                generator_file=str(generator_file),
+                reference_file=str(reference_file),
+            )
             self.assertTrue(verified["ok"])
-            self.assertEqual(calls[0]["problem"], "CF1A")
+            self.assertEqual(calls[0]["problem"], user_file)
             self.assertEqual(calls[0]["timeout"], 3.5)
             self.assertEqual(calls[0]["stress_iterations"], 7)
+            self.assertEqual(calls[0]["generator_file"], str(generator_file))
+            self.assertEqual(calls[0]["reference_file"], str(reference_file))
+
+            for timeout in (0, -1, float("inf"), float("nan")):
+                with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                    service.verify("CF1A", timeout=timeout)
+            for iterations in (0, -1):
+                with self.subTest(iterations=iterations), self.assertRaises(ValueError):
+                    service.verify("CF1A", stress_iterations=iterations)
 
     def test_recommendations_use_configured_target_rating(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

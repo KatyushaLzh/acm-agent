@@ -8,7 +8,7 @@ function bindSystemEvents() {
     pickLocalFile(event.currentTarget).catch(error => toast("文件选择失败", error.message, "error"));
   }));
   $$('[data-file-clear]').forEach(button => button.addEventListener("click", event => clearLocalFileSelection(event.currentTarget)));
-  [$("#ai-stress-form"), $("#close-form")].forEach(form => form.addEventListener("reset", () => {
+  [$("#close-form")].forEach(form => form.addEventListener("reset", () => {
     window.setTimeout(() => syncLocalFileSelections(form), 0);
   }));
   $("#plan-check-button").addEventListener("click", async event => {

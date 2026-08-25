@@ -8,7 +8,8 @@ function bindTodayEvents() {
     event.preventDefault();
     requestRecommendations();
   });
-  $("#ai-recommend-button").addEventListener("click", event => requestAiRecommendations(event.currentTarget));
+  $("#ai-gap-fill-button").addEventListener("click", event => requestAiRecommendations(event.currentTarget, "gap_fill"));
+  $("#ai-specialization-button").addEventListener("click", event => requestAiRecommendations(event.currentTarget, "specialization"));
   $("#recommend-controls [name=source_mode]").addEventListener("change", event => {
     $("#recommend-plan-filter").classList.toggle("hidden", event.currentTarget.value === "catalog_only");
   });

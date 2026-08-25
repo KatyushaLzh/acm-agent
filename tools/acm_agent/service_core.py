@@ -11,6 +11,7 @@ from .config import load_config, save_config
 from .deepseek import DeepSeekClient
 from .plan_manager import PlanManager
 from .platforms import freshness
+from .recommend import LUOGU_CF_EQUIVALENT, recommendation_difficulty_targets
 from .service_common import _db_problem_id, _display_problem_id, _problem_key
 from .storage import Database
 from .tag_policy import effective_tags
@@ -36,6 +37,80 @@ class ServiceCoreMixin:
             )
         return self._deepseek_client_factory()
 
+    @staticmethod
+    def _recent_solved_difficulty_profile(
+        db: Database, *, limit_per_platform: int = 50
+    ) -> dict[str, Any]:
+        """Collect up to 50 latest distinct solved problems from each platform."""
+
+        problem_rows = {
+            (str(row["platform"]), str(row["problem_id"])): row
+            for row in db.problems()
+        }
+        evidence: dict[tuple[str, str], tuple[str | None, bool]] = {}
+        for row in db.query(
+            """SELECT platform,problem_id,submitted_at AS solved_at
+               FROM submissions
+               WHERE (platform='codeforces' AND UPPER(verdict)='OK')
+                  OR (platform='luogu' AND UPPER(verdict)='AC')
+               UNION ALL
+               SELECT platform,problem_id,closed_at AS solved_at
+               FROM attempts
+               WHERE UPPER(result)='AC' AND closed_at IS NOT NULL"""
+        ):
+            platform = str(row["platform"] or "").lower()
+            if platform not in {"codeforces", "luogu"}:
+                continue
+            key = (platform, str(row["problem_id"]))
+            solved_at = str(row["solved_at"] or "") or None
+            current = evidence.get(key)
+            if current is None or str(solved_at or "") > str(current[0] or ""):
+                evidence[key] = (solved_at, solved_at is not None)
+
+        values: list[int] = []
+        platforms: dict[str, dict[str, Any]] = {}
+        for platform in ("codeforces", "luogu"):
+            rows: list[tuple[tuple[Any, ...], int | None, bool]] = []
+            for (row_platform, problem_id), (solved_at, timestamped) in evidence.items():
+                if row_platform != platform:
+                    continue
+                metadata = problem_rows.get((platform, problem_id))
+                if metadata is None:
+                    continue
+                fallback_at = str(metadata["updated_at"] or "")
+                equivalent = (
+                    int(metadata["rating"])
+                    if platform == "codeforces" and metadata["rating"] is not None
+                    else LUOGU_CF_EQUIVALENT.get(int(metadata["difficulty"]))
+                    if platform == "luogu" and metadata["difficulty"] is not None
+                    else None
+                )
+                rows.append(
+                    (
+                        (1 if timestamped else 0, solved_at or fallback_at, problem_id),
+                        equivalent,
+                        timestamped,
+                    )
+                )
+            selected = sorted(rows, key=lambda item: item[0], reverse=True)[
+                : max(0, int(limit_per_platform))
+            ]
+            known = [int(item[1]) for item in selected if item[1] is not None]
+            values.extend(known)
+            platforms[platform] = {
+                "selected": len(selected),
+                "with_equivalent_difficulty": len(known),
+                "with_acceptance_time": sum(bool(item[2]) for item in selected),
+                "average": round(sum(known) / len(known)) if known else None,
+            }
+        return {
+            "limit_per_platform": int(limit_per_platform),
+            "values": values,
+            "sample_count": len(values),
+            "average": round(sum(values) / len(values)) if values else None,
+            "platforms": platforms,
+        }
+
     def setup(
         self,
         codeforces: str,
@@ -43,6 +118,7 @@ class ServiceCoreMixin:
         *,
         target_rating: int | None = None,
         skip_validate: bool = False,
+        defer_sync: bool = False,
     ) -> dict[str, Any]:
         handle = str(codeforces).strip()
         uid = str(luogu).strip()
@@ -87,6 +163,40 @@ class ServiceCoreMixin:
             )
             PlanManager(self.paths.root, db, builtin_plan=self.paths.plan)
             imported = self._import_local_files(db)
+        initial_sync: dict[str, Any] | None = None
+        tag_enrichment: dict[str, Any] | None = None
+        if not skip_validate and not defer_sync:
+            try:
+                # Initialization is the first point where both platform
+                # identities are known.  Populate the complete CF catalog,
+                # Luogu AC set, and every currently missing Luogu tag now so
+                # later recommendations never need to perform metadata I/O.
+                initial_sync = self.sync("all", force=True, full_catalog=True)
+                luogu_result = next(
+                    (
+                        item
+                        for item in initial_sync.get("results", [])
+                        if item.get("platform") == "luogu"
+                    ),
+                    None,
+                )
+                if luogu_result:
+                    raw_enrichment = luogu_result.get("tag_enrichment")
+                    if isinstance(raw_enrichment, Mapping):
+                        tag_enrichment = dict(raw_enrichment)
+            except Exception as exc:
+                # Account initialization is durable even when public platform
+                # data is temporarily unavailable; surface the failed eager
+                # sync so the user can retry it without re-entering IDs.
+                initial_sync = {
+                    "ok": False,
+                    "results": [],
+                    "error": {
+                        "code": "initial_sync_failed",
+                        "message": " ".join(str(exc).split())[:300]
+                        or exc.__class__.__name__,
+                    },
+                }
         return {
             "ok": True,
             "validated": not skip_validate,
@@ -94,9 +204,18 @@ class ServiceCoreMixin:
             "target_cf_rating": target_rating,
             "local_files_imported": imported,
             "config": str(self.paths.config),
+            "initial_sync": initial_sync,
+            "initial_sync_deferred": bool(not skip_validate and defer_sync),
+            "tag_enrichment": tag_enrichment,
         }
 
-    def sync(self, platform: str = "all", *, force: bool = False) -> dict[str, Any]:
+    def sync(
+        self,
+        platform: str = "all",
+        *,
+        force: bool = False,
+        full_catalog: bool = False,
+    ) -> dict[str, Any]:
         if platform not in {"all", "codeforces", "luogu"}:
             raise ValueError("platform 必须是 all、codeforces 或 luogu")
         config = load_config(self.paths)
@@ -116,25 +235,42 @@ class ServiceCoreMixin:
                     uid = str(config["accounts"]["luogu"].get("uid") or "")
                     if not uid:
                         raise ValueError("未配置洛谷 UID，请先运行 acm init")
-                    cf_account = db.account("codeforces")
-                    baseline = int(cf_account["rating"] or 1600) if cf_account else 1600
-                    equivalents = {
-                        1: 800, 2: 1000, 3: 1300, 4: 1600,
-                        5: 1900, 6: 2200, 7: 2500,
-                    }
-                    target_difficulties = {
-                        min(equivalents, key=lambda level: abs(equivalents[level] - target))
-                        for target in (baseline - 150, baseline + 50, baseline + 250)
-                    }
-                    result = self._sync_luogu(
-                        db,
-                        uid,
-                        refresh_catalog=True if force else None,
-                        candidate_queries=[
-                            {"page": 1, "difficulty": difficulty}
-                            for difficulty in sorted(target_difficulties)
-                        ],
-                    )
+                    if full_catalog:
+                        result = self._sync_luogu(
+                            db,
+                            uid,
+                            refresh_catalog=True,
+                            full_catalog=True,
+                        )
+                    else:
+                        cf_account = db.account("codeforces")
+                        solved_profile = self._recent_solved_difficulty_profile(db)
+                        difficulty_targets = recommendation_difficulty_targets(
+                            cf_account["rating"] if cf_account else None,
+                            solved_profile["values"],
+                            target_rating=(
+                                cf_account["target_rating"]
+                                if cf_account and cf_account["target_rating"] is not None
+                                else config.get("recommendation", {}).get("target_cf_rating")
+                            ),
+                        )
+                        equivalents = {
+                            1: 800, 2: 1000, 3: 1300, 4: 1600,
+                            5: 1900, 6: 2200, 7: 2500,
+                        }
+                        target_difficulties = {
+                            min(equivalents, key=lambda level: abs(equivalents[level] - target))
+                            for target in difficulty_targets.values()
+                        }
+                        result = self._sync_luogu(
+                            db,
+                            uid,
+                            refresh_catalog=True if force else None,
+                            candidate_queries=[
+                                {"page": 1, "difficulty": difficulty}
+                                for difficulty in sorted(target_difficulties)
+                            ],
+                        )
                 row = result.as_dict()
                 row["freshness"] = freshness(db, selected_platform)
                 results.append(row)
@@ -235,6 +371,7 @@ class ServiceCoreMixin:
         source_mode: str = "balanced",
         plan_ids: list[str] | None = None,
         _record: bool = True,
+        _return_pool: bool = False,
     ) -> dict[str, Any]:
         if count < 1:
             raise ValueError("count 必须至少为 1")
@@ -301,21 +438,12 @@ class ServiceCoreMixin:
             target_rating = account["target_rating"] if account else None
             if target_rating is None:
                 target_rating = config.get("recommendation", {}).get("target_cf_rating")
-            recent_ac = [
-                {
-                    "problem_id": row["problem_id"],
-                    "rating": row["rating"],
-                    "verdict": row["verdict"],
-                    "timestamp": row["submitted_at"],
-                }
-                for row in db.query(
-                    """SELECT s.problem_id,s.verdict,s.submitted_at,p.rating
-                       FROM submissions s JOIN problems p USING(platform,problem_id)
-                       WHERE s.platform='codeforces' AND s.verdict='OK'
-                         AND p.rating IS NOT NULL
-                       ORDER BY s.submitted_at DESC"""
-                )
-            ]
+            solved_profile = self._recent_solved_difficulty_profile(db)
+            difficulty_targets = recommendation_difficulty_targets(
+                rating,
+                solved_profile["values"],
+                target_rating=target_rating,
+            )
             history: list[dict[str, Any]] = []
             for row in reversed(db.recommendation_runs(limit=30)):
                 item = dict(row)
@@ -340,7 +468,8 @@ class ServiceCoreMixin:
                     plan_ids=plan_ids,
                     cf_rating=rating,
                     target_cf_rating=target_rating,
-                    recent_cf_accepted=recent_ac,
+                    recent_solved_equivalents=solved_profile["values"],
+                    return_pool=_return_pool,
                 )
             ]
             for item in output:
@@ -382,8 +511,6 @@ class ServiceCoreMixin:
             warnings.append("部分平台不是 fresh；推荐使用最后成功快照与本地记录。")
         else:
             basis = "synced"
-        if source_mode == "balanced" and len(output) < count:
-            warnings.append("平台题库候选不足；为保持题单占比上限，本次没有用更多题单题目补位。")
         return {
             "ok": True,
             "mode": mode,
@@ -392,6 +519,18 @@ class ServiceCoreMixin:
             "recommendation_basis": basis,
             "sources": source_details,
             "warnings": warnings,
+            "difficulty_profile": {
+                "targets": {
+                    "current_plus_100": difficulty_targets["recovery"],
+                    "recent_solved_average": difficulty_targets["main"],
+                    "target_rating": difficulty_targets["stretch"],
+                },
+                "recent_solved": {
+                    key: value
+                    for key, value in solved_profile.items()
+                    if key != "values"
+                },
+            },
             "recommendations": output,
         }
 

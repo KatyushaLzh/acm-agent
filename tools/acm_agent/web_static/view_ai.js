@@ -6,21 +6,6 @@ import {
 import { postEventStream } from "./sse.js";
 import { renderRecommendations } from "./view_today.js";
 
-const STRICT_VALIDATOR_FAILURE_MESSAGE = "validator 严格认证未通过，已终止 AI 对拍；helper 未应用，run 未创建。";
-
-function isStrictValidatorCertificationFailure(error) {
-  const jobError = asObject(error?.jobError);
-  if (jobError.validator_strict_certification_failed === true) return true;
-  const identity = [
-    jobError.code,
-    jobError.stage,
-    jobError.stage_label,
-    jobError.artifact,
-    jobError.root_cause_label,
-  ].map(value => String(value || "").toLowerCase()).join(" ");
-  return identity.includes("validator") || identity.includes("probe");
-}
-
 function knowledgeSchemaSelection() {
   const selected = $("#knowledge-schema-mode").value;
   let schema = null;
@@ -338,9 +323,15 @@ function cancelKnowledgeProposal() {
   toast("已取消总结", "没有写入 Markdown 文件。", "success");
 }
 
-async function requestAiRecommendations(button) {
+async function requestAiRecommendations(button, aiMode = "gap_fill") {
   const form = $("#recommend-controls");
-  setBusy(button, true, "DeepSeek 重排中…");
+  if (!["gap_fill", "specialization"].includes(aiMode)) throw new Error(`未知 AI 推荐模式：${aiMode}`);
+  if (state.recommendationController) state.recommendationController.abort();
+  const controller = new AbortController();
+  const epoch = ++state.recommendationEpoch;
+  state.recommendationController = controller;
+  const modeLabel = aiMode === "specialization" ? "专项强化" : "查漏补缺";
+  setBusy(button, true, `${modeLabel}中…`);
   try {
     if (!state.aiStatus?.api_key_detected) {
       toast("尚未启用 DeepSeek", "请先在设置页输入 API Key 并保存。", "error");
@@ -353,12 +344,25 @@ async function requestAiRecommendations(button) {
       count: Number(form.elements.count.value),
       source_mode: form.elements.source_mode.value,
       plan_ids: planIds.length ? planIds : null,
-    } });
-    const result = await waitForJob(jobIdOf(started), "正在用最近尝试明细重排候选…");
+      ai_mode: aiMode,
+    }, signal: controller.signal });
+    const result = await waitForJob(
+      jobIdOf(started),
+      `正在按 AC 知识覆盖生成${modeLabel}推荐…`,
+      null,
+      { shouldCancel: () => state.recommendationEpoch !== epoch || state.recommendationController !== controller },
+    );
+    if (!result || state.recommendationEpoch !== epoch || state.recommendationController !== controller) return;
     renderRecommendations(result || {});
-    toast(result?.ai?.fallback ? "AI 已降级" : "AI 推荐完成", result?.ai?.fallback || "确定性资格过滤保持不变。");
-  } catch (error) { toast("AI 推荐失败", error.message, "error"); }
-  finally { setBusy(button, false); }
+    const fallback = result?.ai?.fallback;
+    const fallbackMessage = typeof fallback === "string" ? fallback : fallback?.message;
+    toast(fallback ? `${modeLabel}已降级` : `${modeLabel}完成`, fallbackMessage || "确定性资格过滤保持不变。");
+  } catch (error) {
+    if (error.name !== "AbortError" && state.recommendationEpoch === epoch) toast("AI 推荐失败", error.message, "error");
+  } finally {
+    if (state.recommendationController === controller) state.recommendationController = null;
+    setBusy(button, false);
+  }
 }
 
 async function loadAiStatus() {
@@ -683,19 +687,24 @@ async function streamAiChat(message, mode, hintLevel) {
       assistant.remove(); throw new Error(String(detail));
     }
     const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let completed = false;
+    const consumeBlock = block => {
+      if (!aiOperationIsCurrent(problemKey, epoch) || state.aiStreamController !== controller) {
+        controller.abort();
+        return;
+      }
+      const item = parseSseBlock(block); if (!item) return;
+      if (item.event === "delta") { assistant.textContent += item.data.content || ""; $("#ai-chat-messages").scrollTop = $("#ai-chat-messages").scrollHeight; }
+      else if (item.event === "done") completed = true;
+      else if (item.event === "error") throw new Error(item.data.message || "DeepSeek 流式请求失败");
+    };
     for (;;) {
       const { value, done } = await reader.read();
       buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
       const blocks = buffer.split(/\r?\n\r?\n/); buffer = blocks.pop() || "";
-      for (const block of blocks) {
-        if (!aiOperationIsCurrent(problemKey, epoch) || state.aiStreamController !== controller) { controller.abort(); break; }
-        const item = parseSseBlock(block); if (!item) continue;
-        if (item.event === "delta") { assistant.textContent += item.data.content || ""; $("#ai-chat-messages").scrollTop = $("#ai-chat-messages").scrollHeight; }
-        else if (item.event === "done") completed = true;
-        else if (item.event === "error") throw new Error(item.data.message || "DeepSeek 流式请求失败");
-      }
+      for (const block of blocks) consumeBlock(block);
+      if (done && buffer.trim()) { consumeBlock(buffer); buffer = ""; }
       if (completed) { await reader.cancel(); break; }
-      if (done) break;
+      if (done) throw new Error("DeepSeek 流式响应在完成事件前中断");
     }
   } catch (error) {
     assistant.classList.add("interrupted");
@@ -708,7 +717,7 @@ async function streamAiChat(message, mode, hintLevel) {
       problemInput.disabled = false;
     }
   }
-  return true;
+  return completed;
 }
 
 async function clearAiConversation(button) {
@@ -772,7 +781,6 @@ async function runPatchAction(action, button) {
 }
 
 export {
-  STRICT_VALIDATOR_FAILURE_MESSAGE, isStrictValidatorCertificationFailure,
   loadKnowledgeTargets, registerKnowledgeTarget, removeKnowledgeTarget,
   renderSafeKnowledgeMarkdown, previewKnowledgeSummary, refreshKnowledgeProposal,
   applyKnowledgeProposal, revertKnowledgeProposal, cancelKnowledgeProposal,

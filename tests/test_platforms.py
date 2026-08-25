@@ -12,6 +12,7 @@ from tools.acm_agent.platforms import (
     ResponseShapeError,
     parse_luogu_passed,
     parse_luogu_problem,
+    parse_luogu_problem_page,
     parse_luogu_problems,
     parse_luogu_tags,
     parse_luogu_user,
@@ -140,6 +141,18 @@ class CodeforcesTests(unittest.TestCase):
 
 
 class LuoguTests(unittest.TestCase):
+    @staticmethod
+    def _problem_page(rows, *, count, per_page):
+        return {
+            "data": {
+                "problems": {
+                    "count": count,
+                    "perPage": per_page,
+                    "result": rows,
+                }
+            }
+        }
+
     def test_parsers(self):
         self.assertEqual(parse_luogu_passed(fixture("luogu_practice.html")), {"P1000", "P3372"})
         with self.assertRaises(ResponseShapeError):
@@ -167,6 +180,62 @@ class LuoguTests(unittest.TestCase):
             parse_luogu_problem(duplicate, "P3372", tags)
         with self.assertRaisesRegex(ResponseShapeError, "unknown tag id 3"):
             parse_luogu_problem(fixture("luogu_problems.json"), "P3372", {})
+
+    def test_full_catalog_follows_remote_pagination(self):
+        pages = {
+            1: self._problem_page(
+                [
+                    {"pid": "P1000", "title": "one", "difficulty": 1, "tags": [3]},
+                    {"pid": "P1001", "title": "two", "difficulty": 2, "tags": []},
+                ],
+                count=5,
+                per_page=2,
+            ),
+            2: self._problem_page(
+                [
+                    {"pid": "CF1A", "title": "mirror", "difficulty": 1, "tags": []},
+                    {"pid": "P1002", "title": "three", "difficulty": 3, "tags": [3]},
+                ],
+                count=5,
+                per_page=2,
+            ),
+            3: self._problem_page(
+                [{"pid": "P1003", "title": "four", "difficulty": 4, "tags": []}],
+                count=5,
+                per_page=2,
+            ),
+        }
+        router = Router({"list": lambda params: pages[int(params["page"])]})
+
+        problems = LuoguClient(router).all_problems(tag_names={3: "线段树"})
+
+        self.assertEqual(
+            [problem["problem_id"] for problem in problems],
+            ["P1000", "P1001", "P1002", "P1003"],
+        )
+        self.assertEqual(problems[0]["tags"], ["线段树"])
+        self.assertEqual(
+            [params["page"] for _, params in router.calls],
+            [1, 2, 3],
+        )
+
+    def test_full_catalog_rejects_an_empty_intermediate_page(self):
+        pages = {
+            1: self._problem_page(
+                [{"pid": "P1000", "title": "one", "tags": []}],
+                count=3,
+                per_page=1,
+            ),
+            2: self._problem_page([], count=3, per_page=1),
+        }
+        router = Router({"list": lambda params: pages[int(params["page"])]})
+
+        with self.assertRaisesRegex(ResponseShapeError, "page 2/3"):
+            LuoguClient(router).all_problems()
+
+    def test_problem_page_parser_requires_pagination_contract(self):
+        with self.assertRaisesRegex(ResponseShapeError, "0 pagination objects"):
+            parse_luogu_problem_page(fixture("luogu_problems.json"))
 
     def test_plan_tag_preview_keeps_partial_results(self):
         class FakeCf:
