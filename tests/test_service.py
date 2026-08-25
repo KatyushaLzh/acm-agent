@@ -141,7 +141,7 @@ class AcmServiceTests(unittest.TestCase):
 
         self.assertEqual(
             calls,
-            [("codeforces", "fixture", True), ("luogu", "42", True)],
+            [("codeforces", "fixture", False), ("luogu", "42", False)],
         )
         self.assertTrue(payload["initial_sync"]["ok"])
         self.assertEqual(luogu_full_catalog, [True])
@@ -163,6 +163,36 @@ class AcmServiceTests(unittest.TestCase):
 
         self.assertIsNone(payload["initial_sync"])
         self.assertIsNone(payload["tag_enrichment"])
+
+    def test_sync_reports_structured_progress_and_aggregate_partial_status(self) -> None:
+        progress: list[dict[str, object]] = []
+
+        def sync_cf(db, handle, *, refresh_catalog=None):
+            return SyncResult("codeforces", "fresh")
+
+        def sync_lg(db, uid, *, refresh_catalog=None, candidate_queries=None):
+            return SyncResult("luogu", "failed", error="fixture outage")
+
+        with tempfile.TemporaryDirectory() as temp:
+            service = AcmService(
+                Path(temp),
+                sync_codeforces_fn=sync_cf,
+                sync_luogu_fn=sync_lg,
+            )
+            service.setup("fixture", "42", skip_validate=True)
+            result = service.sync("all", _progress_callback=progress.append)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual([item["status"] for item in result["results"]], ["fresh", "failed"])
+        self.assertTrue(progress[-1]["usable"])
+        self.assertEqual(
+            set(progress[-1]),
+            {
+                "phase", "platform", "step", "total", "completed", "failed",
+                "message", "started_at", "last_activity_at", "usable",
+            },
+        )
 
     def test_deferred_setup_validates_and_saves_without_syncing(self) -> None:
         class IdentityClient:

@@ -292,7 +292,7 @@ function displayPlatform(platform) { return platform === "codeforces" ? "Codefor
 function freshnessBadge(value) {
   const normalized = String(value || "never").toLowerCase();
   const klass = normalized === "fresh" || normalized === "synced" ? "good" : normalized === "failed" ? "bad" : "warn";
-  const label = { fresh: "fresh", stale: "stale", failed: "failed", never: "未同步" }[normalized] || normalized;
+  const label = { fresh: "fresh", partial: "partial", stale: "stale", failed: "failed", never: "未同步" }[normalized] || normalized;
   return `<span class="badge ${klass}">${escapeHtml(label)}</span>`;
 }
 
@@ -352,8 +352,12 @@ function renderSources(sources) {
   const list = $("#source-list");
   list.innerHTML = ["codeforces", "luogu"].map(platform => {
     const item = asObject(sources[platform]);
-    const detail = item.error || `最近成功：${formatTime(item.last_success_at)}`;
-    return `<div class="source-row"><strong>${displayPlatform(platform)}</strong><small title="${escapeHtml(detail)}">${escapeHtml(detail)}</small>${freshnessBadge(item.freshness)}</div>`;
+    const attemptStatus = String(item.last_attempt_status || "").toLowerCase();
+    const displayStatus = ["partial", "failed"].includes(attemptStatus) ? attemptStatus : item.freshness;
+    const detail = item.error
+      ? `最近尝试 ${attemptStatus || "异常"}：${item.error} · 最近成功：${formatTime(item.last_success_at)}`
+      : `最近成功：${formatTime(item.last_success_at)}`;
+    return `<div class="source-row"><strong>${displayPlatform(platform)}</strong><small title="${escapeHtml(detail)}">${escapeHtml(detail)}</small>${freshnessBadge(displayStatus)}</div>`;
   }).join("");
 }
 

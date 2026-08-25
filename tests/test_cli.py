@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 from pathlib import Path
@@ -31,6 +31,45 @@ class CliEndToEndTests(unittest.TestCase):
         target.mkdir(parents=True)
         shutil.copy2(REPO_ROOT / "training/data-structures-30d/plan.json", target / "plan.json")
         shutil.copy2(REPO_ROOT / "training/data-structures-30d/README.md", target / "README.md")
+
+    def test_human_sync_reports_bounded_progress_on_stderr(self) -> None:
+        class FakeService:
+            def sync(self, platform="all", *, force=False, _progress_callback=None):
+                for step in range(1, 101):
+                    _progress_callback(
+                        {
+                            "phase": "catalog",
+                            "platform": "luogu",
+                            "step": step,
+                            "total": 100,
+                            "message": f"洛谷题库 {step}/100 页",
+                        }
+                    )
+                return {
+                    "ok": True,
+                    "results": [
+                        {
+                            "platform": "luogu",
+                            "status": "fresh",
+                            "accepted": 1,
+                            "submissions": 1,
+                        }
+                    ],
+                }
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+            "tools.acm_agent.cli._service", return_value=FakeService()
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            code = main(["sync", "--platform", "luogu"], root=Path(temp))
+
+        self.assertEqual(code, 0)
+        self.assertIn("luogu: fresh", stdout.getvalue())
+        progress_lines = [line for line in stderr.getvalue().splitlines() if line]
+        self.assertGreaterEqual(len(progress_lines), 2)
+        self.assertLessEqual(len(progress_lines), 25)
+        self.assertIn("洛谷题库 100/100 页", progress_lines[-1])
 
     def test_verify_cli_rejects_non_positive_runtime_controls(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

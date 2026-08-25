@@ -138,8 +138,13 @@ class AiServiceTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         target = self.root / "training" / "data-structures-30d"
         target.mkdir(parents=True)
-        shutil.copy2(REPO_ROOT / "training/data-structures-30d/plan.json", target / "plan.json")
+        plan_path = target / "plan.json"
+        shutil.copy2(REPO_ROOT / "training/data-structures-30d/plan.json", plan_path)
         shutil.copy2(REPO_ROOT / "training/data-structures-30d/README.md", target / "README.md")
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        for task in plan["stages"][0]["tasks"][:3]:
+            task["tags"] = ["数据结构"]
+        plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
         self.client = FakeDeepSeek()
         self.verify_calls = []
 

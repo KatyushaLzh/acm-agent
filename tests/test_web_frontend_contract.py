@@ -79,11 +79,36 @@ class WebFrontendConcurrencyContractTests(unittest.TestCase):
     def test_validated_setup_enters_dashboard_and_tracks_background_sync(self) -> None:
         self.assertIn("正在验证账号", self.workbench)
         self.assertIn("result?.initial_sync_job", self.workbench)
-        self.assertIn("正在抓取…", self.workbench)
+        self.assertIn("同步进行中…", self.workbench)
         self.assertIn("acm-initial-sync-job", self.workbench)
         self.assertIn("resumeInitialSyncJob", self.workbench)
         self.assertIn('id="settings-save-button"', self.index)
         self.assertIn("离线配置，请稍后同步平台状态", self.workbench)
+
+    def test_sync_progress_is_persistent_structured_and_accessible(self) -> None:
+        self.assertIn('id="sync-progress"', self.index)
+        self.assertIn('role="status" aria-live="polite" aria-atomic="true"', self.index)
+        self.assertIn('id="sync-progress-bar"', self.index)
+        self.assertIn("onPoll(job, status)", self.workbench)
+        self.assertIn("renderSyncProgress(job, status)", self.workbench)
+        for field in ("progress.phase", "progress.platform", "progress.step", "progress.total", "progress.completed", "progress.failed", "progress.started_at", "progress.usable"):
+            self.assertIn(field, self.workbench)
+        self.assertIn("sessionStorage.setItem(INITIAL_SYNC_JOB_KEY, jobId)", self.workbench)
+        self.assertIn("sessionStorage.getItem(INITIAL_SYNC_JOB_KEY)", self.workbench)
+        self.assertIn("jobIdOf(state.bootstrap?.active_sync_job)", self.workbench)
+        self.assertIn("activeJobId || sessionStorage.getItem", self.workbench)
+        self.assertIn('bar.removeAttribute("value")', self.workbench)
+        self.assertIn("bar.value = Math.min(total", self.workbench)
+
+    def test_sync_business_outcome_is_not_inferred_from_job_success(self) -> None:
+        for status in ('status === "fresh"', 'status === "partial"', 'status === "failed"'):
+            self.assertIn(status, self.workbench)
+        self.assertIn("result?.ok === false", self.workbench)
+        self.assertIn("同步部分完成", self.workbench)
+        self.assertIn("未把后台任务结束等同于业务同步成功", self.workbench)
+        self.assertIn("await refreshAfterSync()", self.workbench)
+        self.assertIn('["partial", "failed"].includes(attemptStatus)', self.core)
+        self.assertIn("freshnessBadge(displayStatus)", self.core)
 
     def test_ai_plan_import_has_two_modes_and_explicit_privacy_boundary(self) -> None:
         self.assertIn('id="ai-plan-import-button"', self.index)

@@ -53,6 +53,33 @@ def _emit(payload: Mapping[str, Any] | Sequence[Any], *, as_json: bool, human: s
         print(human)
 
 
+def _cli_progress_reporter(enabled: bool):
+    """Render bounded human progress on stderr without polluting JSON stdout."""
+
+    last_key: tuple[object, ...] | None = None
+
+    def report(progress: Mapping[str, Any]) -> None:
+        nonlocal last_key
+        if not enabled:
+            return
+        phase = str(progress.get("phase") or "sync")
+        platform = str(progress.get("platform") or "all")
+        step = int(progress.get("step") or 0)
+        total = int(progress.get("total") or 0)
+        message = str(progress.get("message") or "正在同步平台数据")
+        if total > 20:
+            interval = max(1, total // 20)
+            if step not in {0, 1, total} and step % interval:
+                return
+        key = (phase, platform, step, total, message)
+        if key == last_key:
+            return
+        last_key = key
+        print(f"[同步] {message}", file=sys.stderr, flush=True)
+
+    return report
+
+
 def _read_account_args(args: argparse.Namespace) -> tuple[str, str, int | None]:
     handle = (args.codeforces or input("Codeforces handle: ")).strip()
     uid = (args.luogu or input("洛谷数字 UID: ")).strip()
@@ -70,6 +97,7 @@ def command_init(args: argparse.Namespace, paths: Any) -> int:
         uid,
         target_rating=target,
         skip_validate=args.skip_validate,
+        _progress_callback=_cli_progress_reporter(not args.json),
     )
     _emit(
         payload,
@@ -90,7 +118,11 @@ def command_init(args: argparse.Namespace, paths: Any) -> int:
 
 
 def command_sync(args: argparse.Namespace, paths: Any) -> int:
-    payload = _service(paths).sync(args.platform, force=args.force)
+    payload = _service(paths).sync(
+        args.platform,
+        force=args.force,
+        _progress_callback=_cli_progress_reporter(not args.json),
+    )
     lines = [
         f"{item['platform']}: {item['status']}，AC {item['accepted']}，新提交 {item['submissions']}"
         for item in payload["results"]

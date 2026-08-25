@@ -95,6 +95,12 @@
           <article class="panel">
             <div class="panel-heading"><div><p class="eyebrow">SYNC</p><h2>数据来源</h2></div></div>
             <div id="source-list" class="source-list"></div>
+            <section id="sync-progress" class="sync-progress hidden" role="status" aria-live="polite" aria-atomic="true">
+              <div class="sync-progress-heading"><strong id="sync-progress-phase">等待同步</strong><span id="sync-progress-usable" class="sync-progress-usable">数据状态未知</span></div>
+              <progress id="sync-progress-bar" max="1" aria-label="平台同步进度"></progress>
+              <p id="sync-progress-message">正在读取同步状态…</p>
+              <small id="sync-progress-facts">等待首个进度事件</small>
+            </section>
             <div id="job-progress" class="job-progress hidden"><div class="progress-track"><span></span></div><p>正在处理…</p></div>
           </article>
         </div>

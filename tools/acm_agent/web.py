@@ -214,6 +214,7 @@ class JobManager:
         *,
         job_id: str | None = None,
         use_service_lock: bool = True,
+        metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         job_id = job_id or secrets.token_urlsafe(12)
         record: dict[str, Any] = {
@@ -226,6 +227,7 @@ class JobManager:
             "result": None,
             "error": None,
             "progress": None,
+            "metadata": _json_safe(dict(metadata or {})),
         }
         with self._lock:
             if not self._accepting:
@@ -308,6 +310,31 @@ class JobManager:
         with self._lock:
             record = self._jobs.get(job_id)
             return _json_safe(record) if record is not None else None
+
+    def active(
+        self,
+        kind: str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the newest queued/running job of one kind, if present."""
+
+        with self._lock:
+            for record in reversed(self._jobs.values()):
+                if (
+                    record["kind"] == kind
+                    and record["status"] in {"queued", "running"}
+                    and (metadata is None or record.get("metadata") == _json_safe(dict(metadata)))
+                ):
+                    return _json_safe(record)
+        return None
+
+    def active_any(self, kinds: set[str]) -> dict[str, Any] | None:
+        with self._lock:
+            for record in reversed(self._jobs.values()):
+                if record["kind"] in kinds and record["status"] in {"queued", "running"}:
+                    return _json_safe(record)
+        return None
 
     def report_progress(self, job_id: str, progress: Mapping[str, Any]) -> None:
         """Publish JSON-safe progress for a running background job."""
@@ -624,6 +651,19 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
                 self._send_success({"cancelled": False, **result})
                 return
             if path == "/api/setup":
+                unsupported_fields = set(payload) - {
+                    "codeforces",
+                    "luogu",
+                    "target_rating",
+                    "skip_validate",
+                }
+                if unsupported_fields:
+                    field = sorted(unsupported_fields)[0]
+                    raise ApiProblem(
+                        HTTPStatus.BAD_REQUEST,
+                        "invalid_request",
+                        f"Unknown request field: {field}",
+                    )
                 # Web setup must enter the dashboard as soon as account
                 # validation and configuration persistence finish.  The
                 # catalog crawl uses independent SQLite connections and only
@@ -637,18 +677,29 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
                 result["initial_sync_job"] = None
                 if result.get("validated"):
                     try:
-                        record = self.server.jobs.submit(
+                        sync_metadata = {"accounts": dict(result.get("accounts") or {})}
+                        record = self.server.jobs.active(
                             "initial_sync",
-                            lambda: self._invoke(
-                                "sync",
-                                {
-                                    "platform": "all",
-                                    "force": True,
-                                    "full_catalog": True,
-                                },
-                            ),
-                            use_service_lock=False,
+                            metadata=sync_metadata,
                         )
+                        if record is None:
+                            job_id = secrets.token_urlsafe(12)
+                            record = self.server.jobs.submit(
+                                "initial_sync",
+                                lambda job_id=job_id: self._invoke(
+                                    "sync",
+                                    {
+                                        "platform": "all",
+                                        "full_catalog": True,
+                                        "_progress_callback": lambda progress: self.server.jobs.report_progress(
+                                            job_id, progress
+                                        ),
+                                    },
+                                ),
+                                job_id=job_id,
+                                use_service_lock=False,
+                                metadata=sync_metadata,
+                            )
                     except ApiProblem as exc:
                         result["initial_sync_error"] = {
                             "code": exc.code,
@@ -712,7 +763,16 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
                 payload.setdefault("source", "web")
             if path in self._job_routes:
                 method_name = self._job_routes[path]
-                if method_name == "ai_plan_preview":
+                if method_name == "sync":
+                    unsupported_fields = set(payload) - {"platform", "force", "full_catalog"}
+                    if unsupported_fields:
+                        field = sorted(unsupported_fields)[0]
+                        raise ApiProblem(
+                            HTTPStatus.BAD_REQUEST,
+                            "invalid_request",
+                            f"Unknown request field: {field}",
+                        )
+                if method_name in {"ai_plan_preview", "sync"}:
                     job_id = secrets.token_urlsafe(12)
                     record = self.server.jobs.submit(
                         method_name,
@@ -726,6 +786,11 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
                             },
                         ),
                         job_id=job_id,
+                        metadata=(
+                            {"platform": str(payload.get("platform") or "all")}
+                            if method_name == "sync"
+                            else None
+                        ),
                     )
                     self._send_success(
                         {"job_id": record["job_id"], "job": record},
@@ -827,6 +892,9 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
                     "port": self.server.port,
                     "version": __version__,
                 }
+                data["active_sync_job"] = self.server.jobs.active_any(
+                    {"initial_sync", "sync"}
+                )
                 self._send_success(data)
                 return
             if path == "/api/plans":

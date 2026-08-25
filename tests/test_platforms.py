@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tools.acm_agent.platforms import (
@@ -18,6 +21,7 @@ from tools.acm_agent.platforms import (
     parse_luogu_user,
     sync_codeforces,
     sync_luogu,
+    enrich_luogu_accepted_problem_tags,
     preview_plan_task_tags,
 )
 from tools.acm_agent.storage import Database, SCHEMA_VERSION
@@ -233,6 +237,33 @@ class LuoguTests(unittest.TestCase):
         with self.assertRaisesRegex(ResponseShapeError, "page 2/3"):
             LuoguClient(router).all_problems()
 
+    def test_full_catalog_uses_bounded_parallel_page_fetches(self):
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def page(params):
+            nonlocal active, peak
+            page_number = int(params["page"])
+            if page_number > 1:
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                time.sleep(0.02)
+                with lock:
+                    active -= 1
+            return self._problem_page(
+                [{"pid": f"P{1000 + page_number}", "title": "x", "tags": []}],
+                count=8,
+                per_page=1,
+            )
+
+        problems = LuoguClient(Router({"list": page})).all_problems()
+
+        self.assertEqual(len(problems), 8)
+        self.assertGreaterEqual(peak, 2)
+        self.assertLessEqual(peak, 4)
+
     def test_problem_page_parser_requires_pagination_contract(self):
         with self.assertRaisesRegex(ResponseShapeError, "0 pagination objects"):
             parse_luogu_problem_page(fixture("luogu_problems.json"))
@@ -324,6 +355,207 @@ class LuoguTests(unittest.TestCase):
             result = sync_luogu(db, 42, LuoguClient(router), refresh_catalog=False)
             self.assertEqual(result.status, "failed")
             self.assertEqual(len(db.submissions("luogu")), 1)
+
+    def test_fresh_full_catalog_is_reused_without_fetching_pages(self):
+        class CachedClient:
+            def practice(self, uid):
+                return set()
+
+            def tags(self):
+                raise AssertionError("fresh full catalog must not fetch tags")
+
+            def all_problems(self, **kwargs):
+                raise AssertionError("fresh full catalog must not fetch pages")
+
+        now = datetime(2026, 8, 25, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp, Database(Path(tmp) / "state.db") as db:
+            db.record_sync_attempt(
+                "luogu",
+                status="fresh",
+                success=True,
+                attempted_at=now.isoformat(),
+                metadata={"full_catalog_synced_at": now.isoformat()},
+            )
+            result = sync_luogu(
+                db,
+                42,
+                CachedClient(),
+                full_catalog=True,
+                now=now + timedelta(hours=1),
+            )
+        self.assertEqual(result.status, "fresh")
+        self.assertEqual(result.problems, 0)
+
+    def test_recent_legacy_complete_catalog_is_reused_and_backfilled(self):
+        class CachedClient:
+            def practice(self, uid):
+                return set()
+
+            def tags(self):
+                raise AssertionError("legacy complete catalog must not refetch")
+
+        now = datetime(2026, 8, 25, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp, Database(Path(tmp) / "state.db") as db:
+            db.connection.execute(
+                """WITH RECURSIVE ids(value) AS (
+                       SELECT 1 UNION ALL SELECT value + 1 FROM ids WHERE value < 10000
+                   )
+                   INSERT INTO problems(platform,problem_id,tags_json,source_json,updated_at)
+                   SELECT 'luogu','P' || value,'[]','{}',? FROM ids""",
+                (now.isoformat(),),
+            )
+            db.record_sync_attempt(
+                "luogu",
+                status="fresh",
+                success=True,
+                attempted_at=now.isoformat(),
+                metadata={"catalog_synced_at": now.isoformat()},
+            )
+            result = sync_luogu(
+                db,
+                42,
+                CachedClient(),
+                full_catalog=True,
+                now=now + timedelta(hours=1),
+            )
+            metadata = json.loads(db.sync_state("luogu")["metadata_json"])
+
+        self.assertEqual(result.status, "fresh")
+        self.assertEqual(metadata["full_catalog_synced_at"], now.isoformat())
+
+    def test_public_accepts_are_committed_before_blocking_full_catalog(self):
+        catalog_started = threading.Event()
+        release_catalog = threading.Event()
+        progress: list[dict[str, object]] = []
+        results = []
+
+        class BlockingClient:
+            def practice(self, uid):
+                return {"P1000"}
+
+            def tags(self):
+                return {}
+
+            def all_problems(self, **kwargs):
+                catalog_started.set()
+                release_catalog.wait(timeout=2)
+                return [{"platform": "luogu", "problem_id": "P1001", "tags": []}]
+
+            def problem(self, problem_id, *, tag_names=None):
+                return {
+                    "platform": "luogu",
+                    "problem_id": problem_id,
+                    "tags": ["入门"],
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.db"
+
+            def run_sync():
+                with Database(path) as db:
+                    results.append(
+                        sync_luogu(
+                            db,
+                            42,
+                            BlockingClient(),
+                            refresh_catalog=True,
+                            full_catalog=True,
+                            progress_callback=progress.append,
+                        )
+                    )
+
+            worker = threading.Thread(target=run_sync)
+            worker.start()
+            try:
+                self.assertTrue(catalog_started.wait(timeout=1))
+                with Database(path) as reader:
+                    self.assertEqual(reader.problem_status("luogu", "P1000"), "accepted")
+                self.assertTrue(any(item.get("phase") == "accepted" and item.get("usable") for item in progress))
+            finally:
+                release_catalog.set()
+                worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results[0].status, "fresh")
+
+    def test_failed_full_catalog_does_not_trigger_unbounded_tag_fallback(self):
+        class FailingCatalogClient:
+            def __init__(self):
+                self.problem_calls: list[str] = []
+
+            def practice(self, uid):
+                return {f"P{1000 + index}" for index in range(55)}
+
+            def tags(self):
+                return {1: "dp"}
+
+            def all_problems(self, **kwargs):
+                raise RuntimeError("catalog page failed")
+
+            def problem(self, problem_id, *, tag_names=None):
+                self.problem_calls.append(problem_id)
+                return {
+                    "platform": "luogu",
+                    "problem_id": problem_id,
+                    "tags": ["dp"],
+                }
+
+        client = FailingCatalogClient()
+        with tempfile.TemporaryDirectory() as tmp, Database(Path(tmp) / "state.db") as db:
+            result = sync_luogu(
+                db,
+                42,
+                client,
+                refresh_catalog=True,
+                full_catalog=True,
+            )
+
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.tag_enrichment["attempted"], 10)
+        self.assertEqual(result.tag_enrichment["remaining"], 45)
+        self.assertEqual(len(client.problem_calls), 10)
+
+    def test_full_tag_enrichment_defers_recent_persistent_failure(self):
+        class FailingClient:
+            def __init__(self):
+                self.calls = 0
+
+            def tags(self):
+                return {1: "dp"}
+
+            def practice(self, uid):
+                return {"P1000"}
+
+            def problem(self, problem_id, *, tag_names=None):
+                self.calls += 1
+                raise RuntimeError("permanent bad page")
+
+        now = datetime(2026, 8, 25, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp, Database(Path(tmp) / "state.db") as db:
+            db.upsert_problem({"platform": "luogu", "problem_id": "P1000"})
+            db.upsert_submission(
+                {
+                    "platform": "luogu",
+                    "submission_id": "accepted:P1000",
+                    "problem_id": "P1000",
+                    "verdict": "AC",
+                }
+            )
+            client = FailingClient()
+            first = enrich_luogu_accepted_problem_tags(db, client, full=True, now=now)
+            second_sync = sync_luogu(
+                db,
+                42,
+                client,
+                refresh_catalog=False,
+                now=now + timedelta(hours=1),
+            )
+
+        self.assertEqual(first["failed"], 1)
+        self.assertEqual(second_sync.status, "partial")
+        self.assertEqual(second_sync.tag_enrichment["attempted"], 0)
+        self.assertEqual(second_sync.tag_enrichment["deferred"], 1)
+        self.assertEqual(client.calls, 1)
 
 
 if __name__ == "__main__":

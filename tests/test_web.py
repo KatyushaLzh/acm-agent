@@ -40,6 +40,10 @@ class FakeService:
         return {
             **self._return("setup", values),
             "validated": not bool(values.get("skip_validate")),
+            "accounts": {
+                "codeforces": str(values.get("codeforces") or ""),
+                "luogu": str(values.get("luogu") or ""),
+            },
         }
 
     def recommendations(self, **values: object) -> dict[str, object]:
@@ -190,7 +194,23 @@ class FakeService:
         return self._return("skipped_problems", values)
 
     def sync(self, **values: object) -> dict[str, object]:
-        if values.get("fail"):
+        progress = values.pop("_progress_callback", None)
+        if callable(progress):
+            progress(
+                {
+                    "phase": "complete",
+                    "platform": str(values.get("platform") or "all"),
+                    "step": 1,
+                    "total": 1,
+                    "completed": 1,
+                    "failed": 0,
+                    "message": "fixture sync complete",
+                    "started_at": "2026-08-25T00:00:00+00:00",
+                    "last_activity_at": "2026-08-25T00:00:01+00:00",
+                    "usable": True,
+                }
+            )
+        if values.get("fail") or values.get("platform") not in {None, "all", "codeforces", "luogu"}:
             raise ValueError("fixture sync failed")
         return self._return("sync", values)
 
@@ -469,11 +489,21 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(job["status"], "succeeded")
         self.assertEqual(job["result"]["platform"], "all")
 
-        status, payload, _ = self.request("POST", "/api/jobs/sync", payload={"fail": True})
+        status, payload, _ = self.request(
+            "POST", "/api/jobs/sync", payload={"platform": "invalid"}
+        )
         self.assertEqual(status, 202)
         job = self.wait_for_job(payload["data"]["job_id"])
         self.assertEqual(job["status"], "failed")
         self.assertEqual(job["error"]["code"], "invalid_request")
+
+        status, payload, _ = self.request(
+            "POST",
+            "/api/jobs/sync",
+            payload={"platform": "all", "_validated_cf_user": {"rating": 9999}},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "invalid_request")
 
         status, payload, _ = self.request(
             "POST",
@@ -492,8 +522,24 @@ class WebServerTest(unittest.TestCase):
         release = threading.Event()
 
         def blocking_sync(**values: object) -> dict[str, object]:
+            progress = values.pop("_progress_callback", None)
             started.set()
             release.wait(timeout=2)
+            if callable(progress):
+                progress(
+                    {
+                        "phase": "complete",
+                        "platform": "all",
+                        "step": 2,
+                        "total": 2,
+                        "completed": 2,
+                        "failed": 0,
+                        "message": "fixture sync complete",
+                        "started_at": "2026-08-25T00:00:00+00:00",
+                        "last_activity_at": "2026-08-25T00:00:01+00:00",
+                        "usable": True,
+                    }
+                )
             return {"operation": "sync", **values}
 
         self.service.sync = blocking_sync
@@ -513,9 +559,35 @@ class WebServerTest(unittest.TestCase):
             # Bootstrap uses the global service lock.  It must remain
             # responsive while the network-bound initial crawl is running.
             before = time.monotonic()
-            bootstrap_status, _, _ = self.request("GET", "/api/bootstrap")
+            bootstrap_status, bootstrap_payload, _ = self.request("GET", "/api/bootstrap")
             self.assertEqual(bootstrap_status, 200)
             self.assertLess(time.monotonic() - before, 0.5)
+            self.assertEqual(
+                bootstrap_payload["data"]["active_sync_job"]["job_id"],
+                job_id,
+            )
+
+            same_status, same_payload, _ = self.request(
+                "POST",
+                "/api/setup",
+                payload={"codeforces": "fixture", "luogu": "42"},
+            )
+            self.assertEqual(same_status, 200)
+            self.assertEqual(
+                same_payload["data"]["initial_sync_job"]["job_id"],
+                job_id,
+            )
+
+            changed_status, changed_payload, _ = self.request(
+                "POST",
+                "/api/setup",
+                payload={"codeforces": "different", "luogu": "43"},
+            )
+            self.assertEqual(changed_status, 200)
+            self.assertNotEqual(
+                changed_payload["data"]["initial_sync_job"]["job_id"],
+                job_id,
+            )
 
             release.set()
             job = self.wait_for_job(job_id)
@@ -525,10 +597,11 @@ class WebServerTest(unittest.TestCase):
                 {
                     "operation": "sync",
                     "platform": "all",
-                    "force": True,
                     "full_catalog": True,
                 },
             )
+            self.assertEqual(job["progress"]["phase"], "complete")
+            self.assertTrue(job["progress"]["usable"])
         finally:
             release.set()
 
@@ -545,6 +618,19 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertFalse(payload["data"]["validated"])
         self.assertIsNone(payload["data"]["initial_sync_job"])
+
+        status, payload, _ = self.request(
+            "POST",
+            "/api/setup",
+            payload={
+                "codeforces": "fixture",
+                "luogu": "42",
+                "skip_validate": True,
+                "_progress_callback": {},
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "invalid_request")
 
     def test_finite_stress_verify_job_is_preserved(self) -> None:
         request = {
@@ -691,7 +777,6 @@ class WebServerTest(unittest.TestCase):
 
     def test_synchronous_routes_forward_json_objects(self) -> None:
         routes = {
-            "/api/setup": "setup",
             "/api/recommendations": "recommendations",
             "/api/sessions/start": "start",
             "/api/sessions/close": "close",

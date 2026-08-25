@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -23,6 +24,24 @@ from .storage import Database
 CF_BASE = "https://codeforces.com/api"
 LUOGU_BASE = "https://www.luogu.com.cn"
 CF_THROTTLE_SECONDS = 2.1
+LUOGU_CATALOG_WORKERS = 4
+LUOGU_TAG_WORKERS = 4
+LUOGU_TAG_FAILURES_KEY = "tag_enrichment_failures"
+LUOGU_FULL_CATALOG_MIN_PROBLEMS = 10_000
+
+
+def _report_progress(
+    callback: Callable[[Mapping[str, Any]], None] | None,
+    **progress: Any,
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(progress)
+    except Exception:
+        # Observability must never turn a successful platform sync into a
+        # failed one (for example when a web client disconnects).
+        return
 
 
 class PlatformError(RuntimeError):
@@ -596,6 +615,8 @@ class LuoguClient:
         *,
         tag_names: Mapping[int, str] | None = None,
         max_pages: int = 1000,
+        workers: int = LUOGU_CATALOG_WORKERS,
+        progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch every page of the public catalog, retaining supported P IDs."""
 
@@ -611,14 +632,74 @@ class LuoguClient:
             row["problem_id"]: row
             for row in first["problems"]
         }
-        for page_number in range(2, total_pages + 1):
-            current = self.problem_page_info(page=page_number, tag_names=tag_names)
-            if current["raw_count"] == 0:
-                raise ResponseShapeError(
-                    f"Luogu catalog page {page_number}/{total_pages} is unexpectedly empty"
+        _report_progress(
+            progress_callback,
+            phase="catalog",
+            platform="luogu",
+            step=1,
+            total=total_pages,
+            completed=1,
+            failed=0,
+            message=f"洛谷题库 1/{total_pages} 页",
+            usable=False,
+        )
+
+        def fetch_page(page_number: int) -> tuple[int, dict[str, Any]]:
+            return page_number, self.problem_page_info(
+                page=page_number, tag_names=tag_names
+            )
+
+        page_numbers = list(range(2, total_pages + 1))
+        # Small catalogs stay deterministic for fixtures and cheap manual
+        # queries. Real full catalogs use bounded concurrency so a slow page
+        # does not serialize hundreds of independent HTTP round trips.
+        if len(page_numbers) >= 7 and workers > 1:
+            executor = ThreadPoolExecutor(
+                max_workers=min(max(1, int(workers)), LUOGU_CATALOG_WORKERS),
+                thread_name_prefix="acm-luogu-catalog",
+            )
+            try:
+                page_results = executor.map(fetch_page, page_numbers)
+                for page_number, current in page_results:
+                    if current["raw_count"] == 0:
+                        raise ResponseShapeError(
+                            f"Luogu catalog page {page_number}/{total_pages} is unexpectedly empty"
+                        )
+                    for row in current["problems"]:
+                        found[row["problem_id"]] = row
+                    _report_progress(
+                        progress_callback,
+                        phase="catalog",
+                        platform="luogu",
+                        step=page_number,
+                        total=total_pages,
+                        completed=page_number,
+                        failed=0,
+                        message=f"洛谷题库 {page_number}/{total_pages} 页",
+                        usable=False,
+                    )
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
+        else:
+            for page_number in page_numbers:
+                _, current = fetch_page(page_number)
+                if current["raw_count"] == 0:
+                    raise ResponseShapeError(
+                        f"Luogu catalog page {page_number}/{total_pages} is unexpectedly empty"
+                    )
+                for row in current["problems"]:
+                    found[row["problem_id"]] = row
+                _report_progress(
+                    progress_callback,
+                    phase="catalog",
+                    platform="luogu",
+                    step=page_number,
+                    total=total_pages,
+                    completed=page_number,
+                    failed=0,
+                    message=f"洛谷题库 {page_number}/{total_pages} 页",
+                    usable=False,
                 )
-            for row in current["problems"]:
-                found[row["problem_id"]] = row
         return [found[key] for key in sorted(found)]
 
     def problem_by_keyword(
@@ -677,6 +758,7 @@ def _normalise_preview_tags(value: Any) -> list[str]:
 
 LUOGU_TAG_ENRICHMENT_CURSOR_KEY = "tag_enrichment_cursor"
 LUOGU_TAG_ENRICHMENT_MAX_BATCH = 50
+LUOGU_TAG_ENRICHMENT_CATALOG_FAILURE_BATCH = 10
 
 
 def _sync_metadata(db: Database, platform: str) -> dict[str, Any]:
@@ -742,6 +824,9 @@ def enrich_luogu_accepted_problem_tags(
     *,
     batch_size: int = LUOGU_TAG_ENRICHMENT_MAX_BATCH,
     full: bool = False,
+    workers: int = LUOGU_TAG_WORKERS,
+    now: datetime | None = None,
+    progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Incrementally cache public tags for accepted Luogu problems.
 
@@ -753,15 +838,30 @@ def enrich_luogu_accepted_problem_tags(
     """
 
     client = client or LuoguClient()
+    now = now or datetime.now(timezone.utc)
     metadata = _sync_metadata(db, "luogu")
     cursor = metadata.get(LUOGU_TAG_ENRICHMENT_CURSOR_KEY)
     missing = _luogu_accepted_problems_missing_tags(db)
+    raw_failures = metadata.get(LUOGU_TAG_FAILURES_KEY)
+    failures: dict[str, dict[str, Any]] = {
+        str(problem_id).strip().upper(): dict(value)
+        for problem_id, value in (raw_failures.items() if isinstance(raw_failures, Mapping) else [])
+        if isinstance(value, Mapping)
+    }
+    eligible: list[str] = []
+    deferred = 0
+    for problem_id in missing:
+        retry_at = _parse_iso(str(failures.get(problem_id, {}).get("next_retry_at") or ""))
+        if full and retry_at is not None and retry_at > now:
+            deferred += 1
+        else:
+            eligible.append(problem_id)
     limit = (
-        len(missing)
+        len(eligible)
         if full
         else min(max(int(batch_size), 0), LUOGU_TAG_ENRICHMENT_MAX_BATCH)
     )
-    selected = _rotated_problem_batch(missing, str(cursor) if cursor else None, limit)
+    selected = _rotated_problem_batch(eligible, str(cursor) if cursor else None, limit)
     errors: list[dict[str, str]] = []
     resolved_rows: list[dict[str, Any]] = []
 
@@ -789,7 +889,8 @@ def enrich_luogu_accepted_problem_tags(
             )
 
     failed_problem_ids: set[str] = set()
-    for problem_id in selected:
+
+    def fetch_problem(problem_id: str) -> tuple[str, dict[str, Any] | None, BaseException | None]:
         try:
             problem = client.problem(problem_id, tag_names=tag_names)
             returned_id = str(problem.get("problem_id") or "").strip().upper()
@@ -798,21 +899,59 @@ def enrich_luogu_accepted_problem_tags(
                     f"Luogu problem lookup for {problem_id} returned {returned_id or 'no pid'}"
                 )
             tags = _normalise_preview_tags(problem.get("tags", []))
-            resolved_rows.append(dict(problem))
             if not tags:
                 raise ResponseShapeError(f"Luogu problem {problem_id} has no public tags")
+            return problem_id, dict(problem), None
         except Exception as exc:
+            return problem_id, None, exc
+
+    if isinstance(client, LuoguClient) and len(selected) >= 4 and workers > 1:
+        with ThreadPoolExecutor(
+            max_workers=min(max(1, int(workers)), LUOGU_TAG_WORKERS),
+            thread_name_prefix="acm-luogu-tags",
+        ) as executor:
+            fetched = executor.map(fetch_problem, selected)
+            fetch_results = list(fetched)
+    else:
+        fetch_results = [fetch_problem(problem_id) for problem_id in selected]
+
+    for completed, (problem_id, problem, exc) in enumerate(fetch_results, start=1):
+        if exc is None and problem is not None:
+            resolved_rows.append(problem)
+            failures.pop(problem_id, None)
+        else:
             failed_problem_ids.add(problem_id)
+            previous_attempts = int(failures.get(problem_id, {}).get("attempts") or 0)
+            attempts = previous_attempts + 1
+            retry_hours = min(24 * (2 ** (attempts - 1)), 24 * 7)
+            failures[problem_id] = {
+                "attempts": attempts,
+                "last_failed_at": now.isoformat(timespec="seconds"),
+                "next_retry_at": (now + timedelta(hours=retry_hours)).isoformat(timespec="seconds"),
+                "error": _safe_platform_error(exc or PlatformError("unknown failure")),
+            }
             errors.append(
                 {
                     "platform": "luogu",
                     "problem_id": problem_id,
-                    "message": _safe_platform_error(exc),
+                    "message": _safe_platform_error(exc or PlatformError("unknown failure")),
                 }
             )
+        _report_progress(
+            progress_callback,
+            phase="tags",
+            platform="luogu",
+            step=completed,
+            total=len(selected),
+            completed=completed - len(failed_problem_ids),
+            failed=len(failed_problem_ids),
+            message=f"洛谷标签 {completed}/{len(selected)}",
+            usable=True,
+        )
 
     if selected:
         metadata[LUOGU_TAG_ENRICHMENT_CURSOR_KEY] = selected[-1]
+    metadata[LUOGU_TAG_FAILURES_KEY] = failures
     with db.atomic():
         db.upsert_problems(resolved_rows)
         db.connection.execute(
@@ -831,6 +970,7 @@ def enrich_luogu_accepted_problem_tags(
         "remaining": remaining,
         "cursor": metadata.get(LUOGU_TAG_ENRICHMENT_CURSOR_KEY),
         "errors": errors,
+        **({"deferred": deferred} if deferred else {}),
     }
 
 
@@ -1010,6 +1150,8 @@ def sync_codeforces(
     *,
     refresh_catalog: bool | None = None,
     now: datetime | None = None,
+    validated_user: Mapping[str, Any] | None = None,
+    progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> SyncResult:
     """Synchronize one Codeforces account without destructive partial writes."""
     client = client or CodeforcesClient()
@@ -1017,8 +1159,19 @@ def sync_codeforces(
     state = db.sync_state("codeforces")
     if refresh_catalog is None:
         refresh_catalog = _catalog_due(state, "problemset_synced_at", 24, now)
+    _report_progress(
+        progress_callback,
+        phase="account",
+        platform="codeforces",
+        step=0,
+        total=2,
+        completed=0,
+        failed=0,
+        message="正在同步 Codeforces 账号与提交",
+        usable=False,
+    )
     try:
-        user = client.user_info(handle)
+        user = validated_user or client.user_info(handle)
         raw_submissions = client.new_submissions(handle, db.known_submission_ids("codeforces"))
         submissions: list[dict[str, Any]] = []
         submission_problems: list[dict[str, Any]] = []
@@ -1034,6 +1187,17 @@ def sync_codeforces(
     warnings: list[str] = []
     catalog_ok = not refresh_catalog
     if refresh_catalog:
+        _report_progress(
+            progress_callback,
+            phase="catalog",
+            platform="codeforces",
+            step=0,
+            total=1,
+            completed=0,
+            failed=0,
+            message="正在刷新 Codeforces 全局题库",
+            usable=False,
+        )
         try:
             catalog, stats = client.problemset()
             stat_by_key = {
@@ -1087,6 +1251,17 @@ def sync_codeforces(
     except Exception as exc:
         db.record_sync_attempt("codeforces", status="failed", error=str(exc), success=False)
         return SyncResult("codeforces", "failed", error=str(exc))
+    _report_progress(
+        progress_callback,
+        phase="complete",
+        platform="codeforces",
+        step=1,
+        total=1,
+        completed=1,
+        failed=0 if status != "partial" else 1,
+        message="Codeforces 同步完成" if status == "fresh" else "Codeforces 基础数据可用，题库刷新部分失败",
+        usable=True,
+    )
     return SyncResult(
         "codeforces",
         status,
@@ -1107,42 +1282,50 @@ def sync_luogu(
     candidate_queries: Sequence[Mapping[str, Any]] | None = None,
     full_catalog: bool = False,
     now: datetime | None = None,
+    progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> SyncResult:
     """Sync public Luogu ACs; catalog errors produce a usable partial sync."""
     client = client or LuoguClient()
     now = now or datetime.now(timezone.utc)
     state = db.sync_state("luogu")
+    legacy_full_catalog_at: str | None = None
     if refresh_catalog is None:
         refresh_catalog = _catalog_due(state, "catalog_synced_at", 24, now)
+        if full_catalog:
+            refresh_catalog = _catalog_due(state, "full_catalog_synced_at", 24, now)
+            if refresh_catalog:
+                old_metadata = _sync_metadata(db, "luogu")
+                old_stamp = str(old_metadata.get("catalog_synced_at") or "")
+                parsed_old_stamp = _parse_iso(old_stamp)
+                local_problem_count = int(
+                    db.connection.execute(
+                        "SELECT COUNT(*) FROM problems WHERE platform='luogu'"
+                    ).fetchone()[0]
+                )
+                if (
+                    parsed_old_stamp is not None
+                    and parsed_old_stamp <= now
+                    and now - parsed_old_stamp < timedelta(hours=24)
+                    and local_problem_count >= LUOGU_FULL_CATALOG_MIN_PROBLEMS
+                ):
+                    refresh_catalog = False
+                    legacy_full_catalog_at = old_stamp
+    _report_progress(
+        progress_callback,
+        phase="account",
+        platform="luogu",
+        step=0,
+        total=1,
+        completed=0,
+        failed=0,
+        message="正在同步洛谷公开 AC",
+        usable=False,
+    )
     try:
         passed = client.practice(uid)
     except Exception as exc:
         db.record_sync_attempt("luogu", status="failed", error=str(exc), success=False)
         return SyncResult("luogu", "failed", error=str(exc))
-
-    catalog: list[dict[str, Any]] = []
-    warnings: list[str] = []
-    tags: dict[int, str] = {}
-    catalog_ok = not refresh_catalog
-    if refresh_catalog:
-        try:
-            tags = client.tags()
-            if full_catalog:
-                catalog = client.all_problems(tag_names=tags)
-            else:
-                queries = candidate_queries or tuple({"page": page} for page in candidate_pages)
-                for query in queries:
-                    catalog.extend(
-                        client.problem_page(
-                            page=int(query.get("page", 1)),
-                            difficulty=query.get("difficulty"),
-                            tag=query.get("tag"),
-                            tag_names=tags,
-                        )
-                    )
-            catalog_ok = True
-        except Exception as exc:
-            warnings.append(f"catalog refresh failed: {exc}")
 
     accepted_problems = [
         {
@@ -1158,11 +1341,10 @@ def sync_luogu(
             metadata.update(json.loads(state["metadata_json"] or "{}"))
         except (json.JSONDecodeError, TypeError):
             pass
-    if refresh_catalog and catalog_ok:
-        metadata["catalog_synced_at"] = now.isoformat(timespec="seconds")
-        metadata["tags"] = {str(key): value for key, value in tags.items()}
+    if legacy_full_catalog_at:
+        metadata["full_catalog_synced_at"] = legacy_full_catalog_at
     metadata["uid"] = str(uid)
-    status = "fresh" if not warnings else "partial"
+    stamp = now.isoformat(timespec="seconds")
     try:
         with db.atomic():
             db.upsert_account(
@@ -1170,7 +1352,6 @@ def sync_luogu(
                 str(uid),
                 validated_at=now.isoformat(timespec="seconds"),
             )
-            db.upsert_problems(catalog)
             db.upsert_problems(accepted_problems)
             for pid in sorted(passed):
                 db.upsert_submission(
@@ -1184,25 +1365,105 @@ def sync_luogu(
                         "raw": {"source": "public-practice"},
                     }
                 )
-            stamp = now.isoformat(timespec="seconds")
             db.connection.execute(
                 """INSERT INTO sync_state(platform,status,last_attempt_at,last_success_at,error,cursor,metadata_json)
                    VALUES('luogu',?,?,?,?,NULL,?)
                    ON CONFLICT(platform) DO UPDATE SET status=excluded.status,
                      last_attempt_at=excluded.last_attempt_at,last_success_at=excluded.last_success_at,
                      error=excluded.error,metadata_json=excluded.metadata_json""",
-                (status, stamp, stamp, warnings[0] if warnings else None, json.dumps(metadata, ensure_ascii=False)),
+                ("fresh", stamp, stamp, None, json.dumps(metadata, ensure_ascii=False)),
             )
     except Exception as exc:
         db.record_sync_attempt("luogu", status="failed", error=str(exc), success=False)
         return SyncResult("luogu", "failed", error=str(exc))
+    _report_progress(
+        progress_callback,
+        phase="accepted",
+        platform="luogu",
+        step=len(passed),
+        total=len(passed),
+        completed=len(passed),
+        failed=0,
+        message=f"洛谷公开 AC 已可用（{len(passed)} 题）",
+        usable=True,
+    )
+
+    # The account and public AC set are now durable and usable. Catalog fetches
+    # remain an independent all-or-nothing snapshot: no catalog row is written
+    # until every requested page has passed its structure guards.
+    catalog: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    tags: dict[int, str] = {}
+    catalog_failed = False
+    if refresh_catalog:
+        try:
+            tags = client.tags()
+            if full_catalog:
+                def catalog_progress(values: Mapping[str, Any]) -> None:
+                    _report_progress(progress_callback, **{**dict(values), "usable": True})
+
+                catalog = client.all_problems(
+                    tag_names=tags,
+                    progress_callback=catalog_progress,
+                )
+            else:
+                queries = candidate_queries or tuple({"page": page} for page in candidate_pages)
+                for query_index, query in enumerate(queries, start=1):
+                    catalog.extend(
+                        client.problem_page(
+                            page=int(query.get("page", 1)),
+                            difficulty=query.get("difficulty"),
+                            tag=query.get("tag"),
+                            tag_names=tags,
+                        )
+                    )
+                    _report_progress(
+                        progress_callback,
+                        phase="catalog",
+                        platform="luogu",
+                        step=query_index,
+                        total=len(queries),
+                        completed=query_index,
+                        failed=0,
+                        message="正在刷新洛谷候选题库",
+                        usable=True,
+                    )
+            metadata["catalog_synced_at"] = stamp
+            if full_catalog:
+                metadata["full_catalog_synced_at"] = stamp
+            metadata["tags"] = {str(key): value for key, value in tags.items()}
+            with db.atomic():
+                db.upsert_problems(catalog)
+                db.connection.execute(
+                    "UPDATE sync_state SET metadata_json=? WHERE platform='luogu'",
+                    (json.dumps(metadata, ensure_ascii=False),),
+                )
+        except Exception as exc:
+            catalog_failed = True
+            warnings.append(f"catalog refresh failed: {exc}")
     tag_enrichment: dict[str, Any] | None = None
     try:
-        tag_enrichment = enrich_luogu_accepted_problem_tags(db, client, full=True)
+        tag_enrichment = enrich_luogu_accepted_problem_tags(
+            db,
+            client,
+            batch_size=(
+                LUOGU_TAG_ENRICHMENT_CATALOG_FAILURE_BATCH
+                if catalog_failed
+                else LUOGU_TAG_ENRICHMENT_MAX_BATCH
+            ),
+            full=not catalog_failed,
+            now=now,
+            progress_callback=progress_callback,
+        )
         if tag_enrichment["failed"]:
             warnings.append(
                 "tag enrichment failed for "
                 f"{tag_enrichment['failed']}/{tag_enrichment['attempted']} problem(s)"
+            )
+        elif tag_enrichment.get("deferred"):
+            warnings.append(
+                "tag enrichment deferred for "
+                f"{tag_enrichment['deferred']} problem(s) after recent failures"
             )
     except Exception as exc:
         warnings.append(f"tag enrichment failed: {_safe_platform_error(exc)}")
@@ -1214,6 +1475,17 @@ def sync_luogu(
                 "UPDATE sync_state SET status='partial',error=? WHERE platform='luogu'",
                 (warnings[0],),
             )
+    _report_progress(
+        progress_callback,
+        phase="complete",
+        platform="luogu",
+        step=1,
+        total=1,
+        completed=1,
+        failed=0 if status != "partial" else 1,
+        message="洛谷同步完成" if status == "fresh" else "洛谷基础数据可用，部分元数据待重试",
+        usable=True,
+    )
     return SyncResult(
         "luogu",
         status,

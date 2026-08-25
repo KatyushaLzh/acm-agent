@@ -208,6 +208,19 @@ label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weig
 .source-row { display: grid; grid-template-columns: 110px 1fr auto; gap: 10px; align-items: center; font-size: 12px; }
 .source-row strong { text-transform: capitalize; }
 .source-row small { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+.sync-progress { display: grid; gap: 8px; margin-top: 16px; padding: 12px; border: 1px solid color-mix(in srgb, var(--brand) 32%, var(--line)); border-radius: 10px; background: color-mix(in srgb, var(--brand-soft) 58%, var(--surface)); }
+.sync-progress-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px; }
+.sync-progress-heading strong { color: var(--ink); font-size: 12px; }
+.sync-progress-usable { flex: 0 0 auto; color: var(--brand-strong); font-size: 10px; font-weight: 750; }
+.sync-progress progress { width: 100%; height: 7px; overflow: hidden; accent-color: var(--brand); border: 0; border-radius: 999px; }
+.sync-progress progress:indeterminate { animation: sync-progress-pulse 1.2s ease-in-out infinite; }
+.sync-progress p { margin: 0; color: var(--ink); font-size: 11px; line-height: 1.55; }
+.sync-progress small { color: var(--muted); font-size: 10px; }
+.sync-progress.terminal.fresh { border-color: color-mix(in srgb, var(--brand) 45%, var(--line)); }
+.sync-progress.terminal.partial { border-color: color-mix(in srgb, var(--warning) 58%, var(--line)); background: color-mix(in srgb, var(--warning-soft) 66%, var(--surface)); }
+.sync-progress.terminal.partial .sync-progress-usable { color: var(--warning); }
+.sync-progress.terminal.failed { border-color: color-mix(in srgb, var(--danger) 48%, var(--line)); background: color-mix(in srgb, var(--danger-soft) 66%, var(--surface)); }
+.sync-progress.terminal.failed .sync-progress-usable { color: var(--danger); }
 .empty-state { display: grid; place-items: center; min-height: 150px; padding: 20px; color: var(--muted); border: 1px dashed var(--line); border-radius: var(--radius); text-align: center; }
 .empty-state.compact { min-height: 95px; }
 .session-card { display: grid; gap: 8px; }
@@ -217,6 +230,7 @@ label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weig
 .progress-track { height: 6px; overflow: hidden; background: var(--surface-2); border-radius: 999px; }
 .progress-track span { display: block; width: 38%; height: 100%; background: var(--brand); border-radius: inherit; animation: indeterminate 1.2s infinite ease-in-out; }
 @keyframes indeterminate { from { transform: translateX(-110%); } to { transform: translateX(310%); } }
+@keyframes sync-progress-pulse { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
 .job-progress p { margin: 7px 0 0; color: var(--muted); font-size: 11px; }
 
 .workbench-grid { margin-top: 5px; }

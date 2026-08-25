@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timezone
+import inspect
 import json
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .config import load_config, save_config
 from .deepseek import DeepSeekClient
@@ -19,6 +20,21 @@ from .workspace import parse_problem_ref, scan_local_solutions
 
 
 class ServiceCoreMixin:
+    @staticmethod
+    def _accepts_keyword(function: Callable[..., Any], name: str) -> bool:
+        side_effect = getattr(function, "side_effect", None)
+        if callable(side_effect):
+            function = side_effect
+        try:
+            parameters = inspect.signature(function).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            or parameter.name == name
+            for parameter in parameters
+        )
+
     @property
     def configured(self) -> bool:
         if not self.paths.config.is_file():
@@ -119,6 +135,7 @@ class ServiceCoreMixin:
         target_rating: int | None = None,
         skip_validate: bool = False,
         defer_sync: bool = False,
+        _progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         handle = str(codeforces).strip()
         uid = str(luogu).strip()
@@ -171,7 +188,13 @@ class ServiceCoreMixin:
                 # identities are known.  Populate the complete CF catalog,
                 # Luogu AC set, and every currently missing Luogu tag now so
                 # later recommendations never need to perform metadata I/O.
-                initial_sync = self.sync("all", force=True, full_catalog=True)
+                initial_sync = self.sync(
+                    "all",
+                    full_catalog=True,
+                    import_local_files=False,
+                    _progress_callback=_progress_callback,
+                    _validated_cf_user=cf_user,
+                )
                 luogu_result = next(
                     (
                         item
@@ -215,33 +238,93 @@ class ServiceCoreMixin:
         *,
         force: bool = False,
         full_catalog: bool = False,
+        import_local_files: bool = True,
+        _progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
+        _validated_cf_user: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if platform not in {"all", "codeforces", "luogu"}:
             raise ValueError("platform 必须是 all、codeforces 或 luogu")
         config = load_config(self.paths)
         selected = [platform] if platform != "all" else ["codeforces", "luogu"]
         results: list[dict[str, Any]] = []
+        started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+        def progress(values: Mapping[str, Any]) -> None:
+            if _progress_callback is None:
+                return
+            payload = {
+                "phase": str(values.get("phase") or "sync"),
+                "platform": str(values.get("platform") or platform),
+                "step": int(values.get("step") or 0),
+                "total": int(values.get("total") or len(selected)),
+                "completed": int(values.get("completed") or 0),
+                "failed": int(values.get("failed") or 0),
+                "message": str(values.get("message") or "正在同步平台数据"),
+                "started_at": started_at,
+                "last_activity_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "usable": bool(values.get("usable", False)),
+            }
+            _progress_callback(payload)
+
+        progress(
+            {
+                "phase": "preparing",
+                "platform": platform,
+                "step": 0,
+                "total": len(selected),
+                "completed": 0,
+                "failed": 0,
+                "message": "正在准备同步",
+                "usable": False,
+            }
+        )
         with Database(self.paths.database) as db:
-            self._import_local_files(db)
-            for selected_platform in selected:
+            if import_local_files:
+                self._import_local_files(db)
+            for platform_index, selected_platform in enumerate(selected, start=1):
+                progress(
+                    {
+                        "phase": "platform",
+                        "platform": selected_platform,
+                        "step": platform_index,
+                        "total": len(selected),
+                        "completed": platform_index - 1,
+                        "failed": sum(item["status"] == "failed" for item in results),
+                        "message": f"正在同步 {selected_platform}",
+                        "usable": bool(results),
+                    }
+                )
                 if selected_platform == "codeforces":
                     handle = str(config["accounts"]["codeforces"].get("handle") or "")
                     if not handle:
                         raise ValueError("未配置 Codeforces handle，请先运行 acm init")
-                    result = self._sync_codeforces(
-                        db, handle, refresh_catalog=True if force else None
-                    )
+                    kwargs: dict[str, Any] = {
+                        "refresh_catalog": True if force else None,
+                    }
+                    if _progress_callback is not None and self._accepts_keyword(
+                        self._sync_codeforces, "progress_callback"
+                    ):
+                        kwargs["progress_callback"] = progress
+                    if (
+                        isinstance(_validated_cf_user, Mapping)
+                        and self._accepts_keyword(self._sync_codeforces, "validated_user")
+                    ):
+                        kwargs["validated_user"] = _validated_cf_user
+                    result = self._sync_codeforces(db, handle, **kwargs)
                 else:
                     uid = str(config["accounts"]["luogu"].get("uid") or "")
                     if not uid:
                         raise ValueError("未配置洛谷 UID，请先运行 acm init")
                     if full_catalog:
-                        result = self._sync_luogu(
-                            db,
-                            uid,
-                            refresh_catalog=True,
-                            full_catalog=True,
-                        )
+                        kwargs = {
+                            "refresh_catalog": True if force else None,
+                            "full_catalog": True,
+                        }
+                        if _progress_callback is not None and self._accepts_keyword(
+                            self._sync_luogu, "progress_callback"
+                        ):
+                            kwargs["progress_callback"] = progress
+                        result = self._sync_luogu(db, uid, **kwargs)
                     else:
                         cf_account = db.account("codeforces")
                         solved_profile = self._recent_solved_difficulty_profile(db)
@@ -262,20 +345,56 @@ class ServiceCoreMixin:
                             min(equivalents, key=lambda level: abs(equivalents[level] - target))
                             for target in difficulty_targets.values()
                         }
-                        result = self._sync_luogu(
-                            db,
-                            uid,
-                            refresh_catalog=True if force else None,
-                            candidate_queries=[
+                        kwargs = {
+                            "refresh_catalog": True if force else None,
+                            "candidate_queries": [
                                 {"page": 1, "difficulty": difficulty}
                                 for difficulty in sorted(target_difficulties)
                             ],
-                        )
+                        }
+                        if _progress_callback is not None and self._accepts_keyword(
+                            self._sync_luogu, "progress_callback"
+                        ):
+                            kwargs["progress_callback"] = progress
+                        result = self._sync_luogu(db, uid, **kwargs)
                 row = result.as_dict()
                 row["freshness"] = freshness(db, selected_platform)
                 results.append(row)
+                progress(
+                    {
+                        "phase": "platform_complete",
+                        "platform": selected_platform,
+                        "step": platform_index,
+                        "total": len(selected),
+                        "completed": platform_index,
+                        "failed": sum(item["status"] == "failed" for item in results),
+                        "message": f"{selected_platform} 同步结果：{row['status']}",
+                        "usable": any(item["status"] in {"fresh", "partial"} for item in results),
+                    }
+                )
+        statuses = [item["status"] for item in results]
+        aggregate_status = (
+            "fresh"
+            if statuses and all(status == "fresh" for status in statuses)
+            else "failed"
+            if statuses and all(status == "failed" for status in statuses)
+            else "partial"
+        )
+        progress(
+            {
+                "phase": "complete",
+                "platform": platform,
+                "step": len(selected),
+                "total": len(selected),
+                "completed": len(results),
+                "failed": sum(status == "failed" for status in statuses),
+                "message": f"同步完成：{aggregate_status}",
+                "usable": any(status in {"fresh", "partial"} for status in statuses),
+            }
+        )
         return {
             "ok": all(item["status"] in {"fresh", "partial"} for item in results),
+            "status": aggregate_status,
             "results": results,
         }
 

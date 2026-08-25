@@ -94,7 +94,7 @@ Run fallback commands from the repository root and request JSON whenever facts f
 .\acm.ps1 plan check --json
 ```
 
-If configuration is missing, run `.\acm.ps1 init` and let the user enter a Codeforces handle and numeric Luogu UID. CLI initialization waits for the complete Codeforces/Luogu sync and every unresolved accepted Luogu problem tag attempt. Dashboard setup saves validated accounts, enters the main view immediately, and tracks the same crawl as a background job on the settings save button. `--skip-validate` remains offline and skips that network work. Do not invent account identifiers.
+If configuration is missing, run `.\acm.ps1 init` and let the user enter a Codeforces handle and numeric Luogu UID. CLI initialization waits for the platform sync, but reuses a fresh global catalog and respects persisted Luogu tag retry backoff. Dashboard setup saves validated accounts, enters the main view immediately, and exposes the background sync as a persistent progress card with platform, phase, counts, elapsed time, and fresh/partial/failed outcome; a new tab restores the active job from bootstrap. Luogu public AC state is committed before the full catalog crawl, so the main workflow remains usable while catalog pages and tags continue. Full Luogu catalog pages and eligible tag lookups use bounded concurrency; a catalog-page failure preserves the previous complete snapshot and limits fallback tag repair instead of expanding into one request per accepted problem. `--skip-validate` remains offline and skips that network work. Do not invent account identifiers.
 
 ## Coaching Contract
 
