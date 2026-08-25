@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 import concurrent.futures
+import os
 import sys
 import tempfile
 import time
@@ -20,6 +21,16 @@ from tools.acm_agent.workspace import (
     start_problem,
     validate_default_template,
 )
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    """Compare canonical paths so Windows 8.3 aliases do not fail containment tests."""
+    canonical_path = os.path.normcase(os.path.realpath(path))
+    canonical_root = os.path.normcase(os.path.realpath(root))
+    try:
+        return os.path.commonpath((canonical_path, canonical_root)) == canonical_root
+    except ValueError:
+        return False
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -221,7 +232,10 @@ class VerifyTests(unittest.TestCase):
             executables = [Path(result.compile_command[-1]) for result in results]
             self.assertNotEqual(executables[0].parent, executables[1].parent)
             self.assertTrue(
-                all(path.is_relative_to(root / ".acm" / "build" / "runs") for path in executables)
+                all(
+                    _path_is_within(path, root / ".acm" / "build" / "runs")
+                    for path in executables
+                )
             )
 
     def test_output_limit_is_a_structured_sample_failure(self) -> None:
@@ -287,7 +301,11 @@ class VerifyTests(unittest.TestCase):
             token_result = verify_problem(root, "CF1A")
             self.assertTrue(token_result.passed, token_result.to_dict())
             self.assertTrue(token_result.cases[0].passed)
-            self.assertTrue(Path(token_result.compile_command[-1]).is_relative_to(root / ".acm" / "build"))
+            self.assertTrue(
+                _path_is_within(
+                    Path(token_result.compile_command[-1]), root / ".acm" / "build"
+                )
+            )
 
             exact_result = verify_problem(root, "CF1A", exact=True)
             self.assertFalse(exact_result.passed)
@@ -322,7 +340,7 @@ class VerifyTests(unittest.TestCase):
             self.assertEqual(result.stress_iterations, 1)
             self.assertIsNotNone(result.failure_dir)
             failure = Path(result.failure_dir or "")
-            self.assertTrue(failure.is_relative_to(root / ".acm" / "failures"))
+            self.assertTrue(_path_is_within(failure, root / ".acm" / "failures"))
             self.assertEqual((failure / "input.txt").read_text(), "1\n")
             self.assertEqual((failure / "actual.txt").read_text().strip(), "0")
             self.assertEqual((failure / "expected.txt").read_text().strip(), "1")
