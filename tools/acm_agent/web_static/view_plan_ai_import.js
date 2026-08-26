@@ -3,6 +3,7 @@ import {
   navigate, pollJob, state, toast,
 } from "./core.js";
 import { importErrors, submitPlanImport } from "./view_plans.js";
+import { aiRequestSelection } from "./ai_model_controls.js";
 
 function deepClone(value) { return JSON.parse(JSON.stringify(value)); }
 function draftStages() {
@@ -137,8 +138,11 @@ function selectedMode() {
 }
 
 function syncGenerateControls() {
-  $("#ai-plan-generate-controls").classList.toggle("hidden", selectedMode() !== "generate");
-  $("#ai-plan-text").placeholder = selectedMode() === "generate"
+  const mode = selectedMode();
+  $("#ai-plan-generate-controls").classList.toggle("hidden", mode !== "generate");
+  $('[data-ai-model-picker="plan_organize"]').classList.toggle("hidden", mode !== "organize");
+  $('[data-ai-model-picker="plan_generate"]').classList.toggle("hidden", mode !== "generate");
+  $("#ai-plan-text").placeholder = mode === "generate"
     ? "例如：生成一份线段树与树状数组强化题单，先基础操作，再综合应用。"
     : "例如：第一阶段整理 CF1A、P3374；第二阶段做 P3372，并标记为提高。";
 }
@@ -153,6 +157,7 @@ function aiPlanJobError(job) {
 async function generateAiPlan(button) {
   const text = $("#ai-plan-text").value.trim();
   const mode = selectedMode();
+  const profileId = mode === "generate" ? "plan_generate" : "plan_organize";
   const count = Number($("#ai-plan-task-count").value);
   if (!text) {
     $("#ai-plan-request-error").textContent = "请先输入题目列表或训练目标。";
@@ -165,8 +170,8 @@ async function generateAiPlan(button) {
     $("#ai-plan-request-error").classList.remove("hidden");
     return;
   }
-  if (state.aiStatus?.api_key_detected === false) {
-    toast("尚未启用 DeepSeek", "请先在设置页输入 API Key 并保存。", "error");
+  if (state.aiStatus?.profiles?.[profileId]?.ready === false) {
+    toast("题单模型不可用", "请先选择并验证此模式使用的模型。", "error");
     $("#ai-plan-import-dialog").close();
     navigate("settings");
     return;
@@ -184,7 +189,7 @@ async function generateAiPlan(button) {
   showAiPlanProgress(mode === "generate" ? "AI 正在分析目标并筛选本地题库…" : "AI 正在识别并整理题目…");
   button.disabled = true;
   try {
-    const body = { mode, text };
+    const body = { mode, text, ...aiRequestSelection(profileId) };
     if (mode === "generate") {
       body.task_count = count;
       body.include_completed = $("#ai-plan-include-completed").checked;

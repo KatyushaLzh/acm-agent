@@ -1,0 +1,69 @@
+{
+  "workload_version": "model-provider-workload-v4-stage4-paid20",
+  "schema_version": 4,
+  "profiles": [
+    {"id": "recommendation", "run_kind": "recommendation", "correctness_gate": "eligible_count_topics_slots"},
+    {"id": "plan_organize", "run_kind": "plan_import", "mode": "organize", "correctness_gate": "allowlist_permutation_preview_only"},
+    {"id": "plan_generate", "run_kind": "plan_import", "mode": "generate", "correctness_gate": "catalog_dedup_exclusions_lowering"},
+    {"id": "coaching", "run_kind": "coaching", "correctness_gate": "conversation_sse_hint_level"},
+    {"id": "patch", "run_kind": "patch", "correctness_gate": "validator_compile_samples_preview_only"},
+    {"id": "summary", "run_kind": "markdown_summary", "correctness_gate": "schema_entry_validator_preview_only"}
+  ],
+  "safety": {
+    "isolated_workspace": true,
+    "writes_proposals_only": true,
+    "stores_sensitive_prompts": false,
+    "live_provider_requires_explicit_opt_in": true,
+    "provider": "deepseek",
+    "model": "deepseek-v4-flash",
+    "fallbacks": false,
+    "transport_retries_per_logical_request": 1,
+    "validation_repairs_per_logical_request": 1,
+    "business_base_provider_requests": 12,
+    "adaptive_retry_repair_or_probe_budget": 8,
+    "provider_request_target": 20,
+    "provider_request_hard_limit": 20
+  },
+  "phases": {
+    "correctness_cache_disabled": {
+      "recommendation": 1,
+      "plan_organize": 1,
+      "summary": 1,
+      "plan_generate": 1,
+      "coaching": 3,
+      "patch": 1,
+      "logical_requests": 8,
+      "base_provider_requests": 8
+    },
+    "exact_cache": {
+      "recommendation": {"logical_requests": 2, "base_provider_requests": 1},
+      "plan_organize": {"logical_requests": 2, "base_provider_requests": 1},
+      "summary": {"logical_requests": 2, "base_provider_requests": 1},
+      "logical_requests": 6,
+      "base_provider_requests": 3
+    },
+    "singleflight": {
+      "profile": "plan_organize",
+      "logical_requests": 2,
+      "validation_repairs": 0,
+      "expected_provider_requests": 1
+    },
+    "provider_kv_probe": {
+      "fills_remaining_request_budget": true,
+      "maximum_provider_requests": 8,
+      "fixed_system_prefix": true,
+      "varying_user_tail": true
+    }
+  },
+  "acceptance": {
+    "logical_requests": 16,
+    "provider_requests_exactly": 20,
+    "all_six_profiles_complete": true,
+    "deterministic_fallback_counts_as_stage_verified": false,
+    "partial_counts_as_stage_verified": false,
+    "unavailable_counts_as_stage_verified": false,
+    "exact_second_calls_zero_provider": true,
+    "coaching_later_turns_cached_tokens_nonzero": true,
+    "singleflight_one_provider_request": true
+  }
+}

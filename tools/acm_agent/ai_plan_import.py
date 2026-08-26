@@ -154,53 +154,64 @@ def _validate_dates(stages: Sequence[Mapping[str, Any]]) -> None:
 def validate_organize_ir(
     value: Any, *, allowed_problem_keys: Sequence[str]
 ) -> dict[str, Any]:
-    """Validate an organize response and require a perfect input permutation."""
+    """Validate organize IR v2 and lower it to the trusted plan IR.
+
+    The model is only allowed to group canonical keys.  User-facing task
+    attributes are deliberately synthesized here so a model cannot smuggle
+    levels, notes, or descriptions through the organize response.
+    """
 
     root = _object(
         value,
         label="AI 整理结果",
-        allowed={"title", "description", "stages"},
+        allowed={"title", "groups"},
     )
-    raw_stages = root.get("stages")
+    raw_stages = root.get("groups")
     if not isinstance(raw_stages, list) or not raw_stages:
-        raise AIPlanImportError("AI 整理结果必须包含非空 stages 数组")
+        raise AIPlanImportError("AI 整理结果必须包含非空 groups 数组")
     stages: list[dict[str, Any]] = []
     selected: list[str] = []
     allowed = set(allowed_problem_keys)
+    raw_dates: list[str | None] = []
+    dates_valid = True
     for stage_index, raw_stage in enumerate(raw_stages, 1):
         stage = _object(
             raw_stage,
-            label=f"stages[{stage_index}]",
-            allowed={"topic", "due_date", "problems"},
+            label=f"groups[{stage_index}]",
+            allowed={"topic", "due_date", "problem_keys"},
         )
-        raw_problems = stage.get("problems")
-        if not isinstance(raw_problems, list) or not raw_problems:
-            raise AIPlanImportError(f"stages[{stage_index}].problems 必须是非空数组")
-        problems: list[dict[str, str]] = []
-        for problem_index, raw_problem in enumerate(raw_problems, 1):
-            problem = _object(
-                raw_problem,
-                label=f"stages[{stage_index}].problems[{problem_index}]",
-                allowed={"problem_key", "level", "note"},
+        raw_problems = stage.get("problem_keys")
+        if (
+            not isinstance(raw_problems, list)
+            or not raw_problems
+            or any(not isinstance(item, str) for item in raw_problems)
+        ):
+            raise AIPlanImportError(
+                f"groups[{stage_index}].problem_keys 必须是非空字符串数组"
             )
-            key = _text(problem.get("problem_key"), label="problem_key", required=True)
+        problems: list[dict[str, str]] = []
+        for raw_problem in raw_problems:
+            key = _text(raw_problem, label="problem_key", required=True)
             if key not in allowed:
                 raise AIPlanImportError(f"AI 整理结果包含未知题目: {key}")
-            level = _text(problem.get("level") or "B", label="level").upper()
-            if level not in VALID_LEVELS:
-                raise AIPlanImportError(f"AI 整理结果包含非法 level: {level}")
             problems.append(
                 {
                     "problem_key": key,
-                    "level": level,
-                    "note": _text(problem.get("note"), label="note"),
+                    "level": "B",
+                    "note": "",
                 }
             )
             selected.append(key)
+        try:
+            due_date = _date(stage.get("due_date"), label="due_date")
+        except AIPlanImportError:
+            due_date = None
+            dates_valid = False
+        raw_dates.append(due_date)
         stages.append(
             {
                 "topic": _text(stage.get("topic"), label="topic", required=True),
-                "due_date": _date(stage.get("due_date"), label="due_date"),
+                "due_date": due_date,
                 "problems": problems,
             }
         )
@@ -208,11 +219,21 @@ def validate_organize_ir(
         raise AIPlanImportError("AI 整理结果包含重复题目")
     if set(selected) != allowed or len(selected) != len(allowed_problem_keys):
         raise AIPlanImportError("AI 整理结果遗漏或增加了题目")
-    _validate_dates(stages)
+    present = [item for item in raw_dates if item is not None]
+    dates_valid = dates_valid and (
+        not present
+        or (len(present) == len(raw_dates) and present == sorted(present))
+    )
+    warnings: list[str] = []
+    if not dates_valid:
+        for stage in stages:
+            stage["due_date"] = None
+        warnings.append("模型返回的日期不完整、无效或非递减，已全部清空")
     return {
         "title": _text(root.get("title"), label="title", required=True),
-        "description": _text(root.get("description"), label="description"),
+        "description": "根据输入题号生成的 AI 整理题单",
         "stages": stages,
+        "warnings": warnings,
     }
 
 

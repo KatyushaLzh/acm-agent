@@ -4,6 +4,7 @@ import {
 } from "./core.js";
 import { refreshPlanSummaries, selectPlan } from "./view_plans.js";
 import { requestRecommendations } from "./view_today.js";
+import { formatDeepSeekCost, renderAiAuditCards } from "./ai_model_controls.js";
 
 function renderReview(data) {
   const sessions = data.sessions ?? 0;
@@ -20,6 +21,33 @@ function renderReview(data) {
   weakNode.innerHTML = weak.length ? weak.sort((a, b) => b[1] - a[1]).slice(0, 10).map(([name, value]) => `<div class="bar-row"><span>${escapeHtml(name)}</span><progress class="bar-track" max="${escapeHtml(max)}" value="${escapeHtml(value)}"></progress><b>${escapeHtml(value)}</b></div>`).join("") : "暂无训练数据";
   renderChips("#result-distribution", data.results);
   renderChips("#failure-distribution", data.failure_modes);
+}
+
+function renderAiCostAudit(payload) {
+  const audit = asObject(payload?.audit || payload);
+  renderAiAuditCards($("#ai-cost-summary"), audit, `近 ${audit.window_days || 30} 天`);
+  const groups = Array.isArray(audit.groups) ? audit.groups : [];
+  const groupNode = $("#ai-cost-groups");
+  groupNode.className = groups.length ? "governance-table" : "governance-table empty-state compact";
+  groupNode.innerHTML = groups.length ? `<div class="governance-row cost-head"><b>任务 / Provider / 模型</b><b>Runs</b><b>请求</b><b>全模型 Tokens / 缓存</b><b>DeepSeek 估算费用（人民币）</b></div>${groups.map(item => `<div class="governance-row cost-row"><strong data-label="任务 / 路由">${escapeHtml(item.profile_id)} · ${escapeHtml(item.provider_id)} / ${escapeHtml(item.model)}</strong><span data-label="Runs">${escapeHtml(item.runs)}</span><span data-label="请求">${item.provider_requests_known == null ? "未知" : escapeHtml(item.provider_requests_known)}</span><span data-label="全模型 Tokens / 缓存">${item.total_tokens_known == null ? "未知" : escapeHtml(item.total_tokens_known)} / ${item.cache_read_tokens_known == null ? "未知" : escapeHtml(item.cache_read_tokens_known)}</span><span data-label="DeepSeek 估算费用（人民币）">${escapeHtml(formatDeepSeekCost(item.deepseek_cost))}</span></div>`).join("")}` : "暂无 AI run";
+  const runs = Array.isArray(audit.recent_runs) ? audit.recent_runs : [];
+  const runNode = $("#ai-cost-runs");
+  runNode.className = runs.length ? "governance-table recent-cost-runs" : "governance-table empty-state compact";
+  runNode.innerHTML = runs.length ? `<div class="governance-row run-head"><b>时间 / 任务</b><b>请求 → 实际</b><b>请求数</b><b>全模型 Tokens / 缓存</b><b>DeepSeek 估算费用（人民币）</b></div>${runs.map(item => {
+    const actual = `${item.resolved_provider_id || item.provider_id}/${item.resolved_model || "未知"}`;
+    const requested = `${item.provider_id}/${item.requested_model}`;
+    const cost = formatDeepSeekCost(item.deepseek_cost);
+    return `<div class="governance-row run-row"><strong data-label="时间 / 任务">${escapeHtml(formatTime(item.created_at))} · ${escapeHtml(item.profile_id)}</strong><span data-label="请求 → 实际">${escapeHtml(requested)} → ${escapeHtml(actual)}${item.fallback_count ? ` · 模型路由回退 ${escapeHtml(item.fallback_count)}` : ""}</span><span data-label="请求数">${item.provider_requests == null ? "未知" : escapeHtml(item.provider_requests)}</span><span data-label="全模型 Tokens / 缓存">${item.total_tokens == null ? "未知" : escapeHtml(item.total_tokens)} / ${item.cache_read_tokens == null ? "未知" : escapeHtml(item.cache_read_tokens)}</span><span data-label="DeepSeek 估算费用（人民币）">${escapeHtml(cost)}${item.deepseek_cost?.unknown_reason ? ` · ${escapeHtml(item.deepseek_cost.unknown_reason)}` : ""}</span></div>`;
+  }).join("")}` : "暂无 AI run";
+}
+
+async function repriceAiCostAudit(button) {
+  setBusy(button, true, "重算中…");
+  try {
+    const data = await api("/api/ai/costs/reprice", { body: {} });
+    renderAiCostAudit(data);
+    toast("DeepSeek 费用已重算", "新 DeepSeek 价格版本已追加；全模型历史 token 与原估算记录均保留。");
+  } finally { setBusy(button, false); }
 }
 
 function openSkipDialog(index) {
@@ -131,6 +159,8 @@ async function loadReview() {
   catch (error) { toast("复盘生成失败", error.message, "error"); }
   finally { setBusy(button, false); }
   await loadSkippedProblems();
+  try { renderAiCostAudit(await api("/api/ai/costs")); }
+  catch (error) { toast("AI 费用读取失败", error.message, "error"); }
 }
 
 async function copyPath(path) {
@@ -144,4 +174,4 @@ async function copyPath(path) {
   }
 }
 
-export { openSkipDialog, confirmSkip, unskipProblem, loadReview, copyPath };
+export { openSkipDialog, confirmSkip, unskipProblem, loadReview, copyPath, repriceAiCostAudit };

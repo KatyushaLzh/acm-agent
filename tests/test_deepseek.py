@@ -339,6 +339,8 @@ class DeepSeekClientTests(unittest.TestCase):
         self.assertEqual(result.content, "ok")
         self.assertEqual(len(transport.requests), 2)
         self.assertEqual(client.provider_request_count, 2)
+        self.assertEqual(result.usage["provider_requests"], 2)
+        self.assertEqual(result.requested_model, "deepseek-v4-flash")
         self.assertEqual(sleeps, [1.0])
 
         retry_events = []
@@ -446,6 +448,8 @@ class DeepSeekClientTests(unittest.TestCase):
         self.assertEqual(client.provider_request_count, 2)
         self.assertEqual(result.data, {"ranked": ["CF1A"]})
         self.assertEqual(result.content, '{"ranked":["CF1A"]}')
+        self.assertEqual(result.usage["provider_requests"], 2)
+        self.assertEqual(result.usage["protocol_repairs"], 1)
 
     def test_usage_preserves_nested_and_flat_reasoning_tokens_without_content(self) -> None:
         transport = QueueTransport(
@@ -570,7 +574,10 @@ class DeepSeekClientTests(unittest.TestCase):
         )
         self.assertEqual("".join(event.content for event in events), "Hello!")
         self.assertEqual(events[-1].finish_reason, "stop")
-        self.assertEqual(events[-1].usage, {"total_tokens": 9})
+        self.assertEqual(events[-1].usage["total_tokens"], 9)
+        self.assertEqual(events[-1].usage["provider_requests"], 1)
+        self.assertEqual(events[-1].usage["protocol_repairs"], 0)
+        self.assertGreaterEqual(events[-1].usage["latency_ms"], 0)
         self.assertNotIn("hidden", repr(events))
         payload = json.loads(transport.requests[0][0].data.decode("utf-8"))
         self.assertTrue(payload["stream"])

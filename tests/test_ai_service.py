@@ -7,7 +7,10 @@ from pathlib import Path
 import shutil
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 from tools.acm_agent.ai_context import (
@@ -17,7 +20,9 @@ from tools.acm_agent.ai_context import (
     expected_patch_backup_path,
 )
 from tools.acm_agent.deepseek import ChatResult, JsonChatResult, StreamEvent
+from tools.acm_agent.provider import ProviderError
 from tools.acm_agent.credentials import DeepSeekCredentialStore
+from tools.acm_agent.config import load_config, save_config
 from tools.acm_agent.service import AcmService
 from tools.acm_agent.service_common import AIConversationConflict
 from tools.acm_agent.storage import Database
@@ -74,7 +79,14 @@ class FakeDeepSeek:
                 "replacement_code": self.patch_code,
             }
         else:
-            request = json.loads(prompt.splitlines()[-1])
+            request = next(
+                value
+                for item in reversed(messages)
+                for line in reversed(str(item["content"]).splitlines())
+                if line.lstrip().startswith("{")
+                for value in [json.loads(line)]
+                if isinstance(value, dict) and "eligible_focus_topics" in value
+            )
             focus_topics = request["eligible_focus_topics"][: min(3, request["requested_count"])]
             ranked = []
             seen = set()
@@ -131,6 +143,9 @@ class FakeDeepSeek:
         yield StreamEvent("usage", usage={"total_tokens": 12})
         yield StreamEvent("done", finish_reason="stop", usage={"total_tokens": 12})
 
+    def structured(self, messages, **kwargs):
+        return self.chat_json(messages, **kwargs)
+
 
 class AiServiceTests(unittest.TestCase):
     def setUp(self):
@@ -138,13 +153,8 @@ class AiServiceTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         target = self.root / "training" / "data-structures-30d"
         target.mkdir(parents=True)
-        plan_path = target / "plan.json"
-        shutil.copy2(REPO_ROOT / "training/data-structures-30d/plan.json", plan_path)
+        shutil.copy2(REPO_ROOT / "training/data-structures-30d/plan.json", target / "plan.json")
         shutil.copy2(REPO_ROOT / "training/data-structures-30d/README.md", target / "README.md")
-        plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        for task in plan["stages"][0]["tasks"][:3]:
-            task["tags"] = ["数据结构"]
-        plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
         self.client = FakeDeepSeek()
         self.verify_calls = []
 
@@ -206,6 +216,18 @@ class AiServiceTests(unittest.TestCase):
         self.assertNotIn("private note", sent)
         self.assertNotIn(str(self.root), sent)
         self.assertNotIn("#include", sent)
+        self.assertEqual(self.client.calls[-1][2]["max_tokens"], 2_400)
+
+    def test_cache_clear_allows_safe_profile_disabled_by_current_policy(self):
+        config = load_config(self.service.paths)
+        config["ai"]["cache"]["exact_profiles"] = []
+        save_config(self.service.paths, config)
+
+        result = self.service.ai_cache_clear(profile_ids=["recommendation"])
+
+        self.assertTrue(result["ok"])
+        with self.assertRaisesRegex(ValueError, "plan_generate"):
+            self.service.ai_cache_clear(profile_ids=["plan_generate"])
 
     def test_chat_persists_stream_and_raises_close_hint_level(self):
         self.service.start("CF1A")
@@ -216,12 +238,14 @@ class AiServiceTests(unittest.TestCase):
                 message="给我关键性质",
                 mode="hint",
                 hint_level=2,
+                delivery_mode="low_latency",
             )
         )
         self.assertEqual([row["event"] for row in events], ["meta", "delta", "delta", "usage", "done"])
         sent = json.dumps(self.client.calls[-1][1], ensure_ascii=False)
         self.assertIn(CHINESE_EXPLANATION_RULE, sent)
         self.assertIn("代码、算法名和复杂度表达无需翻译", sent)
+        self.assertEqual(self.client.calls[-1][2]["max_tokens"], 4_096)
         loaded = self.service.ai_conversation(conversation["conversation_id"])
         self.assertEqual(loaded["messages"][-1]["content"], "第一段第二段")
         self.assertEqual(loaded["messages"][-1]["status"], "complete")
@@ -235,6 +259,36 @@ class AiServiceTests(unittest.TestCase):
         self.assertEqual(closed["close"]["hint_level"], 2)
         loaded = self.service.ai_conversation(conversation["conversation_id"])
         self.assertEqual(loaded["conversation"]["status"], "closed")
+
+    def test_coaching_keeps_stable_prefix_across_hint_levels(self):
+        self.service.start("CF1A")
+        conversation = self.service.ai_conversation_start("CF1A")
+        conversation_id = conversation["conversation_id"]
+
+        self.service.ai_chat(
+            "CF1A",
+            conversation_id=conversation_id,
+            message="先问我一个反例问题",
+            mode="hint",
+            hint_level=1,
+        )
+        first_messages = self.client.calls[-1][1]
+        self.service.ai_chat(
+            "CF1A",
+            conversation_id=conversation_id,
+            message="现在给出核心转化",
+            mode="hint",
+            hint_level=3,
+        )
+        second_messages = self.client.calls[-1][1]
+
+        self.assertEqual(second_messages[: len(first_messages)], first_messages)
+        self.assertEqual(first_messages[0], second_messages[0])
+        self.assertNotIn("started_at", json.dumps(second_messages, ensure_ascii=False))
+        first_turn = json.loads(first_messages[-1]["content"])
+        second_turn = json.loads(second_messages[-1]["content"])
+        self.assertEqual(first_turn["hint_level"], 1)
+        self.assertEqual(second_turn["hint_level"], 3)
 
     def test_close_counts_streaming_hint_before_first_content(self):
         self.service.start("CF1A")
@@ -297,6 +351,133 @@ class AiServiceTests(unittest.TestCase):
         )
         self.assertEqual(events[-1]["event"], "done")
 
+    def test_identical_coaching_requests_coalesce_and_replay_terminal_result(self):
+        self.service.start("CF1A")
+        conversation_id = self.service.ai_conversation_start("CF1A")["conversation_id"]
+        started = threading.Event()
+        release = threading.Event()
+        provider_calls = 0
+
+        def blocking_chat(messages, **kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            started.set()
+            self.assertTrue(release.wait(5))
+            return ChatResult(
+                "共享终态",
+                "stop",
+                {"total_tokens": 9},
+                kwargs["model"],
+            )
+
+        self.client.chat = blocking_chat
+        request = {
+            "message": "给我一个反例问题",
+            "mode": "hint",
+            "hint_level": 1,
+            "conversation_id": conversation_id,
+        }
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            leader = executor.submit(self.service.ai_chat, "CF1A", **request)
+            self.assertTrue(started.wait(5))
+            follower = executor.submit(self.service.ai_chat, "CF1A", **request)
+            time.sleep(0.1)
+            release.set()
+            leader_result = leader.result(timeout=5)
+            follower_result = follower.result(timeout=5)
+
+        self.assertEqual(provider_calls, 1)
+        self.assertEqual(leader_result["content"], "共享终态")
+        self.assertEqual(follower_result["content"], "共享终态")
+        self.assertEqual(follower_result["local_cache"]["status"], "coalesced")
+        with Database(self.service.paths.database) as db:
+            follower_run = db.ai_run(follower_result["ai_run_id"])
+            metrics = db.ai_cache_status()
+        self.assertEqual(follower_run["local_cache_status"], "coalesced")
+        self.assertEqual(follower_run["status"], "complete")
+        self.assertGreaterEqual(metrics["coalesced_followers"], 1)
+
+    def test_identical_stream_follower_receives_live_delta_before_leader_done(self):
+        self.service.start("CF1A")
+        conversation_id = self.service.ai_conversation_start("CF1A")["conversation_id"]
+        delta_ready = threading.Event()
+        release = threading.Event()
+        provider_calls = 0
+
+        def blocking_stream(messages, **kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            delta_ready.set()
+            yield StreamEvent("delta", content="实时片段")
+            self.assertTrue(release.wait(5))
+            yield StreamEvent("done", finish_reason="stop", usage={"total_tokens": 4})
+
+        self.client.stream_chat = blocking_stream
+        request = {
+            "message": "给我一个反例问题",
+            "mode": "hint",
+            "hint_level": 1,
+            "delivery_mode": "low_latency",
+        }
+        leader_stream = self.service.ai_chat_stream(conversation_id, **request)
+        leader_events: list[dict] = []
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            leader = executor.submit(lambda: leader_events.extend(list(leader_stream)))
+            self.assertTrue(delta_ready.wait(5))
+            follower_stream = self.service.ai_chat_stream(conversation_id, **request)
+            follower_meta = next(follower_stream)
+            follower_delta = next(follower_stream)
+            self.assertFalse(release.is_set())
+            self.assertEqual(follower_meta["event"], "meta")
+            self.assertEqual(follower_delta, {"event": "delta", "data": {"content": "实时片段"}})
+            release.set()
+            follower_tail = list(follower_stream)
+            leader.result(timeout=5)
+
+        self.assertEqual(provider_calls, 1)
+        self.assertEqual(follower_tail[-1]["event"], "done")
+
+    def test_coalesced_failure_returns_unavailable_without_second_provider_call(self):
+        self.service.start("CF1A")
+        conversation_id = self.service.ai_conversation_start("CF1A")["conversation_id"]
+        provider_started = threading.Event()
+        release = threading.Event()
+        provider_calls = 0
+
+        def failing_chat(messages, **kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            provider_started.set()
+            self.assertTrue(release.wait(5))
+            raise ProviderError("server_error", "offline", retryable=False)
+
+        self.client.chat = failing_chat
+        request = {
+            "message": "只给一个反例问题",
+            "mode": "hint",
+            "hint_level": 1,
+            "conversation_id": conversation_id,
+        }
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            leader_future = executor.submit(self.service.ai_chat, "CF1A", **request)
+            self.assertTrue(provider_started.wait(5))
+            follower_future = executor.submit(self.service.ai_chat, "CF1A", **request)
+            time.sleep(0.05)
+            release.set()
+            leader = leader_future.result(timeout=5)
+            follower = follower_future.result(timeout=5)
+
+        self.assertEqual(provider_calls, 1)
+        self.assertFalse(leader["ok"])
+        self.assertFalse(follower["ok"])
+        self.assertEqual(leader["ai"]["outcome"]["business_outcome"], "unavailable")
+        self.assertEqual(follower["ai"]["outcome"]["business_outcome"], "unavailable")
+        self.assertEqual(follower["ai"]["outcome"]["provider_outcome"], "not_called")
+        with Database(self.service.paths.database) as db:
+            follower_run = db.ai_run(follower["ai_run_id"])
+        self.assertEqual(follower_run["status"], "complete")
+        self.assertEqual(follower_run["provider_outcome"], "not_called")
+
     def test_patch_preview_apply_verify_failure_and_revert(self):
         started = self.service.start("CF1A")
         source = Path(started["source"])
@@ -308,6 +489,7 @@ class AiServiceTests(unittest.TestCase):
         self.assertIn("代码、算法名和复杂度表达无需翻译", sent)
         self.assertIn("每个实质修复点附近加入简短的中文 C++ 注释", sent)
         self.assertIn("原代码哪里错误以及该修改为何正确", sent)
+        self.assertEqual(self.client.calls[-1][2]["max_tokens"], 8_192)
         self.assertIn("proposal_id", preview)
         self.assertEqual(preview["candidate_code"], self.client.patch_code)
         self.assertIn("// 原代码错误", preview["candidate_code"])
@@ -325,8 +507,11 @@ class AiServiceTests(unittest.TestCase):
     def test_invalid_patch_marks_message_and_run_failed(self):
         self.service.start("CF1A")
         self.client.patch_code = "```cpp\nint main(){}\n```"
-        with self.assertRaises(AIContextError):
-            self.service.ai_patch_preview("CF1A", instruction="修复")
+        result = self.service.ai_patch_preview("CF1A", instruction="修复")
+        self.assertFalse(result["ok"])
+        self.assertIsNone(result["proposal_id"])
+        self.assertEqual(result["ai"]["outcome"]["business_outcome"], "partial")
+        self.assertEqual(result["ai"]["outcome"]["repair_attempts"], 1)
         with Database(self.service.paths.database) as db:
             assistant = db.query(
                 "SELECT status FROM ai_messages WHERE role='assistant' ORDER BY rowid DESC LIMIT 1"
@@ -335,7 +520,7 @@ class AiServiceTests(unittest.TestCase):
                 "SELECT status FROM ai_runs WHERE kind='patch' ORDER BY rowid DESC LIMIT 1"
             )[0]
             self.assertEqual(assistant["status"], "error")
-            self.assertEqual(run["status"], "failed")
+            self.assertEqual(run["status"], "complete")
 
     def test_patch_apply_db_failure_restores_source_and_preview_state(self):
         started = self.service.start("CF1A")

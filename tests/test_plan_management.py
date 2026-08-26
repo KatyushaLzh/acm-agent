@@ -18,7 +18,7 @@ from tools.acm_agent.storage import Database, MIGRATIONS, SCHEMA_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BUILTIN_PLAN = ROOT / "training" / "data-structures-30d" / "plan.json"
+LEGACY_PLAN = ROOT / "training" / "data-structures-30d" / "plan.json"
 
 
 def sample_plan(plan_id: str = "sample-plan") -> dict[str, object]:
@@ -82,14 +82,8 @@ def sample_plan(plan_id: str = "sample-plan") -> dict[str, object]:
 
 
 class PlanSchemaTests(unittest.TestCase):
-    def test_builtin_plan_is_progressive_without_stage_deadlines(self) -> None:
-        source = json.loads(BUILTIN_PLAN.read_text(encoding="utf-8"))
-        self.assertEqual(source["schema_version"], 2)
-        self.assertEqual(source["schedule_mode"], "progressive")
-        self.assertEqual(len(source["stages"]), 30)
-        for stage in source["stages"]:
-            self.assertFalse({"date", "due_date", "unlock_at"} & stage.keys())
-
+    def test_v1_conversion_is_v2_and_uses_structured_ac_conditions(self) -> None:
+        source = json.loads(LEGACY_PLAN.read_text(encoding="utf-8"))
         converted = convert_v1_to_v2(source)
         self.assertEqual(converted["schema_version"], 2)
         self.assertNotIn("platform_target", converted)
@@ -282,8 +276,8 @@ class PlanManagerTests(unittest.TestCase):
     def prepare_root(self, root: Path) -> None:
         target = root / "training" / "data-structures-30d"
         target.mkdir(parents=True)
-        shutil.copy2(BUILTIN_PLAN, target / "plan.json")
-        shutil.copy2(BUILTIN_PLAN.with_name("README.md"), target / "README.md")
+        shutil.copy2(LEGACY_PLAN, target / "plan.json")
+        shutil.copy2(LEGACY_PLAN.with_name("README.md"), target / "README.md")
 
     def test_builtin_is_registered_without_modifying_source_and_edit_creates_override(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

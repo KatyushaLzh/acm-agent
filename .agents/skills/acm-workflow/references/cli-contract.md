@@ -2,6 +2,8 @@
 
 The local HTTP API and CLI JSON output share these semantics. Prefer the API while a healthy dashboard runtime exists; use CLI JSON as the compatibility fallback.
 
+AI cost audits expose `provider_route_fallbacks` and `business_fallbacks` separately. Legacy `route_fallbacks` and recent-run `fallback_count` are provider-route compatibility aliases; deterministic/hybrid local degradation is counted only in the business fields. Provider fallback legs rebind model and reasoning controls from the selected leg before adapter invocation.
+
 ## Statuses
 
 - `unknown`: no reliable platform or local evidence.
@@ -47,12 +49,13 @@ Status precedence is `accepted > skipped > attempted > local_only > not_started 
 - `--skip-validate` / `skip_validate=true` is an offline path: it saves configuration but performs no platform sync or tag request.
 - AI recommendations only consume cached tags and never trigger tag scraping.
 
-## DeepSeek AI Rules
+## AI Provider Rules
 
-- `GET /api/ai/status` returns only detection, source (`secure_store`, `environment`, `injected`, or `none`), persisted state, and a sanitized load error; it never returns the key.
-- `POST /api/ai/credential` is the only endpoint that accepts a key. It is synchronous, loopback-token protected, excluded from the job registry, and persists only a Windows current-user DPAPI ciphertext. `{ "clear": true }` deletes that ciphertext. Browser code must clear the password input after every attempt and must not use browser storage.
-- Models are restricted to `deepseek-v4-flash` and `deepseek-v4-pro`. Recommendation requests always disable thinking.
-- AI recommendation mode is `gap_fill` (low distinct-AC topic coverage) or `specialization` (high coverage), defaulting to `gap_fill`. Items retain deterministic `score`, `breakdown`, and `reasons`, and add `focus_topic`, `ranking_basis`, `ai_reason`, `training_focus`, `ai_run_id`, and `ai_usage`. Responses expose `ai.mode`, `ai.focus_topics`, `ai.submission_coverage`, and `ai.taxonomy_version`; provider/protocol/candidate failures return a deterministic same-mode fallback.
+- `GET /api/ai/status` returns credential detection/source/persisted state, sanitized load errors, a non-sensitive `secure_store` diagnosis, and sanitized provider/connection/profile/credential-slot/governance metadata; it never returns a key.
+- Synchronous loopback-token-protected credential and connection endpoints may accept a key in the request body. Bound secrets persist only through current-user Windows DPAPI, macOS Keychain, or Linux Secret Service. The service never auto-selects a file keyring or writes a plaintext/weakly encrypted fallback. Browser code clears the password input after every attempt and never uses browser storage.
+- An unavailable secure store returns `credential_store_unavailable` with HTTP 503; a locked store returns `credential_store_locked` with HTTP 409. The Dashboard remains usable, and an explicit environment variable may supply a process-local credential, but corrupted or binding-mismatched stored credentials remain fail-closed.
+- The built-in DeepSeek provider is restricted to `deepseek-v4-flash` and `deepseek-v4-pro`. Managed OpenAI-compatible connections may use only discovered models with current capability evidence. Each task profile owns its route and `reasoning_strength` (`auto`, `off`, `low`, `medium`, or `high`); `auto` omits provider reasoning controls, while `off` explicitly disables them.
+- AI recommendation mode is `gap_fill` (low distinct-AC topic coverage) or `specialization` (high coverage), defaulting to `gap_fill`. Items retain deterministic `score`, `breakdown`, and `reasons`, and add `focus_topic`, `ranking_basis`, `ai_reason`, `training_focus`, `ai_run_id`, and `ai_usage`. Responses expose `ai.mode`, `ai.focus_topics`, `ai.submission_coverage`, and `ai.taxonomy_version`; provider/protocol/candidate failures may return a same-mode hybrid/deterministic fallback only after the complete local business validator passes, otherwise the result is structured `unavailable` with `ok=false`.
 - Recommendation payloads contain only classified distinct platform-AC summaries and deterministic candidates. They exclude account fields, handles, UIDs, submission IDs, raw JSON, languages, notes, chats, source code, local paths, API keys, and runtime tokens.
 - Coaching conversation messages persist locally. SSE event names are exactly `meta`, `delta`, `usage`, `done`, and `error`; a disconnected partial answer is stored as `interrupted`.
 - `review` and every patch proposal count as hint level 4. `close` stores the maximum of explicit input and persisted AI assistant history.
@@ -60,9 +63,9 @@ Status precedence is `accepted > skipped > attempted > local_only > not_started 
 
 ## Local Stress Rules
 
-- Finite local stress is available only when the problem directory contains hand-written `<problem>.bf.cpp` and `<problem>.gen.cpp` helpers.
+- Finite local stress accepts explicitly selected existing generator/reference/user `.cpp` files; without explicit selections it requires hand-written `<problem>.bf.cpp` and `<problem>.gen.cpp` beside the managed source.
 - `verify --stress-iterations <N> --seed <seed>` controls the bounded case count and deterministic starting seed. It does not generate helpers or persist resumable runs.
-- A mismatch keeps the generated input, solution output, brute-force output, seed, and replay command under `.acm/failures/`.
+- A mismatch publishes the latest `.stress.in`, `.reference.out`, and `.user.out` beside the source. Generator/runtime/output-limit diagnostics and replay metadata stay under `.acm/failures/`; a source-adjacent publication failure also falls back there.
 
 ## Plan and Recommendation Rules
 
@@ -82,7 +85,7 @@ Status precedence is `accepted > skipped > attempted > local_only > not_started 
 - Closing an attempt and generating a Markdown summary are separate operations. A summary failure never changes the closed attempt.
 - A target is one registered absolute local `.md` path plus a revisioned `summary-schema-v1`. Existing root `algorithms.md` and `tricks.md` are automatically registered with their fixed schemas; unregistering any target never deletes the file.
 - Preview sends only the closed attempt context and necessary schema shape to DeepSeek. Cleared conversations, accounts, API keys, local paths, reasoning content, and the full target file are excluded. One old card may additionally be sent only when its normalized `Source` problem ID exactly matches, so the model can merge it with the new evidence.
-- Proposal status is `preview`, `applying`, `applied`, `conflict`, `failed`, `reverting`, or `reverted`. Only the latest `preview` revision with confidence at least 0.75 is applyable. Exact Source matches are AI-merged automatically; title-only or fuzzy similarity creates a new card without a choice step.
+- Proposal status is `preview`, `applying`, `applied`, `conflict`, `failed`, `reverting`, or `reverted`. Only the latest `preview` revision is applyable. Confidence below 0.75 shows the soft warning `模型置信度低，需人工核对` but does not prevent editing, refreshing, or applying. Exact Source matches are AI-merged automatically; title-only or fuzzy similarity creates a new card without a choice step.
 - Editing `entry_markdown` requires `knowledge refresh`; apply never accepts replacement candidate bytes from the client.
 - Apply and revert are guarded by target/schema/proposal revisions and SHA-256. HTTP 409 means reload or preview again; never overwrite the external edit.
 

@@ -7,6 +7,7 @@ broken or partial network response never erases a good snapshot.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -30,11 +31,11 @@ from .storage_schema import MIGRATIONS, SCHEMA_VERSION
 
 # Schema versions whose *preceding* schema is snapshotted when the database is
 # opened directly at that schema (the upgrade's first step).
-_BACKUP_ON_DIRECT_OPEN = frozenset((*range(5, 15), 17))
+_BACKUP_ON_DIRECT_OPEN = frozenset((*range(5, 15), 17, 19, 24))
 # Subset that is also snapshotted when the schema is merely passed through as an
 # intermediate step of a longer upgrade.  Versions 5 and 6 keep the legacy
 # direct-open-only behavior.
-_BACKUP_AS_INTERMEDIATE = frozenset((*range(7, 15), 17))
+_BACKUP_AS_INTERMEDIATE = frozenset((*range(7, 15), 17, 19, 24))
 
 
 class Database(
@@ -68,9 +69,6 @@ class Database(
         if current != source_version or not self.path.exists():
             return
         backup_path = self.path.with_name(f"{self.path.name}.v{source_version}.bak")
-        if backup_path.exists():
-            self._validate_migration_backup(backup_path, source_version)
-            return
         temporary = backup_path.with_name(f".{backup_path.name}.tmp")
         temporary.unlink(missing_ok=True)
         destination = sqlite3.connect(temporary)
@@ -80,20 +78,47 @@ class Database(
         finally:
             destination.close()
         try:
-            self._validate_migration_backup(temporary, source_version)
+            source_fingerprint = self._validate_migration_backup(
+                temporary, source_version
+            )
+            if backup_path.exists():
+                self._validate_migration_backup(
+                    backup_path,
+                    source_version,
+                    expected_fingerprint=source_fingerprint,
+                )
+                return
             os.replace(temporary, backup_path)
         finally:
             temporary.unlink(missing_ok=True)
 
     @staticmethod
-    def _validate_migration_backup(path: Path, expected_version: int) -> None:
-        """Fail closed unless a migration backup is readable and consistent."""
+    def _migration_backup_fingerprint(connection: sqlite3.Connection) -> str:
+        """Hash the complete logical SQLite snapshot in a stable representation."""
+
+        digest = hashlib.sha256()
+        for statement in connection.iterdump():
+            encoded = statement.encode("utf-8", errors="surrogatepass")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        return digest.hexdigest()
+
+    @classmethod
+    def _validate_migration_backup(
+        cls,
+        path: Path,
+        expected_version: int,
+        *,
+        expected_fingerprint: str | None = None,
+    ) -> str:
+        """Validate a backup and optionally bind it to the current source snapshot."""
 
         try:
             connection = sqlite3.connect(path)
             try:
                 version = int(connection.execute("PRAGMA user_version").fetchone()[0])
                 quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]
+                fingerprint = cls._migration_backup_fingerprint(connection)
             finally:
                 connection.close()
         except sqlite3.Error as exc:
@@ -104,6 +129,11 @@ class Database(
             )
         if quick_check != "ok":
             raise RuntimeError(f"migration backup failed integrity check: {path}")
+        if expected_fingerprint is not None and fingerprint != expected_fingerprint:
+            raise RuntimeError(
+                f"migration backup does not match source database: {path}"
+            )
+        return fingerprint
 
     def __enter__(self) -> "Database":
         return self
@@ -129,12 +159,10 @@ class Database(
             migration = MIGRATIONS.get(version)
             if migration is None:
                 raise RuntimeError(f"missing database migration {version}")
-            rebuilds_fk_parent = version == 17
+            rebuilds_fk_parent = version in {17, 24}
             if rebuilds_fk_parent:
-                # v17 retires persistent stress state and rebuilds ai_runs to
-                # remove its stress-only preparation metadata column.  Child
-                # tables keep referencing the replacement table by the same
-                # name, so enforcement is disabled only for the DDL window.
+                # These migrations rebuild FK parent tables while preserving
+                # their public names. Enforcement is disabled only for DDL.
                 self.connection.execute("PRAGMA foreign_keys = OFF")
             try:
                 # ``executescript`` commits any pending transaction before it

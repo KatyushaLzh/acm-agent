@@ -4,7 +4,7 @@
 
 ## 开发约束
 
-- 使用 Python 3.13 标准库；不要为核心运行引入 pip/npm 依赖。
+- 使用 Python 3.13 标准库；不要为核心运行引入 pip/npm 依赖。Unix Dashboard 的可选安全存储依赖必须固定在 `tools/requirements-web-unix.lock`，由项目隔离环境管理。
 - 保持网页仅监听回环地址，不削弱令牌、Host、Origin 和请求大小校验。
 - SQLite 是运行状态的唯一事实源；文件名不能作为 AC 证据。
 - 平台同步失败必须保留最后一次成功快照。

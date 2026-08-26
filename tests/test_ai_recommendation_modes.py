@@ -18,11 +18,57 @@ class _TopicAwareDeepSeek:
 
     def __init__(self) -> None:
         self.request: dict | None = None
+        self.calls = 0
         self.invalid = False
+        self.partial_invalid = False
+        self.forced_problem_keys: list[str] = []
 
     def chat_json(self, messages, **kwargs):
-        request = json.loads(messages[-1]["content"].splitlines()[-1])
+        self.calls += 1
+        request = next(
+            value
+            for item in reversed(messages)
+            for line in reversed(str(item["content"]).splitlines())
+            if line.lstrip().startswith("{")
+            for value in [json.loads(line)]
+            if isinstance(value, dict) and "eligible_focus_topics" in value
+        )
         self.request = request
+        if self.partial_invalid:
+            count = request["requested_count"]
+            focus = request["eligible_focus_topics"][: min(3, count)]
+            target = request["slot_sequence"][0]["difficulty_target"]
+            tolerance = request["slot_sequence"][0]["difficulty_tolerance"]
+            slot = request["slot_sequence"][0]["slot"].split("-", 1)[0]
+            candidate = min(
+                (
+                    item
+                    for item in request["candidates"]
+                    if focus[0] in item["knowledge_topics"]
+                    and abs(int(item["difficulty"]) - int(target)) <= int(tolerance)
+                ),
+                key=lambda item: (
+                    abs(int(item["difficulty"]) - int(target)),
+                    -float(item["slot_scores"][slot]["score"]),
+                    item["problem_key"],
+                ),
+            )
+            data = {
+                "focus_topics": focus,
+                "ranked": [
+                    {
+                        "problem_key": candidate["problem_key"],
+                        "topic": focus[0],
+                        "ai_reason": "保留合法子集",
+                        "training_focus": focus[0],
+                    },
+                    {"problem_key": "codeforces:999999Z", "topic": "forged"},
+                ],
+                "risk_warning": "",
+            }
+            return JsonChatResult(
+                json.dumps(data), "stop", {"total_tokens": 5}, kwargs["model"], data
+            )
         if self.invalid:
             data = {
                 "focus_topics": request["eligible_focus_topics"][:1],
@@ -36,7 +82,35 @@ class _TopicAwareDeepSeek:
         focus = request["eligible_focus_topics"][: min(3, count)]
         ranked = []
         seen: set[str] = set()
+        for problem_key in self.forced_problem_keys:
+            candidate = next(
+                (
+                    item
+                    for item in request["candidates"]
+                    if item["problem_key"] == problem_key
+                ),
+                None,
+            )
+            if candidate is None:
+                continue
+            topic = next(
+                (value for value in candidate["knowledge_topics"] if value in focus),
+                None,
+            )
+            if topic is None:
+                continue
+            seen.add(candidate["problem_key"])
+            ranked.append(
+                {
+                    "problem_key": candidate["problem_key"],
+                    "topic": topic,
+                    "ai_reason": "难度容差测试",
+                    "training_focus": topic,
+                }
+            )
         for topic in focus:
+            if len(ranked) >= count:
+                break
             for candidate in request["candidates"]:
                 if candidate["problem_key"] in seen or topic not in candidate["knowledge_topics"]:
                     continue
@@ -74,6 +148,9 @@ class _TopicAwareDeepSeek:
         return JsonChatResult(
             json.dumps(data), "stop", {"total_tokens": 5}, kwargs["model"], data
         )
+
+    def structured(self, messages, **kwargs):
+        return self.chat_json(messages, **kwargs)
 
 
 class AiRecommendationModeTests(unittest.TestCase):
@@ -143,7 +220,7 @@ class AiRecommendationModeTests(unittest.TestCase):
                     {
                         "platform": "codeforces",
                         "problem_id": f"{2000 + index}A",
-                        "rating": 800,
+                        "rating": 1800,
                         "tags": ["geometry"],
                     }
                 )
@@ -204,6 +281,85 @@ class AiRecommendationModeTests(unittest.TestCase):
         self.assertGreater(keys.count("dynamic_programming"), 5)
         self.assertIn("已放宽", result["ai"]["risk_warning"])
 
+    def test_recommendation_exact_cache_hit_and_force_refresh(self) -> None:
+        with Database(self.service.paths.database) as db:
+            for index in range(3):
+                db.upsert_problem({
+                    "platform": "codeforces",
+                    "problem_id": f"{5000 + index}A",
+                    "rating": 1800,
+                    "tags": ["dp"],
+                })
+        calls_before = self.client.calls
+        with mock.patch.object(self.service, "_record_recommendation_output"), mock.patch(
+            "tools.acm_agent.service_ai.recommendation_difficulty_targets",
+            return_value={"recovery": 1800, "main": 1800, "stretch": 1800},
+        ):
+            cold = self.service.ai_recommendations(count=1)
+            hit = self.service.ai_recommendations(count=1)
+            refreshed = self.service.ai_recommendations(count=1, force_refresh=True)
+
+        self.assertEqual(
+            self.client.calls - calls_before,
+            2,
+            (cold["ai"].get("local_cache"), hit["ai"].get("local_cache"), refreshed["ai"].get("local_cache")),
+        )
+        self.assertEqual(cold["ai"]["local_cache"]["status"], "miss")
+        self.assertEqual(hit["ai"]["local_cache"]["status"], "hit")
+        self.assertEqual(refreshed["ai"]["local_cache"]["status"], "refresh")
+
+    def test_ai_ranking_accepts_non_closest_candidate_within_100_points(self) -> None:
+        candidates = []
+        for index, rating in enumerate((1800, 1900, 1901)):
+            problem_id = f"{4000 + index}A"
+            candidates.append(
+                {
+                    "slot": "main",
+                    "problem_key": f"codeforces:{problem_id}",
+                    "problem_id": f"CF{problem_id}",
+                    "platform": "codeforces",
+                    "title": "",
+                    "url": "",
+                    "equivalent_rating": rating,
+                    "score": 100.0,
+                    "breakdown": {"plan_urgency": 0.0, "difficulty_fit": 100.0},
+                    "reasons": [],
+                    "tags": ["dp"],
+                    "plan_sources": [],
+                }
+            )
+
+        def run_with(problem_key: str) -> dict:
+            self.client.forced_problem_keys = [problem_key]
+            with mock.patch.object(
+                self.service,
+                "recommendations",
+                return_value={
+                    "ok": True,
+                    "recommendations": [dict(item) for item in candidates],
+                },
+            ), mock.patch.object(
+                self.service, "_record_recommendation_output"
+            ), mock.patch(
+                "tools.acm_agent.service_ai.recommendation_difficulty_targets",
+                return_value={"recovery": 1800, "main": 1800, "stretch": 1800},
+            ):
+                # This test intentionally changes the fake provider response
+                # for an otherwise identical canonical request.  Bypass the
+                # Stage 4 exact response cache so both validator boundaries
+                # are exercised independently.
+                return self.service.ai_recommendations(count=1, force_refresh=True)
+
+        boundary = run_with("codeforces:4001A")
+        self.assertIsNone(boundary["ai"]["fallback"])
+        self.assertEqual(boundary["recommendations"][0]["problem_key"], "codeforces:4001A")
+        self.assertEqual(
+            self.client.request["slot_sequence"][0]["difficulty_tolerance"], 100
+        )
+
+        with self.assertRaisesRegex(ValueError, "正负 100"):
+            run_with("codeforces:4002A")
+
     def test_modes_restrict_candidates_and_send_only_sanitized_ac_summary(self) -> None:
         topic_tags = [
             ("dynamic_programming", "dp", 0),
@@ -262,6 +418,9 @@ class AiRecommendationModeTests(unittest.TestCase):
         with mock.patch.object(self.service, "recommendations", side_effect=deterministic_result), mock.patch.object(
             self.service, "_record_recommendation_output"
         ), mock.patch(
+            "tools.acm_agent.service_ai.recommendation_difficulty_targets",
+            return_value={"recovery": 1400, "main": 1400, "stretch": 1400},
+        ), mock.patch(
             "tools.acm_agent.platforms.enrich_luogu_accepted_problem_tags",
             return_value={"attempted": 0, "resolved": 0, "failed": 0, "remaining": 0},
         ) as enrich_tags:
@@ -294,9 +453,26 @@ class AiRecommendationModeTests(unittest.TestCase):
                 strong,
             )
 
+            self.service.ai_cache_clear(profile_ids=["recommendation"])
+            self.client.partial_invalid = True
+            hybrid = self.service.ai_recommendations(
+                count=1, mode="easy", ai_mode="gap_fill"
+            )
+            self.assertEqual(hybrid["ai"]["outcome"]["business_outcome"], "hybrid")
+            self.assertTrue(
+                all(row["ranking_basis"] == "hybrid" for row in hybrid["recommendations"])
+            )
+            self.client.partial_invalid = False
             self.client.invalid = True
-            fallback = self.service.ai_recommendations(count=2, ai_mode="gap_fill")
+            fallback = self.service.ai_recommendations(
+                count=2, ai_mode="gap_fill", source_mode="plan_only"
+            )
             self.assertEqual(fallback["ai"]["fallback"]["code"], "invalid_ai_ranking")
+            self.assertEqual(
+                fallback["ai"]["outcome"]["business_outcome"],
+                "deterministic_fallback",
+            )
+            self.assertEqual(fallback["ai"]["outcome"]["repair_attempts"], 1)
             self.assertEqual(
                 {row["knowledge_topic_key"] for row in fallback["recommendations"]},
                 {"dynamic_programming", "greedy"},
@@ -317,6 +493,45 @@ class AiRecommendationModeTests(unittest.TestCase):
             "notes",
         ):
             self.assertNotIn(forbidden, outbound)
+
+    def test_fallback_is_unavailable_without_a_full_strict_difficulty_set(self) -> None:
+        candidates = []
+        for index in range(6):
+            tag = "dp" if index < 3 else "greedy"
+            candidates.append(
+                {
+                    "slot": "main",
+                    "problem_key": f"codeforces:{7000 + index}A",
+                    "problem_id": f"CF{7000 + index}A",
+                    "platform": "codeforces",
+                    "title": "",
+                    "url": "",
+                    "equivalent_rating": 1800,
+                    "score": 100.0,
+                    "breakdown": {"difficulty_fit": 100.0},
+                    "reasons": [],
+                    "tags": [tag],
+                    "plan_sources": [],
+                }
+            )
+        self.client.invalid = True
+        with mock.patch.object(
+            self.service,
+            "recommendations",
+            return_value={"ok": True, "recommendations": candidates},
+        ), mock.patch.object(
+            self.service, "_record_recommendation_output"
+        ), mock.patch(
+            "tools.acm_agent.service_ai.recommendation_difficulty_targets",
+            return_value={"recovery": 1000, "main": 1000, "stretch": 1000},
+        ):
+            result = self.service.ai_recommendations(count=2)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["recommendations"], [])
+        self.assertEqual(
+            result["ai"]["outcome"]["business_outcome"], "unavailable"
+        )
         with Database(self.service.paths.database) as db:
             audit = dict(
                 db.query(

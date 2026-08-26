@@ -772,8 +772,6 @@ def build_markdown_candidate(
 
     normalized_schema = validate_summary_schema(schema)
     normalized_entry = validate_structured_entry(entry, normalized_schema)
-    if normalized_entry["confidence"] < 0.75:
-        raise EntryValidationError("entry confidence is below the 0.75 apply threshold")
     rendered = render_structured_entry(normalized_entry, normalized_schema, newline=document.newline)
     return _build_candidate(
         document,
@@ -830,8 +828,6 @@ def _build_candidate(
     duplicate_action: str,
     merge_title: str | None,
 ) -> CandidateResult:
-    if float(normalized_entry["confidence"]) < 0.75:
-        raise EntryValidationError("entry confidence is below the 0.75 apply threshold")
     action = str(duplicate_action).strip().casefold()
     if action not in {"auto", "merge", "new"}:
         raise EntryValidationError("duplicate_action must be auto, merge, or new")

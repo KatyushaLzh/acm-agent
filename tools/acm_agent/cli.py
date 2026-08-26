@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import math
+import os
 from pathlib import Path
 import sys
 from typing import Any, Mapping, Sequence
 
-from .ai_policy import ALLOWED_MODELS, ALLOWED_REASONING_EFFORTS
+from .ai_policy import ALLOWED_REASONING_EFFORTS
 from .knowledge import PRESET_NAMES
 # Re-exported dependencies keep existing CLI monkey-patch integrations stable.
 from .platforms import CodeforcesClient, LuoguClient, sync_codeforces, sync_luogu
@@ -15,7 +17,6 @@ from .service import AcmService, FAILURE_MODES, RESULTS
 from .verify import verify_problem
 
 
-MODEL_CHOICES = tuple(sorted(ALLOWED_MODELS))
 REASONING_EFFORT_CHOICES = tuple(sorted(ALLOWED_REASONING_EFFORTS))
 KNOWLEDGE_PRESET_CHOICES = (*PRESET_NAMES, "custom")
 KNOWLEDGE_SCHEMA_MODE_CHOICES = ("auto", "stored", "ai")
@@ -207,6 +208,7 @@ def command_next(args: argparse.Namespace, paths: Any) -> int:
     if args.ai:
         kwargs["model"] = args.model
         kwargs["ai_mode"] = args.ai_mode
+        kwargs["force_refresh"] = args.force_refresh
     payload = method(**kwargs)
     lines: list[str] = []
     for item in payload["recommendations"]:
@@ -251,6 +253,218 @@ def command_ai_settings(args: argparse.Namespace, paths: Any) -> int:
     return 0
 
 
+def command_ai_provider_list(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_providers()
+    lines = [
+        f"{item['id']}  {item['adapter']}  {item['base_url']}  {'enabled' if item['enabled'] else 'disabled'}"
+        for item in payload["providers"]
+    ]
+    _emit(payload, as_json=args.json, human="\n".join(lines) or "暂无 Provider。")
+    return 0
+
+
+def command_ai_provider_set(args: argparse.Namespace, paths: Any) -> int:
+    models = json.loads(args.models_file.read_text(encoding="utf-8-sig"))
+    if not isinstance(models, Mapping):
+        raise ValueError("models-file 必须包含 model id 到 capability 定义的 JSON 对象")
+    payload = _service(paths).ai_provider_upsert(
+        provider_id=args.provider_id,
+        name=args.name,
+        adapter=args.adapter,
+        base_url=args.base_url,
+        credential_slot=args.credential_slot,
+        models=models,
+        enabled=True,
+        auth_type=args.auth_type,
+        header_name=args.header_name,
+        environment_variable=args.from_env or "",
+    )
+    _emit(payload, as_json=args.json, human=f"Provider {args.provider_id} 已保存。")
+    return 0
+
+
+def command_ai_provider_disable(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_provider_disable(provider_id=args.provider_id)
+    _emit(payload, as_json=args.json, human=f"Provider {args.provider_id} 已停用。")
+    return 0
+
+
+def command_ai_provider_test(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_provider_test(provider_id=args.provider_id, model=args.model)
+    _emit(
+        payload,
+        as_json=args.json,
+        human=(
+            f"Provider conformance {'通过' if payload['ok'] else '失败'}："
+            f"{payload['provider_id']}/{payload['model']}"
+        ),
+    )
+    return 0 if payload["ok"] else 2
+
+
+def command_ai_credential_list(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_credentials()
+    lines = [
+        f"{item['slot']}  {item['provider_id']}  {item['source']}"
+        for item in payload["credentials"]
+    ]
+    _emit(payload, as_json=args.json, human="\n".join(lines) or "暂无凭据槽位。")
+    return 0
+
+
+def command_ai_credential_set(args: argparse.Namespace, paths: Any) -> int:
+    secret = (
+        str(os.environ.get(args.from_env) or "")
+        if args.from_env
+        else getpass.getpass("API Key（输入不会回显）: ")
+    )
+    payload = _service(paths).ai_credential_slot(
+        slot=args.slot,
+        provider_id=args.provider_id,
+        api_key=secret,
+    )
+    _emit(payload, as_json=args.json, human=f"凭据槽位 {args.slot} 已安全保存。")
+    return 0
+
+
+def command_ai_credential_clear(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_credential_slot(
+        slot=args.slot, provider_id=args.provider_id, clear=True
+    )
+    _emit(payload, as_json=args.json, human=f"凭据槽位 {args.slot} 已清除。")
+    return 0
+
+
+def command_ai_profile_list(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_profiles()
+    lines = [
+        f"{profile_id}  {value['provider_id']}/{value['model']}  thinking={value['thinking']}"
+        for profile_id, value in payload["profiles"].items()
+    ]
+    _emit(payload, as_json=args.json, human="\n".join(lines))
+    return 0
+
+
+def command_ai_profile_set(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_profile_update(
+        profile_id=args.profile_id,
+        provider_id=args.provider_id,
+        model=args.model,
+        thinking=args.thinking,
+        reasoning_effort=args.reasoning_effort,
+    )
+    _emit(payload, as_json=args.json, human=f"TaskProfile {args.profile_id} 已保存。")
+    return 0
+
+
+def command_ai_costs(args: argparse.Namespace, paths: Any) -> int:
+    service = _service(paths)
+    payload = service.ai_costs_reprice() if args.reprice else service.ai_costs(days=args.days)
+    audit = payload["audit"]
+    deepseek_cost = audit["deepseek_cost"]
+    all_model_tokens = audit["all_model_tokens"]
+    cache_metrics = audit["cache_metrics"]
+
+    cost_runs = int(deepseek_cost.get("runs") or 0)
+    unknown_cost_runs = int(deepseek_cost.get("unknown_cost_runs") or 0)
+    partial_cost_runs = int(deepseek_cost.get("partial_cost_runs") or 0)
+    if cost_runs and unknown_cost_runs == cost_runs:
+        cost_text = "未知"
+    else:
+        prefix = "至少 " if partial_cost_runs or unknown_cost_runs else ""
+        cost_text = f"{prefix}¥{float(deepseek_cost.get('known_estimated_cny') or 0):.6f}"
+
+    token_runs = int(all_model_tokens.get("runs") or 0)
+    unknown_token_runs = int(all_model_tokens.get("unknown_runs") or 0)
+    token_text = (
+        "未知"
+        if token_runs and unknown_token_runs == token_runs
+        else f"{int(all_model_tokens.get('total_tokens_known') or 0):,}"
+    )
+    hit_rate = cache_metrics.get("hit_rate_percent")
+    cache_text = (
+        f"{float(hit_rate):.1f}%"
+        if isinstance(hit_rate, (int, float)) and not isinstance(hit_rate, bool)
+        else "暂无可观测数据"
+    )
+    human = "\n".join(
+        (
+            (
+                f"近 {audit['window_days']} 天 DeepSeek 估算费用：{cost_text}"
+                f"（{cost_runs} runs，{unknown_cost_runs} 次未知，"
+                f"{partial_cost_runs} 次部分估算）"
+            ),
+            (
+                f"全模型 Tokens：{token_text}"
+                f"（输入 {int(all_model_tokens.get('input_tokens_known') or 0):,}，"
+                f"输出 {int(all_model_tokens.get('output_tokens_known') or 0):,}，"
+                f"{unknown_token_runs} 次缺失）"
+            ),
+            (
+                f"全模型缓存命中率：{cache_text}"
+                f"（读取 {int(cache_metrics.get('cache_read_tokens_known') or 0):,} / "
+                f"可观测输入 {int(cache_metrics.get('eligible_input_tokens') or 0):,}，"
+                f"{int(cache_metrics.get('observed_runs') or 0)} 次有效，"
+                f"{int(cache_metrics.get('unknown_runs') or 0)} 次缺失，"
+                f"{int(cache_metrics.get('invalid_runs') or 0)} 次无效）"
+            ),
+        )
+    )
+    _emit(payload, as_json=args.json, human=human)
+    return 0
+
+
+def command_ai_cache_status(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_cache_status()
+    entries = int(payload.get("entries", payload.get("entry_count", 0)) or 0)
+    bytes_used = int(payload.get("bytes", payload.get("total_bytes", 0)) or 0)
+    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+    exact_rate = metrics.get(
+        "local_exact_hit_rate",
+        metrics.get("exact_hit_rate", payload.get("exact_hit_rate")),
+    )
+    avoidance = metrics.get(
+        "provider_avoidance",
+        metrics.get("provider_avoidance_rate", payload.get("provider_avoidance")),
+    )
+    details = [f"本地精确缓存：{entries} 项，{bytes_used} bytes"]
+    if exact_rate is not None:
+        details.append(f"命中率 {float(exact_rate):.2%}" if float(exact_rate) <= 1 else f"命中率 {float(exact_rate):.2f}%")
+    if avoidance is not None:
+        details.append(f"Provider 避免率 {float(avoidance):.2%}" if float(avoidance) <= 1 else f"Provider 避免率 {float(avoidance):.2f}%")
+    _emit(payload, as_json=args.json, human="；".join(details))
+    return 0
+
+
+def command_ai_cache_clear(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_cache_clear(profile_ids=args.profile_ids or None)
+    removed = int(payload.get("removed", payload.get("removed_entries", 0)) or 0)
+    _emit(payload, as_json=args.json, human=f"已清理 {removed} 项本地精确缓存。")
+    return 0
+
+
+def command_ai_cache_prune(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_cache_prune()
+    removed = int(payload.get("removed", payload.get("removed_entries", 0)) or 0)
+    _emit(payload, as_json=args.json, human=f"缓存整理完成，移除 {removed} 项。")
+    return 0
+
+
+def command_ai_policy_show(args: argparse.Namespace, paths: Any) -> int:
+    payload = {"ok": True, "governance": _service(paths).ai_governance()}
+    _emit(payload, as_json=args.json, human=json.dumps(payload["governance"]["policy"], ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_ai_policy_set(args: argparse.Namespace, paths: Any) -> int:
+    policy = json.loads(args.file.read_text(encoding="utf-8-sig"))
+    if not isinstance(policy, Mapping):
+        raise ValueError("policy 文件必须是 JSON 对象")
+    payload = _service(paths).ai_policy_update(policy=policy)
+    _emit(payload, as_json=args.json, human="AI 路由、预算与 fallback 策略已保存。")
+    return 0
+
+
 def command_context_fetch(args: argparse.Namespace, paths: Any) -> int:
     payload = _service(paths).problem_context_fetch(args.problem, force=args.force)
     _emit(payload, as_json=args.json, human=f"题面已缓存：{payload['problem_id']}（{payload['source']}）")
@@ -283,6 +497,7 @@ def command_ask(args: argparse.Namespace, paths: Any) -> int:
         hint_level=args.hint_level,
         model=args.model,
         conversation_id=args.conversation,
+        delivery_mode=args.delivery_mode,
     )
     _emit(payload, as_json=args.json, human=payload.get("content") or "")
     return 0
@@ -410,6 +625,7 @@ def command_knowledge_preview(args: argparse.Namespace, paths: Any) -> int:
         preset=args.preset,
         schema=_schema_file(args.schema_file),
         model=args.model,
+        force_refresh=args.force_refresh,
     )
     proposal = payload.get("proposal") if isinstance(payload.get("proposal"), dict) else payload
     _emit(payload, as_json=args.json, human=proposal.get("entry_markdown") or "预览已生成；目标文件尚未修改。")
@@ -758,12 +974,17 @@ def build_parser() -> argparse.ArgumentParser:
     nxt.add_argument("--plan", dest="plan_ids", action="append", help="限定已启用题单，可重复")
     nxt.add_argument("--ai", action="store_true", help="显式使用 DeepSeek 按平台 AC 知识覆盖推荐")
     nxt.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="AI 推荐时跳过已有本地精确缓存并刷新；未使用 --ai 时无效",
+    )
+    nxt.add_argument(
         "--ai-mode",
         choices=("gap_fill", "specialization"),
         default="gap_fill",
         help="AI 推荐模式：查漏补缺或专项强化（默认 gap_fill）",
     )
-    nxt.add_argument("--model", choices=MODEL_CHOICES)
+    nxt.add_argument("--model")
     nxt.add_argument("--json", action="store_true")
     nxt.set_defaults(handler=command_next)
 
@@ -773,19 +994,112 @@ def build_parser() -> argparse.ArgumentParser:
     ai_status.add_argument("--json", action="store_true")
     ai_status.set_defaults(handler=command_ai_status)
     ai_test = ai_sub.add_parser("test")
-    ai_test.add_argument("--model", choices=MODEL_CHOICES)
+    ai_test.add_argument("--model")
     ai_test.add_argument("--json", action="store_true")
     ai_test.set_defaults(handler=command_ai_test)
     ai_settings = ai_sub.add_parser("settings")
-    ai_settings.add_argument("--recommend-model", choices=MODEL_CHOICES)
-    ai_settings.add_argument("--coach-model", choices=MODEL_CHOICES)
-    ai_settings.add_argument("--summary-model", choices=MODEL_CHOICES)
+    ai_settings.add_argument("--recommend-model")
+    ai_settings.add_argument("--coach-model")
+    ai_settings.add_argument("--summary-model")
     ai_settings.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=None)
     ai_settings.add_argument("--reasoning-effort", choices=REASONING_EFFORT_CHOICES)
     ai_settings.add_argument("--summary-thinking", action=argparse.BooleanOptionalAction, default=None)
     ai_settings.add_argument("--summary-reasoning-effort", choices=REASONING_EFFORT_CHOICES)
     ai_settings.add_argument("--json", action="store_true")
     ai_settings.set_defaults(handler=command_ai_settings)
+
+    ai_provider = ai_sub.add_parser("provider", help="管理模型 Provider")
+    ai_provider_sub = ai_provider.add_subparsers(dest="provider_command", required=True)
+    ai_provider_list = ai_provider_sub.add_parser("list")
+    ai_provider_list.add_argument("--json", action="store_true")
+    ai_provider_list.set_defaults(handler=command_ai_provider_list)
+    ai_provider_set = ai_provider_sub.add_parser("set")
+    ai_provider_set.add_argument("provider_id")
+    ai_provider_set.add_argument("--name", required=True)
+    ai_provider_set.add_argument("--adapter", choices=("deepseek", "openai_compatible"), default="openai_compatible")
+    ai_provider_set.add_argument("--base-url", required=True)
+    ai_provider_set.add_argument("--credential-slot", required=True)
+    ai_provider_set.add_argument("--models-file", type=Path, required=True)
+    ai_provider_set.add_argument("--auth-type", choices=("bearer", "header"), default="bearer")
+    ai_provider_set.add_argument("--header-name")
+    ai_provider_set.add_argument("--from-env", help="非敏感环境变量名，仅记录名称")
+    ai_provider_set.add_argument("--json", action="store_true")
+    ai_provider_set.set_defaults(handler=command_ai_provider_set)
+    ai_provider_disable = ai_provider_sub.add_parser("disable")
+    ai_provider_disable.add_argument("provider_id")
+    ai_provider_disable.add_argument("--json", action="store_true")
+    ai_provider_disable.set_defaults(handler=command_ai_provider_disable)
+    ai_provider_test = ai_provider_sub.add_parser("test", help="显式执行付费/联网 conformance canary")
+    ai_provider_test.add_argument("provider_id")
+    ai_provider_test.add_argument("--model")
+    ai_provider_test.add_argument("--json", action="store_true")
+    ai_provider_test.set_defaults(handler=command_ai_provider_test)
+
+    ai_credential = ai_sub.add_parser("credential", help="管理命名系统安全凭据槽位")
+    ai_credential_sub = ai_credential.add_subparsers(dest="credential_command", required=True)
+    ai_credential_list = ai_credential_sub.add_parser("list")
+    ai_credential_list.add_argument("--json", action="store_true")
+    ai_credential_list.set_defaults(handler=command_ai_credential_list)
+    ai_credential_set = ai_credential_sub.add_parser("set")
+    ai_credential_set.add_argument("slot")
+    ai_credential_set.add_argument("--provider-id", required=True)
+    ai_credential_set.add_argument("--from-env", help="从指定环境变量读取；secret 不进入命令行")
+    ai_credential_set.add_argument("--json", action="store_true")
+    ai_credential_set.set_defaults(handler=command_ai_credential_set)
+    ai_credential_clear = ai_credential_sub.add_parser("clear")
+    ai_credential_clear.add_argument("slot")
+    ai_credential_clear.add_argument("--provider-id", required=True)
+    ai_credential_clear.add_argument("--json", action="store_true")
+    ai_credential_clear.set_defaults(handler=command_ai_credential_clear)
+
+    ai_profile = ai_sub.add_parser("profile", help="管理六类 TaskProfile")
+    ai_profile_sub = ai_profile.add_subparsers(dest="profile_command", required=True)
+    ai_profile_list = ai_profile_sub.add_parser("list")
+    ai_profile_list.add_argument("--json", action="store_true")
+    ai_profile_list.set_defaults(handler=command_ai_profile_list)
+    ai_profile_set = ai_profile_sub.add_parser("set")
+    ai_profile_set.add_argument("profile_id", choices=("recommendation", "plan_organize", "plan_generate", "coaching", "patch", "summary"))
+    ai_profile_set.add_argument("--provider-id", required=True)
+    ai_profile_set.add_argument("--model", required=True)
+    ai_profile_set.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=None)
+    ai_profile_set.add_argument("--reasoning-effort", choices=REASONING_EFFORT_CHOICES)
+    ai_profile_set.add_argument("--json", action="store_true")
+    ai_profile_set.set_defaults(handler=command_ai_profile_set)
+
+    ai_costs = ai_sub.add_parser("costs", help="查看安全聚合的 AI 用量与估算费用")
+    ai_costs.add_argument("--days", type=int, default=30)
+    ai_costs.add_argument("--reprice", action="store_true", help="用当前内置价格版本追加重算记录")
+    ai_costs.add_argument("--json", action="store_true")
+    ai_costs.set_defaults(handler=command_ai_costs)
+
+    ai_cache = ai_sub.add_parser("cache", help="查看或清理本地 AI 精确缓存")
+    ai_cache_sub = ai_cache.add_subparsers(dest="cache_command", required=True)
+    ai_cache_status = ai_cache_sub.add_parser("status")
+    ai_cache_status.add_argument("--json", action="store_true")
+    ai_cache_status.set_defaults(handler=command_ai_cache_status)
+    ai_cache_clear = ai_cache_sub.add_parser("clear")
+    ai_cache_clear.add_argument(
+        "--profile",
+        dest="profile_ids",
+        action="append",
+        choices=("recommendation", "plan_organize", "summary"),
+        help="只清理指定可缓存 TaskProfile；可重复，省略时清理全部",
+    )
+    ai_cache_clear.add_argument("--json", action="store_true")
+    ai_cache_clear.set_defaults(handler=command_ai_cache_clear)
+    ai_cache_prune = ai_cache_sub.add_parser("prune")
+    ai_cache_prune.add_argument("--json", action="store_true")
+    ai_cache_prune.set_defaults(handler=command_ai_cache_prune)
+
+    ai_policy = ai_sub.add_parser("policy", help="查看或更新任务预算与模型 fallback")
+    ai_policy_sub = ai_policy.add_subparsers(dest="policy_command", required=True)
+    ai_policy_show = ai_policy_sub.add_parser("show")
+    ai_policy_show.add_argument("--json", action="store_true")
+    ai_policy_show.set_defaults(handler=command_ai_policy_show)
+    ai_policy_set = ai_policy_sub.add_parser("set")
+    ai_policy_set.add_argument("file", type=Path)
+    ai_policy_set.add_argument("--json", action="store_true")
+    ai_policy_set.set_defaults(handler=command_ai_policy_set)
 
     context = sub.add_parser("context", help="管理 AI 使用的公开题面上下文")
     context_sub = context.add_subparsers(dest="context_command", required=True)
@@ -810,8 +1124,9 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("message", nargs="?")
     ask.add_argument("--mode", choices=("hint", "explain", "review"), default="hint")
     ask.add_argument("--hint-level", type=int, default=1)
-    ask.add_argument("--model", choices=MODEL_CHOICES)
+    ask.add_argument("--model")
     ask.add_argument("--conversation")
+    ask.add_argument("--delivery-mode", choices=("resilient", "low_latency"), default=None)
     ask.add_argument("--json", action="store_true")
     ask.set_defaults(handler=command_ask)
 
@@ -820,7 +1135,7 @@ def build_parser() -> argparse.ArgumentParser:
     patch_preview = patch_sub.add_parser("preview")
     patch_preview.add_argument("problem")
     patch_preview.add_argument("instruction", nargs="?")
-    patch_preview.add_argument("--model", choices=MODEL_CHOICES)
+    patch_preview.add_argument("--model")
     patch_preview.add_argument("--conversation")
     patch_preview.add_argument("--json", action="store_true")
     patch_preview.set_defaults(handler=command_patch_preview)
@@ -886,7 +1201,12 @@ def build_parser() -> argparse.ArgumentParser:
     knowledge_preview.add_argument("--schema-mode", choices=KNOWLEDGE_SCHEMA_MODE_CHOICES, default="stored")
     knowledge_preview.add_argument("--preset", choices=KNOWLEDGE_PRESET_CHOICES)
     knowledge_preview.add_argument("--schema-file", type=Path)
-    knowledge_preview.add_argument("--model", choices=MODEL_CHOICES)
+    knowledge_preview.add_argument("--model")
+    knowledge_preview.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="跳过已有本地精确缓存并生成新总结",
+    )
     knowledge_preview.add_argument("--json", action="store_true")
     knowledge_preview.set_defaults(handler=command_knowledge_preview)
     knowledge_refresh = knowledge_sub.add_parser("refresh", help="用编辑后的条目刷新安全预览，不调用模型")

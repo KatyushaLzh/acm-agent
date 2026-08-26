@@ -1,0 +1,26 @@
+{
+  "catalog_version": "deepseek-2026-08-26-cny-v1",
+  "effective_date": "2026-08-26",
+  "currency": "CNY",
+  "unit_tokens": 1000000,
+  "source": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
+  "schedule": {
+    "timezone": "UTC",
+    "peak_weekdays": [0, 1, 2, 3, 4],
+    "peak_intervals": [[1, 4], [6, 10]]
+  },
+  "providers": {
+    "deepseek": {
+      "models": {
+        "deepseek-v4-flash": {
+          "off_peak": {"cache_read_input": 0.05, "uncached_input": 1.5, "output": 4.5},
+          "peak": {"cache_read_input": 0.1, "uncached_input": 3.0, "output": 9.0}
+        },
+        "deepseek-v4-pro": {
+          "off_peak": {"cache_read_input": 0.15, "uncached_input": 4.5, "output": 13.5},
+          "peak": {"cache_read_input": 0.3, "uncached_input": 9.0, "output": 27.0}
+        }
+      }
+    }
+  }
+}

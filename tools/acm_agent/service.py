@@ -11,14 +11,19 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import Paths
-from .credentials import CredentialStoreError, DeepSeekCredentialStore
-from .deepseek import DeepSeekClient
+from .credentials import (
+    CredentialVault,
+    CredentialStoreError,
+    DeepSeekCredentialStore,
+    create_platform_credential_vault,
+)
 from .platforms import (
     CodeforcesClient,
     LuoguClient,
     sync_codeforces,
     sync_luogu,
 )
+from .provider_default import create_default_provider
 from .recommend import recommend
 from .service_ai import ServiceAIMixin
 from .service_common import (
@@ -57,10 +62,12 @@ class AcmService(
         sync_codeforces_fn: Callable[..., Any] = sync_codeforces,
         sync_luogu_fn: Callable[..., Any] = sync_luogu,
         verify_fn: Callable[..., Any] = verify_problem,
-        deepseek_client_factory: Callable[[], Any] = DeepSeekClient,
+        provider_client_factory: Callable[[], Any] | None = None,
+        deepseek_client_factory: Callable[[], Any] | None = None,
         recommend_fn: Callable[..., Any] | None = None,
         problem_context_fetcher: Callable[[ProblemRef], tuple[str, str]] | None = None,
         credential_store: DeepSeekCredentialStore | None = None,
+        credential_vault: CredentialVault | None = None,
     ) -> None:
         self.paths = Paths.for_root(Path(root))
         self._codeforces_client_factory = codeforces_client_factory
@@ -68,16 +75,28 @@ class AcmService(
         self._sync_codeforces = sync_codeforces_fn
         self._sync_luogu = sync_luogu_fn
         self._verify = verify_fn
-        self._deepseek_client_factory = deepseek_client_factory
+        if provider_client_factory is not None and deepseek_client_factory is not None:
+            raise ValueError(
+                "provider_client_factory and deepseek_client_factory are mutually exclusive"
+            )
+        selected_provider_factory = provider_client_factory or deepseek_client_factory
+        self._provider_factory_is_default = selected_provider_factory is None
+        self._provider_client_factory = selected_provider_factory or create_default_provider
         self._recommend_fn = recommend_fn
         self._problem_context_fetcher = problem_context_fetcher
         self._credential_store = credential_store or DeepSeekCredentialStore(
             self.paths.state_dir / "deepseek-key.dpapi"
         )
+        self._credential_vault = credential_vault
+        if credential_store is None and self._credential_vault is None:
+            self._credential_vault = create_platform_credential_vault(self.paths.state_dir)
         self._deepseek_api_key: str | None = None
         self._credential_error: str | None = None
         try:
-            self._deepseek_api_key = self._credential_store.load()
+            if self._credential_vault is not None:
+                self._credential_vault.migrate_legacy_deepseek()
+            else:
+                self._deepseek_api_key = self._credential_store.load()
         except CredentialStoreError as exc:
             self._credential_error = str(exc)
         if self.paths.database.is_file():

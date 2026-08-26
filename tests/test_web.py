@@ -19,6 +19,7 @@ from tools.acm_agent.web import (
     create_server,
     find_existing_instance,
 )
+from tools.acm_agent.credentials import CredentialStoreError
 from tools.acm_agent.storage import PlanRevisionConflict, TagOverrideRevisionConflict
 
 
@@ -50,7 +51,18 @@ class FakeService:
         return self._return("recommendations", values)
 
     def ai_status(self, **values: object) -> dict[str, object]:
-        return {"ok": True, "api_key_detected": False, "settings": {}}
+        return {
+            "ok": True,
+            "api_key_detected": False,
+            "settings": {},
+            "coaching_delivery_mode": "resilient",
+            "secure_store": {
+                "backend": "dpapi",
+                "available": True,
+                "error_code": None,
+                "message": "Windows DPAPI 可用。",
+            },
+        }
 
     def ai_settings(self, **values: object) -> dict[str, object]:
         return self._return("ai_settings", values)
@@ -68,6 +80,107 @@ class FakeService:
 
     def ai_test(self, **values: object) -> dict[str, object]:
         return self._return("ai_test", values)
+
+    def ai_providers(self, **values: object) -> dict[str, object]:
+        return {"ok": True, "providers": [], "profiles": {}}
+
+    def ai_profiles(self, **values: object) -> dict[str, object]:
+        return {"ok": True, "profiles": {}}
+
+    def ai_credentials(self, **values: object) -> dict[str, object]:
+        return {"ok": True, "credentials": []}
+
+    def ai_provider_upsert(self, **values: object) -> dict[str, object]:
+        return self._return("ai_provider_upsert", values)
+
+    def ai_provider_disable(self, **values: object) -> dict[str, object]:
+        return self._return("ai_provider_disable", values)
+
+    def ai_connections(self, **values: object) -> dict[str, object]:
+        return {"ok": True, "connections": []}
+
+    def ai_connection_upsert(self, **values: object) -> dict[str, object]:
+        values = {key: value for key, value in values.items() if key != "api_key"}
+        return self._return("ai_connection_upsert", values)
+
+    def ai_connection_refresh(self, **values: object) -> dict[str, object]:
+        return self._return("ai_connection_refresh", values)
+
+    def ai_connection_delete(self, **values: object) -> dict[str, object]:
+        return self._return("ai_connection_delete", values)
+
+    def ai_profile_update(self, **values: object) -> dict[str, object]:
+        return self._return("ai_profile_update", values)
+
+    def ai_policy_update(self, **values: object) -> dict[str, object]:
+        return self._return("ai_policy_update", values)
+
+    def ai_costs(self, **values: object) -> dict[str, object]:
+        return {
+            "ok": True,
+            "audit": {
+                "totals": {},
+                "deepseek_cost": {
+                    "provider_id": "deepseek",
+                    "runs": 1,
+                    "known_estimated_cny": 0.25,
+                    "currency": "CNY",
+                    "unknown_cost_runs": 0,
+                    "partial_cost_runs": 0,
+                },
+                "all_model_tokens": {
+                    "runs": 2,
+                    "total_tokens_known": 300,
+                    "input_tokens_known": 240,
+                    "output_tokens_known": 60,
+                    "unknown_runs": 0,
+                },
+                "cache_metrics": {
+                    "cache_read_tokens_known": 120,
+                    "eligible_input_tokens": 240,
+                    "hit_rate_percent": 50.0,
+                    "observed_runs": 2,
+                    "unknown_runs": 0,
+                    "invalid_runs": 0,
+                },
+                "groups": [],
+                "recent_runs": [],
+            },
+        }
+
+    def ai_costs_reprice(self, **values: object) -> dict[str, object]:
+        return {
+            "ok": True,
+            "repricing": {"runs": 0},
+            "audit": self.ai_costs()["audit"],
+        }
+
+    def ai_cache_status(self, **values: object) -> dict[str, object]:
+        self.calls.append(("ai_cache_status", dict(values)))
+        return {
+            "entries": 3,
+            "bytes": 1024,
+            "metrics": {
+                "local_exact_hit_rate": 0.5,
+                "provider_avoidance": 0.6,
+            },
+        }
+
+    def ai_cache_clear(self, **values: object) -> dict[str, object]:
+        return {**self._return("ai_cache_clear", values), "removed": 2}
+
+    def ai_cache_prune(self, **values: object) -> dict[str, object]:
+        return {**self._return("ai_cache_prune", values), "removed": 1}
+
+    def ai_credential_slot(self, **values: object) -> dict[str, object]:
+        self.calls.append(("ai_credential_slot", dict(values)))
+        return {"ok": True, "slot": values.get("slot"), "detected": True}
+
+    def ai_provider_test(self, **values: object) -> dict[str, object]:
+        return {"ok": True, **self._return("ai_provider_test", values)}
+
+    def ai_model_verify(self, **values: object) -> dict[str, object]:
+        return {"ok": True, **self._return("ai_model_verify", values)}
 
     def ai_recommendations(self, **values: object) -> dict[str, object]:
         return self._return("ai_recommendations", values)
@@ -102,6 +215,9 @@ class FakeService:
     def ai_conversation(self, **values: object) -> dict[str, object]:
         return self._return("ai_conversation", values)
 
+    def ai_conversation_switch(self, **values: object) -> dict[str, object]:
+        return {**self._return("ai_conversation_switch", values), "conversation_id": "conv-2"}
+
     def ai_chat_stream(self, conversation_id: str, **values: object):
         self.calls.append(("ai_chat_stream", {"conversation_id": conversation_id, **values}))
         yield {"event": "meta", "data": {"conversation_id": conversation_id}}
@@ -117,6 +233,9 @@ class FakeService:
 
     def ai_patch_revert(self, **values: object) -> dict[str, object]:
         return self._return("ai_patch_revert", values)
+
+    def knowledge_preview(self, **values: object) -> dict[str, object]:
+        return self._return("knowledge_preview", values)
 
     def start(self, **values: object) -> dict[str, object]:
         return self._return("start", values)
@@ -312,7 +431,101 @@ class WebServerTest(unittest.TestCase):
         status, payload, headers = self.request("GET", "/static/app.js", token=None)
         self.assertEqual(status, 200)
         self.assertEqual(headers["content-type"], "text/javascript; charset=utf-8")
+        self.assertEqual(headers["cache-control"], "no-store")
         self.assertIn("console.log", payload["raw"])
+
+    def test_stage2_management_http_routes_and_named_credential_no_echo(self) -> None:
+        provider_body = {
+            "provider_id": "relay", "name": "Relay",
+            "base_url": "https://relay.example/v1", "credential_slot": "relay",
+            "models": {"relay-model": {"capabilities": {"text_chat": True, "usage": True}}},
+        }
+        status, payload, _ = self.request("POST", "/api/ai/providers", payload=provider_body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["operation"], "ai_provider_upsert")
+
+        secret = "web-stage2-secret"
+        status, payload, _ = self.request("POST", "/api/ai/credentials", payload={
+            "slot": "relay", "provider_id": "relay", "api_key": secret,
+        })
+        self.assertEqual(status, 200)
+        self.assertNotIn(secret, json.dumps(payload))
+
+        status, payload, _ = self.request("POST", "/api/ai/profiles", payload={
+            "profile_id": "recommendation", "provider_id": "relay",
+            "model": "relay-model", "thinking": False,
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["operation"], "ai_profile_update")
+
+        status, payload, _ = self.request("POST", "/api/ai/providers/disable", payload={
+            "provider_id": "relay",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["operation"], "ai_provider_disable")
+
+    def test_stage3_policy_and_cost_audit_routes(self) -> None:
+        status, payload, _ = self.request("GET", "/api/ai/costs")
+        self.assertEqual(status, 200)
+        self.assertIn("totals", payload["data"]["audit"])
+        self.assertEqual(
+            payload["data"]["audit"]["deepseek_cost"]["provider_id"], "deepseek"
+        )
+        self.assertEqual(
+            payload["data"]["audit"]["all_model_tokens"]["total_tokens_known"], 300
+        )
+        self.assertEqual(
+            payload["data"]["audit"]["cache_metrics"]["hit_rate_percent"], 50.0
+        )
+
+        policy = {"budgets": {}, "fallbacks": {}, "hard_limits": {}}
+        status, payload, _ = self.request(
+            "POST", "/api/ai/policy",
+            payload={"policy": policy, "coaching_delivery_mode": "low_latency"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["operation"], "ai_policy_update")
+        self.assertEqual(payload["data"]["policy"], policy)
+        self.assertEqual(payload["data"]["coaching_delivery_mode"], "low_latency")
+
+        status, payload, _ = self.request(
+            "POST", "/api/ai/costs/reprice", payload={}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["repricing"]["runs"], 0)
+
+    def test_simplified_connection_profile_verification_and_conversation_switch_routes(self) -> None:
+        selection = {
+            "model_ref": {"provider_id": "relay", "model": "same-name"},
+            "reasoning_strength": "medium",
+        }
+        secret = "web-connection-secret"
+        status, payload, _ = self.request("POST", "/api/ai/connections", payload={
+            "display_name": "Relay", "base_url": "https://relay.example/v1", "api_key": secret,
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["operation"], "ai_connection_upsert")
+        self.assertNotIn(secret, json.dumps(payload))
+
+        status, payload, _ = self.request("POST", "/api/ai/profiles", payload={
+            "profile_id": "recommendation", **selection,
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["model_ref"], selection["model_ref"])
+
+        status, payload, _ = self.request("POST", "/api/jobs/ai/models/verify", payload={
+            "profile_id": "recommendation", **selection,
+        })
+        self.assertEqual(status, 202)
+        job = self.wait_for_job(payload["data"]["job_id"])
+        self.assertEqual(job["result"]["operation"], "ai_model_verify")
+
+        status, payload, _ = self.request(
+            "POST", "/api/ai/conversations/conv-1/switch", payload=selection
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["conversation_id"], "conv-2")
+        self.assertEqual(payload["data"]["model_ref"], selection["model_ref"])
 
     def test_static_katex_font_mime_types(self) -> None:
         expected = {
@@ -384,6 +597,36 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["data"], {"cancelled": True})
 
+    def test_local_cpp_picker_uses_latest_problem_source_directory(self) -> None:
+        older = self.root / "2026" / "8" / "24"
+        latest = self.root / "2026" / "8" / "25"
+        older.mkdir(parents=True)
+        latest.mkdir(parents=True)
+        (older / "P2617.cpp").write_text("int main() {}\n", encoding="utf-8")
+        (latest / "P2617.cpp").write_text("int main() {}\n", encoding="utf-8")
+        selected = latest / "generator.cpp"
+        selected.write_text("int main() {}\n", encoding="utf-8")
+        self.file_picker_result = selected
+
+        status, payload, _ = self.request(
+            "POST",
+            "/api/local-files/pick",
+            payload={"kind": "cpp", "problem": "P2617"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["path"], str(selected))
+        self.assertEqual(self.file_picker_calls[-1], ("cpp", latest.resolve()))
+
+        self.file_picker_result = None
+        status, _, _ = self.request(
+            "POST",
+            "/api/local-files/pick",
+            payload={"kind": "cpp", "problem": "missing-problem"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self.file_picker_calls[-1], ("cpp", self.root.resolve()))
+
     def test_local_file_picker_inherits_auth_and_validates_request(self) -> None:
         status, payload, _ = self.request(
             "POST",
@@ -395,7 +638,13 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "unauthorized")
         self.assertEqual(self.file_picker_calls, [])
 
-        for request_payload in ({}, {"kind": "txt"}, {"kind": "cpp", "extra": True}):
+        for request_payload in (
+            {},
+            {"kind": "txt"},
+            {"kind": "cpp", "extra": True},
+            {"kind": "cpp", "problem": 2617},
+            {"kind": "markdown", "problem": "P2617"},
+        ):
             with self.subTest(payload=request_payload):
                 status, payload, _ = self.request(
                     "POST", "/api/local-files/pick", payload=request_payload
@@ -654,6 +903,15 @@ class WebServerTest(unittest.TestCase):
         status, payload, _ = self.request("GET", "/api/ai/status")
         self.assertEqual(status, 200)
         self.assertFalse(payload["data"]["api_key_detected"])
+        self.assertEqual(
+            payload["data"]["secure_store"],
+            {
+                "backend": "dpapi",
+                "available": True,
+                "error_code": None,
+                "message": "Windows DPAPI 可用。",
+            },
+        )
 
         secret = "sk-http-fixture-must-not-echo"
         status, payload, _ = self.request(
@@ -678,7 +936,10 @@ class WebServerTest(unittest.TestCase):
         status, payload, headers = self.request(
             "POST",
             "/api/ai/conversations/conv-1/messages",
-            payload={"message": "hint", "mode": "hint", "hint_level": 1},
+            payload={
+                "message": "hint", "mode": "hint", "hint_level": 1,
+                "delivery_mode": "resilient",
+            },
         )
         self.assertEqual(status, 200)
         self.assertEqual(headers["content-type"], "text/event-stream; charset=utf-8")
@@ -686,6 +947,7 @@ class WebServerTest(unittest.TestCase):
         self.assertIn("event: delta", payload["raw"])
         self.assertIn("event: usage", payload["raw"])
         self.assertIn("event: done", payload["raw"])
+        self.assertEqual(self.service.calls[-1][1]["delivery_mode"], "resilient")
 
         status, payload, _ = self.request(
             "POST", "/api/jobs/ai/recommendations", payload={"count": 2}
@@ -704,6 +966,57 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(job["result"]["operation"], "ai_plan_preview")
         self.assertEqual(job["progress"]["round"], 1)
         self.assertEqual(job["progress"]["accepted_count"], 1)
+
+    def test_ai_cache_control_routes_and_force_refresh_passthrough(self) -> None:
+        status, payload, _ = self.request("GET", "/api/ai/cache")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["entries"], 3)
+        self.assertEqual(self.service.calls[-1], ("ai_cache_status", {}))
+
+        status, payload, _ = self.request(
+            "POST",
+            "/api/ai/cache/clear",
+            payload={"profile_ids": ["recommendation", "summary"]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["removed"], 2)
+        self.assertEqual(
+            self.service.calls[-1],
+            ("ai_cache_clear", {"profile_ids": ["recommendation", "summary"]}),
+        )
+
+        status, payload, _ = self.request("POST", "/api/ai/cache/prune", payload={})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["removed"], 1)
+        self.assertEqual(self.service.calls[-1], ("ai_cache_prune", {}))
+
+        status, payload, _ = self.request(
+            "POST",
+            "/api/jobs/ai/recommendations",
+            payload={"count": 2, "force_refresh": True},
+        )
+        self.assertEqual(status, 202)
+        job = self.wait_for_job(payload["data"]["job_id"])
+        self.assertTrue(job["result"]["force_refresh"])
+
+        status, payload, _ = self.request(
+            "POST",
+            "/api/jobs/ai/knowledge/preview",
+            payload={"attempt_id": 1, "target_id": "target-1", "force_refresh": True},
+        )
+        self.assertEqual(status, 202)
+        job = self.wait_for_job(payload["data"]["job_id"])
+        self.assertEqual(job["result"]["operation"], "knowledge_preview")
+        self.assertTrue(job["result"]["force_refresh"])
+
+        status, payload, _ = self.request(
+            "POST",
+            "/api/jobs/ai/plans/preview",
+            payload={"mode": "organize", "text": "CF1A", "force_refresh": True},
+        )
+        self.assertEqual(status, 202)
+        job = self.wait_for_job(payload["data"]["job_id"])
+        self.assertTrue(job["result"]["force_refresh"])
 
     def test_sse_iteration_failure_is_a_structured_terminal_event(self) -> None:
         def broken_stream(conversation_id: str, **values: object):
@@ -980,6 +1293,27 @@ class WebServerTest(unittest.TestCase):
 
 
 class JobManagerTest(unittest.TestCase):
+    def test_typed_credential_store_errors_preserve_public_code_and_status(self) -> None:
+        unavailable = _problem_from_exception(
+            CredentialStoreError(
+                "系统安全存储不可用。", code="credential_store_unavailable"
+            )
+        )
+        self.assertEqual(unavailable.status, 503)
+        self.assertEqual(unavailable.code, "credential_store_unavailable")
+
+        locked = _problem_from_exception(
+            CredentialStoreError(
+                "系统安全存储已锁定。", code="credential_store_locked"
+            )
+        )
+        self.assertEqual(locked.status, 409)
+        self.assertEqual(locked.code, "credential_store_locked")
+
+        legacy = _problem_from_exception(CredentialStoreError("凭据写入失败。"))
+        self.assertEqual(legacy.status, 409)
+        self.assertEqual(legacy.code, "credential_store_error")
+
     def test_jobs_execute_serially(self) -> None:
         manager = JobManager(threading.RLock(), capacity=10)
         running = 0
@@ -1271,7 +1605,6 @@ class JobManagerTest(unittest.TestCase):
         self.assertIn('delete button.dataset.busyLabel', self.script)
         self.assertIn('delete button.dataset.busyWasDisabled', self.script)
         for selector in (
-            "#ai-test-button",
             "#sync-button",
             "#ai-context-button",
             "#plan-check-button",
@@ -1396,13 +1729,14 @@ class JobManagerTest(unittest.TestCase):
         ):
             self.assertIn(token_class, styles)
 
-    def test_ai_key_form_uses_password_input_and_never_browser_storage(self) -> None:
-        self.assertIn('id="ai-credential-form"', self.html)
+    def test_ai_connection_form_uses_password_input_and_never_browser_storage(self) -> None:
+        self.assertIn('id="ai-connection-form"', self.html)
         self.assertIn('name="api_key" type="password"', self.html)
         self.assertIn('autocomplete="new-password"', self.html)
-        self.assertIn('id="ai-key-clear"', self.html)
-        self.assertIn('api("/api/ai/credential"', self.script)
-        self.assertIn('input.value = ""', self.script)
+        self.assertNotIn('id="ai-credential-form"', self.html)
+        self.assertNotIn('id="ai-key-clear"', self.html)
+        self.assertIn('api("/api/ai/connections"', self.script)
+        self.assertIn('finally {\n    keyInput.value = "";', self.script)
         self.assertNotIn('localStorage.setItem("deepseek', self.script)
         self.assertNotIn('sessionStorage.setItem("deepseek', self.script)
         self.assertNotIn('localStorage.setItem("api', self.script)

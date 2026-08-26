@@ -33,9 +33,12 @@ const state = {
   skipCandidate: null,
   skippedProblems: [],
   aiStatus: null,
+  aiSelections: {},
+  aiSelectionBusy: false,
   aiProblemKey: "",
   aiConversationId: "",
   aiConversationProblemKey: "",
+  aiConversationSelection: null,
   aiEpoch: 0,
   aiStreamController: null,
   aiContextHash: null,
@@ -110,6 +113,8 @@ function filePickerField(name) {
   return document.querySelector(`[data-file-picker-field="${name}"]`);
 }
 
+const VERIFY_FILE_PICKERS = new Set(["generator_file", "reference_file", "user_file"]);
+
 function resetKnowledgeTargetInspection() {
   state.knowledgeTargetInspection = null;
   const button = $("#knowledge-target-add");
@@ -140,9 +145,13 @@ function setLocalFileSelection(name, path, { fromPicker = false } = {}) {
 async function pickLocalFile(button) {
   const name = button.dataset.filePicker;
   const kind = button.dataset.kind;
+  const problem = VERIFY_FILE_PICKERS.has(name)
+    ? String($("#verify-form input[name=problem]")?.value || "").trim()
+    : "";
+  const body = problem ? { kind, problem } : { kind };
   setBusy(button, true, "选择中…");
   try {
-    const selected = await api("/api/local-files/pick", { body: { kind } });
+    const selected = await api("/api/local-files/pick", { body });
     if (selected.cancelled) return;
     if (!selected.path) throw new Error("文件选择器未返回路径");
     setLocalFileSelection(name, selected.path, { fromPicker: true });
@@ -523,8 +532,21 @@ function renderVerify(result) {
   if (result.compile_output) lines.push(`\n[compiler]\n${result.compile_output}`);
   const cases = result.cases || result.case_results || [];
   for (const test of cases) lines.push(`\n[${test.name || test.case || "case"}] ${test.passed ?? test.ok ? "PASS" : "FAIL"}${test.message ? ` — ${test.message}` : ""}`);
-  if (result.sanitizer) lines.push(`\nSanitizer: ${result.sanitizer}`);
-  if (result.stress) lines.push(`Stress: ${typeof result.stress === "object" ? JSON.stringify(result.stress, null, 2) : result.stress}`);
+  const sanitizer = String(result.sanitizer || "").toLowerCase();
+  if (sanitizer === "enabled") lines.push("\nSanitizer: 已启用 ASan/UBSan");
+  else if (sanitizer === "unsupported") lines.push("\nSanitizer: 当前编译器未提供 ASan/UBSan，已按普通模式继续");
+  else if (sanitizer && sanitizer !== "not_requested") lines.push(`\nSanitizer: ${result.sanitizer}`);
+  const stress = typeof result.stress === "string" ? result.stress.toLowerCase() : result.stress;
+  const stressLabels = {
+    not_available: "未运行（未同时提供生成器和暴力程序）",
+    passed: `通过（${Number(result.stress_iterations || 0)} 轮）`,
+    compile_failed: "未运行（对拍辅助程序编译失败）",
+    timeout: "中止（生成器、待测程序或暴力程序超时）",
+    output_limit: "中止（输出超过安全上限；具体阶段见下方警告）",
+    failed: `失败（已运行 ${Number(result.stress_iterations || 0)} 轮）`,
+  };
+  if (result.stress) lines.push(`Stress: ${typeof stress === "object" ? JSON.stringify(stress, null, 2) : (stressLabels[stress] || result.stress)}`);
+  for (const warning of result.warnings || []) lines.push(`\n[警告] ${warning}`);
   if (result.failure_dir) lines.push(`\n失败资产: ${result.failure_dir}`);
   if (result.error) lines.push(`\nError: ${result.error.message || result.error}`);
   if (!lines.length) lines.push(JSON.stringify(result, null, 2));

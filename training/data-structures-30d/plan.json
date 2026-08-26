@@ -1,1085 +1,254 @@
 {
-  "schema_version": 2,
-  "plan_id": "data-structures-30d",
+  "schema_version": 1,
   "title": "30 天数据结构进阶题单",
-  "description": "按 D1 至 D30 的阶段顺序推进，各阶段不设截至日期。",
-  "schedule_mode": "progressive",
-  "stages": [
+  "start_date": "2026-07-27",
+  "end_date": "2026-08-25",
+  "days": [
     {
-      "stage_key": "d01",
-      "topic": "四结构诊断",
-      "kind": "practice",
+      "day": 1, "date": "2026-07-27", "topic": "四结构诊断", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d01-a1",
-          "platform": "luogu",
-          "problem_id": "P3374",
-          "url": "https://www.luogu.com.cn/problem/P3374",
-          "level": "A",
-          "tags": [],
-          "name": "P3374"
-        },
-        {
-          "task_key": "d01-a2",
-          "platform": "luogu",
-          "problem_id": "P3372",
-          "url": "https://www.luogu.com.cn/problem/P3372",
-          "level": "A",
-          "tags": [],
-          "name": "P3372"
-        },
-        {
-          "task_key": "d01-b1",
-          "platform": "luogu",
-          "problem_id": "P2024",
-          "url": "https://www.luogu.com.cn/problem/P2024",
-          "level": "B",
-          "tags": [],
-          "name": "P2024"
-        },
-        {
-          "task_key": "d01-c1",
-          "platform": "luogu",
-          "problem_id": "P3369",
-          "url": "https://www.luogu.com.cn/problem/P3369",
-          "level": "C",
-          "tags": [],
-          "name": "P3369",
-          "note": "要求 FHQ Treap"
-        }
+        {"task_key": "d01-a1", "problem_id": "P3374", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P3374", "level": "A", "required": true},
+        {"task_key": "d01-a2", "problem_id": "P3372", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P3372", "level": "A", "required": true},
+        {"task_key": "d01-b1", "problem_id": "P2024", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P2024", "level": "B", "required": true},
+        {"task_key": "d01-c1", "problem_id": "P3369", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P3369", "level": "C", "required": false, "note": "要求 FHQ Treap"}
       ]
     },
     {
-      "stage_key": "d02",
-      "topic": "BIT、离散化、顺序统计",
-      "kind": "practice",
+      "day": 2, "date": "2026-07-28", "topic": "BIT、离散化、顺序统计", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d02-a1",
-          "platform": "luogu",
-          "problem_id": "P3368",
-          "url": "https://www.luogu.com.cn/problem/P3368",
-          "level": "A",
-          "tags": [],
-          "name": "P3368"
-        },
-        {
-          "task_key": "d02-b1",
-          "platform": "codeforces",
-          "problem_id": "CF1042D",
-          "url": "https://codeforces.com/problemset/problem/1042/D",
-          "level": "B",
-          "tags": [],
-          "name": "CF1042D"
-        },
-        {
-          "task_key": "d02-c1",
-          "platform": "codeforces",
-          "problem_id": "CF61E",
-          "url": "https://codeforces.com/problemset/problem/61/E",
-          "level": "C",
-          "tags": [],
-          "name": "CF61E"
-        }
+        {"task_key": "d02-a1", "problem_id": "P3368", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P3368", "level": "A", "required": true},
+        {"task_key": "d02-b1", "problem_id": "CF1042D", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/1042/D", "level": "B", "required": true},
+        {"task_key": "d02-c1", "problem_id": "CF61E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/61/E", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d03",
-      "topic": "多懒标记线段树",
-      "kind": "practice",
+      "day": 3, "date": "2026-07-29", "topic": "多懒标记线段树", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d03-a1",
-          "platform": "luogu",
-          "problem_id": "P3373",
-          "url": "https://www.luogu.com.cn/problem/P3373",
-          "level": "A",
-          "tags": [],
-          "name": "P3373"
-        },
-        {
-          "task_key": "d03-b1",
-          "platform": "codeforces",
-          "problem_id": "CF242E",
-          "url": "https://codeforces.com/problemset/problem/242/E",
-          "level": "B",
-          "tags": [],
-          "name": "CF242E"
-        },
-        {
-          "task_key": "d03-c1",
-          "platform": "luogu",
-          "problem_id": "P2572",
-          "url": "https://www.luogu.com.cn/problem/P2572",
-          "level": "C",
-          "tags": [],
-          "name": "P2572"
-        }
+        {"task_key": "d03-a1", "problem_id": "P3373", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P3373", "level": "A", "required": true},
+        {"task_key": "d03-b1", "problem_id": "CF242E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/242/E", "level": "B", "required": true},
+        {"task_key": "d03-c1", "problem_id": "P2572", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P2572", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d04",
-      "topic": "自定义区间信息",
-      "kind": "practice",
+      "day": 4, "date": "2026-07-30", "topic": "自定义区间信息", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d04-a1",
-          "platform": "luogu",
-          "problem_id": "P4513",
-          "url": "https://www.luogu.com.cn/problem/P4513",
-          "level": "A",
-          "tags": [],
-          "name": "P4513"
-        },
-        {
-          "task_key": "d04-b1",
-          "platform": "codeforces",
-          "problem_id": "CF380C",
-          "url": "https://codeforces.com/problemset/problem/380/C",
-          "level": "B",
-          "tags": [],
-          "name": "CF380C"
-        },
-        {
-          "task_key": "d04-c1",
-          "platform": "codeforces",
-          "problem_id": "CF914D",
-          "url": "https://codeforces.com/problemset/problem/914/D",
-          "level": "C",
-          "tags": [],
-          "name": "CF914D"
-        }
+        {"task_key": "d04-a1", "problem_id": "P4513", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P4513", "level": "A", "required": true},
+        {"task_key": "d04-b1", "problem_id": "CF380C", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/380/C", "level": "B", "required": true},
+        {"task_key": "d04-c1", "problem_id": "CF914D", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/914/D", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d05",
-      "topic": "并查集变体",
-      "kind": "practice",
+      "day": 5, "date": "2026-07-31", "topic": "并查集变体", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d05-a1",
-          "platform": "luogu",
-          "problem_id": "P1196",
-          "url": "https://www.luogu.com.cn/problem/P1196",
-          "level": "A",
-          "tags": [],
-          "name": "P1196"
-        },
-        {
-          "task_key": "d05-b1",
-          "platform": "codeforces",
-          "problem_id": "CF1253D",
-          "url": "https://codeforces.com/problemset/problem/1253/D",
-          "level": "B",
-          "tags": [],
-          "name": "CF1253D"
-        },
-        {
-          "task_key": "d05-c1",
-          "platform": "codeforces",
-          "problem_id": "CF455C",
-          "url": "https://codeforces.com/problemset/problem/455/C",
-          "level": "C",
-          "tags": [],
-          "name": "CF455C"
-        }
+        {"task_key": "d05-a1", "problem_id": "P1196", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P1196", "level": "A", "required": true},
+        {"task_key": "d05-b1", "problem_id": "CF1253D", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/1253/D", "level": "B", "required": true},
+        {"task_key": "d05-c1", "problem_id": "CF455C", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/455/C", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d06",
-      "topic": "单调结构、笛卡尔树",
-      "kind": "practice",
+      "day": 6, "date": "2026-08-01", "topic": "单调结构、笛卡尔树", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d06-a1",
-          "platform": "luogu",
-          "problem_id": "P5854",
-          "url": "https://www.luogu.com.cn/problem/P5854",
-          "level": "A",
-          "tags": [],
-          "name": "P5854"
-        },
-        {
-          "task_key": "d06-b1",
-          "platform": "codeforces",
-          "problem_id": "CF547B",
-          "url": "https://codeforces.com/problemset/problem/547/B",
-          "level": "B",
-          "tags": [],
-          "name": "CF547B"
-        },
-        {
-          "task_key": "d06-c1",
-          "platform": "codeforces",
-          "problem_id": "CF1313C2",
-          "url": "https://codeforces.com/problemset/problem/1313/C2",
-          "level": "C",
-          "tags": [],
-          "name": "CF1313C2"
-        }
+        {"task_key": "d06-a1", "problem_id": "P5854", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P5854", "level": "A", "required": true},
+        {"task_key": "d06-b1", "problem_id": "CF547B", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/547/B", "level": "B", "required": true},
+        {"task_key": "d06-c1", "problem_id": "CF1313C2", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/1313/C2", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d07",
-      "topic": "3 小时虚拟赛",
-      "kind": "virtual_contest",
+      "day": 7, "date": "2026-08-02", "topic": "3 小时虚拟赛", "kind": "virtual_contest", "unlock_at": "2026-08-02",
       "tasks": [
-        {
-          "task_key": "d07-s1",
-          "platform": "codeforces",
-          "problem_id": "CF339D",
-          "url": "https://codeforces.com/problemset/problem/339/D",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF339D"
-        },
-        {
-          "task_key": "d07-s2",
-          "platform": "codeforces",
-          "problem_id": "CF459D",
-          "url": "https://codeforces.com/problemset/problem/459/D",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF459D"
-        },
-        {
-          "task_key": "d07-s3",
-          "platform": "codeforces",
-          "problem_id": "CF474F",
-          "url": "https://codeforces.com/problemset/problem/474/F",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF474F"
-        },
-        {
-          "task_key": "d07-s4",
-          "platform": "codeforces",
-          "problem_id": "CF52C",
-          "url": "https://codeforces.com/problemset/problem/52/C",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF52C"
-        }
+        {"task_key": "d07-s1", "problem_id": "CF339D", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/339/D", "level": "SIM", "required": true, "unlock_at": "2026-08-02"},
+        {"task_key": "d07-s2", "problem_id": "CF459D", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/459/D", "level": "SIM", "required": true, "unlock_at": "2026-08-02"},
+        {"task_key": "d07-s3", "problem_id": "CF474F", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/474/F", "level": "SIM", "required": true, "unlock_at": "2026-08-02"},
+        {"task_key": "d07-s4", "problem_id": "CF52C", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/52/C", "level": "SIM", "required": true, "unlock_at": "2026-08-02"}
       ]
     },
     {
-      "stage_key": "d08",
-      "topic": "FHQ Treap",
-      "kind": "practice",
+      "day": 8, "date": "2026-08-03", "topic": "FHQ Treap", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d08-a1",
-          "platform": "luogu",
-          "problem_id": "P3369",
-          "url": "https://www.luogu.com.cn/problem/P3369",
-          "level": "A",
-          "tags": [],
-          "name": "P3369"
-        },
-        {
-          "task_key": "d08-b1",
-          "platform": "luogu",
-          "problem_id": "P6136",
-          "url": "https://www.luogu.com.cn/problem/P6136",
-          "level": "B",
-          "tags": [],
-          "name": "P6136"
-        }
+        {"task_key": "d08-a1", "problem_id": "P3369", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P3369", "level": "A", "required": true},
+        {"task_key": "d08-b1", "problem_id": "P6136", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P6136", "level": "B", "required": true}
       ]
     },
     {
-      "stage_key": "d09",
-      "topic": "隐式 FHQ Treap",
-      "kind": "practice",
+      "day": 9, "date": "2026-08-04", "topic": "隐式 FHQ Treap", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d09-a1",
-          "platform": "luogu",
-          "problem_id": "P3391",
-          "url": "https://www.luogu.com.cn/problem/P3391",
-          "level": "A",
-          "tags": [],
-          "name": "P3391"
-        },
-        {
-          "task_key": "d09-b1",
-          "platform": "luogu",
-          "problem_id": "P2596",
-          "url": "https://www.luogu.com.cn/problem/P2596",
-          "level": "B",
-          "tags": [],
-          "name": "P2596"
-        },
-        {
-          "task_key": "d09-c1",
-          "platform": "luogu",
-          "problem_id": "P2042",
-          "url": "https://www.luogu.com.cn/problem/P2042",
-          "level": "C",
-          "tags": [],
-          "name": "P2042"
-        }
+        {"task_key": "d09-a1", "problem_id": "P3391", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P3391", "level": "A", "required": true},
+        {"task_key": "d09-b1", "problem_id": "P2596", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P2596", "level": "B", "required": true},
+        {"task_key": "d09-c1", "problem_id": "P2042", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P2042", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d10",
-      "topic": "权值线段树、动态开点",
-      "kind": "practice",
+      "day": 10, "date": "2026-08-05", "topic": "权值线段树、动态开点", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d10-a1",
-          "platform": "luogu",
-          "problem_id": "P1168",
-          "url": "https://www.luogu.com.cn/problem/P1168",
-          "level": "A",
-          "tags": [],
-          "name": "P1168"
-        },
-        {
-          "task_key": "d10-b1",
-          "platform": "codeforces",
-          "problem_id": "CF1354D",
-          "url": "https://codeforces.com/problemset/problem/1354/D",
-          "level": "B",
-          "tags": [],
-          "name": "CF1354D"
-        },
-        {
-          "task_key": "d10-c1",
-          "platform": "luogu",
-          "problem_id": "P5459",
-          "url": "https://www.luogu.com.cn/problem/P5459",
-          "level": "C",
-          "tags": [],
-          "name": "P5459",
-          "note": "要求动态开点"
-        }
+        {"task_key": "d10-a1", "problem_id": "P1168", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P1168", "level": "A", "required": true},
+        {"task_key": "d10-b1", "problem_id": "CF1354D", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/1354/D", "level": "B", "required": true},
+        {"task_key": "d10-c1", "problem_id": "P5459", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P5459", "level": "C", "required": false, "note": "要求动态开点"}
       ]
     },
     {
-      "stage_key": "d11",
-      "topic": "主席树",
-      "kind": "practice",
+      "day": 11, "date": "2026-08-06", "topic": "主席树", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d11-a1",
-          "platform": "luogu",
-          "problem_id": "P3834",
-          "url": "https://www.luogu.com.cn/problem/P3834",
-          "level": "A",
-          "tags": [],
-          "name": "P3834"
-        },
-        {
-          "task_key": "d11-b1",
-          "platform": "codeforces",
-          "problem_id": "CF813E",
-          "url": "https://codeforces.com/problemset/problem/813/E",
-          "level": "B",
-          "tags": [],
-          "name": "CF813E"
-        },
-        {
-          "task_key": "d11-c1",
-          "platform": "codeforces",
-          "problem_id": "CF484E",
-          "url": "https://codeforces.com/problemset/problem/484/E",
-          "level": "C",
-          "tags": [],
-          "name": "CF484E"
-        }
+        {"task_key": "d11-a1", "problem_id": "P3834", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P3834", "level": "A", "required": true},
+        {"task_key": "d11-b1", "problem_id": "CF813E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/813/E", "level": "B", "required": true},
+        {"task_key": "d11-c1", "problem_id": "CF484E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/484/E", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d12",
-      "topic": "线段树合并、分裂",
-      "kind": "practice",
+      "day": 12, "date": "2026-08-07", "topic": "线段树合并、分裂", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d12-a1",
-          "platform": "luogu",
-          "problem_id": "P3605",
-          "url": "https://www.luogu.com.cn/problem/P3605",
-          "level": "A",
-          "tags": [],
-          "name": "P3605"
-        },
-        {
-          "task_key": "d12-b1",
-          "platform": "luogu",
-          "problem_id": "P4556",
-          "url": "https://www.luogu.com.cn/problem/P4556",
-          "level": "B",
-          "tags": [],
-          "name": "P4556"
-        },
-        {
-          "task_key": "d12-c1",
-          "platform": "luogu",
-          "problem_id": "P5494",
-          "url": "https://www.luogu.com.cn/problem/P5494",
-          "level": "C",
-          "tags": [],
-          "name": "P5494"
-        }
+        {"task_key": "d12-a1", "problem_id": "P3605", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P3605", "level": "A", "required": true},
+        {"task_key": "d12-b1", "problem_id": "P4556", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P4556", "level": "B", "required": true},
+        {"task_key": "d12-c1", "problem_id": "P5494", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P5494", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d13",
-      "topic": "分块、莫队",
-      "kind": "practice",
+      "day": 13, "date": "2026-08-08", "topic": "分块、莫队", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d13-a1",
-          "platform": "luogu",
-          "problem_id": "P1494",
-          "url": "https://www.luogu.com.cn/problem/P1494",
-          "level": "A",
-          "tags": [],
-          "name": "P1494"
-        },
-        {
-          "task_key": "d13-b1",
-          "platform": "codeforces",
-          "problem_id": "CF86D",
-          "url": "https://codeforces.com/problemset/problem/86/D",
-          "level": "B",
-          "tags": [],
-          "name": "CF86D"
-        },
-        {
-          "task_key": "d13-c1",
-          "platform": "codeforces",
-          "problem_id": "CF617E",
-          "url": "https://codeforces.com/problemset/problem/617/E",
-          "level": "C",
-          "tags": [],
-          "name": "CF617E"
-        }
+        {"task_key": "d13-a1", "problem_id": "P1494", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P1494", "level": "A", "required": true},
+        {"task_key": "d13-b1", "problem_id": "CF86D", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/86/D", "level": "B", "required": true},
+        {"task_key": "d13-c1", "problem_id": "CF617E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/617/E", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d14",
-      "topic": "3 小时虚拟赛",
-      "kind": "virtual_contest",
+      "day": 14, "date": "2026-08-09", "topic": "3 小时虚拟赛", "kind": "virtual_contest", "unlock_at": "2026-08-09",
       "tasks": [
-        {
-          "task_key": "d14-s1",
-          "platform": "codeforces",
-          "problem_id": "CF920F",
-          "url": "https://codeforces.com/problemset/problem/920/F",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF920F"
-        },
-        {
-          "task_key": "d14-s2",
-          "platform": "codeforces",
-          "problem_id": "CF1555E",
-          "url": "https://codeforces.com/problemset/problem/1555/E",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF1555E"
-        },
-        {
-          "task_key": "d14-s3",
-          "platform": "codeforces",
-          "problem_id": "CF558E",
-          "url": "https://codeforces.com/problemset/problem/558/E",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF558E"
-        },
-        {
-          "task_key": "d14-s4",
-          "platform": "codeforces",
-          "problem_id": "CF1000F",
-          "url": "https://codeforces.com/problemset/problem/1000/F",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF1000F"
-        }
+        {"task_key": "d14-s1", "problem_id": "CF920F", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/920/F", "level": "SIM", "required": true, "unlock_at": "2026-08-09"},
+        {"task_key": "d14-s2", "problem_id": "CF1555E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/1555/E", "level": "SIM", "required": true, "unlock_at": "2026-08-09"},
+        {"task_key": "d14-s3", "problem_id": "CF558E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/558/E", "level": "SIM", "required": true, "unlock_at": "2026-08-09"},
+        {"task_key": "d14-s4", "problem_id": "CF1000F", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/1000/F", "level": "SIM", "required": true, "unlock_at": "2026-08-09"}
       ]
     },
     {
-      "stage_key": "d15",
-      "topic": "李超线段树",
-      "kind": "practice",
+      "day": 15, "date": "2026-08-10", "topic": "李超线段树", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d15-a1",
-          "platform": "luogu",
-          "problem_id": "P4254",
-          "url": "https://www.luogu.com.cn/problem/P4254",
-          "level": "A",
-          "tags": [],
-          "name": "P4254"
-        },
-        {
-          "task_key": "d15-b1",
-          "platform": "codeforces",
-          "problem_id": "CF319C",
-          "url": "https://codeforces.com/problemset/problem/319/C",
-          "level": "B",
-          "tags": [],
-          "name": "CF319C"
-        },
-        {
-          "task_key": "d15-c1",
-          "platform": "codeforces",
-          "problem_id": "CF1083E",
-          "url": "https://codeforces.com/problemset/problem/1083/E",
-          "level": "C",
-          "tags": [],
-          "name": "CF1083E"
-        }
+        {"task_key": "d15-a1", "problem_id": "P4254", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P4254", "level": "A", "required": true},
+        {"task_key": "d15-b1", "problem_id": "CF319C", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/319/C", "level": "B", "required": true},
+        {"task_key": "d15-c1", "problem_id": "CF1083E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/1083/E", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d16",
-      "topic": "Beats、势能剪枝",
-      "kind": "practice",
+      "day": 16, "date": "2026-08-11", "topic": "Beats、势能剪枝", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d16-a1",
-          "platform": "luogu",
-          "problem_id": "P4145",
-          "url": "https://www.luogu.com.cn/problem/P4145",
-          "level": "A",
-          "tags": [],
-          "name": "P4145"
-        },
-        {
-          "task_key": "d16-b1",
-          "platform": "luogu",
-          "problem_id": "P6242",
-          "url": "https://www.luogu.com.cn/problem/P6242",
-          "level": "B",
-          "tags": [],
-          "name": "P6242"
-        },
-        {
-          "task_key": "d16-c1",
-          "platform": "luogu",
-          "problem_id": "P6792",
-          "url": "https://www.luogu.com.cn/problem/P6792",
-          "level": "C",
-          "tags": [],
-          "name": "P6792"
-        }
+        {"task_key": "d16-a1", "problem_id": "P4145", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P4145", "level": "A", "required": true},
+        {"task_key": "d16-b1", "problem_id": "P6242", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P6242", "level": "B", "required": true},
+        {"task_key": "d16-c1", "problem_id": "P6792", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P6792", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d17",
-      "topic": "时间线段树、回滚 DSU",
-      "kind": "practice",
+      "day": 17, "date": "2026-08-12", "topic": "时间线段树、回滚 DSU", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d17-a1",
-          "platform": "luogu",
-          "problem_id": "P4588",
-          "url": "https://www.luogu.com.cn/problem/P4588",
-          "level": "A",
-          "tags": [],
-          "name": "P4588"
-        },
-        {
-          "task_key": "d17-b1",
-          "platform": "luogu",
-          "problem_id": "P5787",
-          "url": "https://www.luogu.com.cn/problem/P5787",
-          "level": "B",
-          "tags": [],
-          "name": "P5787"
-        },
-        {
-          "task_key": "d17-c1",
-          "platform": "codeforces",
-          "problem_id": "CF1140F",
-          "url": "https://codeforces.com/problemset/problem/1140/F",
-          "level": "C",
-          "tags": [],
-          "name": "CF1140F"
-        }
+        {"task_key": "d17-a1", "problem_id": "P4588", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P4588", "level": "A", "required": true},
+        {"task_key": "d17-b1", "problem_id": "P5787", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P5787", "level": "B", "required": true},
+        {"task_key": "d17-c1", "problem_id": "CF1140F", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/1140/F", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d18",
-      "topic": "树套树、动态顺序统计",
-      "kind": "practice",
+      "day": 18, "date": "2026-08-13", "topic": "树套树、动态顺序统计", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d18-a1",
-          "platform": "luogu",
-          "problem_id": "P2617",
-          "url": "https://www.luogu.com.cn/problem/P2617",
-          "level": "A",
-          "tags": [],
-          "name": "P2617"
-        },
-        {
-          "task_key": "d18-b1",
-          "platform": "luogu",
-          "problem_id": "P3380",
-          "url": "https://www.luogu.com.cn/problem/P3380",
-          "level": "B",
-          "tags": [],
-          "name": "P3380"
-        },
-        {
-          "task_key": "d18-c1",
-          "platform": "codeforces",
-          "problem_id": "CF893F",
-          "url": "https://codeforces.com/problemset/problem/893/F",
-          "level": "C",
-          "tags": [],
-          "name": "CF893F"
-        }
+        {"task_key": "d18-a1", "problem_id": "P2617", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P2617", "level": "A", "required": true},
+        {"task_key": "d18-b1", "problem_id": "P3380", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P3380", "level": "B", "required": true},
+        {"task_key": "d18-c1", "problem_id": "CF893F", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/893/F", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d19",
-      "topic": "DFS 序、树链剖分",
-      "kind": "practice",
+      "day": 19, "date": "2026-08-14", "topic": "DFS 序、树链剖分", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d19-a1",
-          "platform": "luogu",
-          "problem_id": "P3384",
-          "url": "https://www.luogu.com.cn/problem/P3384",
-          "level": "A",
-          "tags": [],
-          "name": "P3384"
-        },
-        {
-          "task_key": "d19-b1",
-          "platform": "codeforces",
-          "problem_id": "CF343D",
-          "url": "https://codeforces.com/problemset/problem/343/D",
-          "level": "B",
-          "tags": [],
-          "name": "CF343D"
-        },
-        {
-          "task_key": "d19-c1",
-          "platform": "codeforces",
-          "problem_id": "CF916E",
-          "url": "https://codeforces.com/problemset/problem/916/E",
-          "level": "C",
-          "tags": [],
-          "name": "CF916E"
-        }
+        {"task_key": "d19-a1", "problem_id": "P3384", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P3384", "level": "A", "required": true},
+        {"task_key": "d19-b1", "problem_id": "CF343D", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/343/D", "level": "B", "required": true},
+        {"task_key": "d19-c1", "problem_id": "CF916E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/916/E", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d20",
-      "topic": "扫描线、区间覆盖",
-      "kind": "practice",
+      "day": 20, "date": "2026-08-15", "topic": "扫描线、区间覆盖", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d20-a1",
-          "platform": "luogu",
-          "problem_id": "P5490",
-          "url": "https://www.luogu.com.cn/problem/P5490",
-          "level": "A",
-          "tags": [],
-          "name": "P5490"
-        },
-        {
-          "task_key": "d20-b1",
-          "platform": "codeforces",
-          "problem_id": "CF863E",
-          "url": "https://codeforces.com/problemset/problem/863/E",
-          "level": "B",
-          "tags": [],
-          "name": "CF863E"
-        },
-        {
-          "task_key": "d20-c1",
-          "platform": "luogu",
-          "problem_id": "P1856",
-          "url": "https://www.luogu.com.cn/problem/P1856",
-          "level": "C",
-          "tags": [],
-          "name": "P1856"
-        }
+        {"task_key": "d20-a1", "problem_id": "P5490", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P5490", "level": "A", "required": true},
+        {"task_key": "d20-b1", "problem_id": "CF863E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/863/E", "level": "B", "required": true},
+        {"task_key": "d20-c1", "problem_id": "P1856", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P1856", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d21",
-      "topic": "3 小时虚拟赛",
-      "kind": "virtual_contest",
+      "day": 21, "date": "2026-08-16", "topic": "3 小时虚拟赛", "kind": "virtual_contest", "unlock_at": "2026-08-16",
       "tasks": [
-        {
-          "task_key": "d21-s1",
-          "platform": "codeforces",
-          "problem_id": "CF665E",
-          "url": "https://codeforces.com/problemset/problem/665/E",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF665E"
-        },
-        {
-          "task_key": "d21-s2",
-          "platform": "codeforces",
-          "problem_id": "CF1400E",
-          "url": "https://codeforces.com/problemset/problem/1400/E",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF1400E"
-        },
-        {
-          "task_key": "d21-s3",
-          "platform": "codeforces",
-          "problem_id": "CF891C",
-          "url": "https://codeforces.com/problemset/problem/891/C",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF891C"
-        },
-        {
-          "task_key": "d21-s4",
-          "platform": "codeforces",
-          "problem_id": "CF145E",
-          "url": "https://codeforces.com/problemset/problem/145/E",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF145E"
-        }
+        {"task_key": "d21-s1", "problem_id": "CF665E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/665/E", "level": "SIM", "required": true, "unlock_at": "2026-08-16"},
+        {"task_key": "d21-s2", "problem_id": "CF1400E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/1400/E", "level": "SIM", "required": true, "unlock_at": "2026-08-16"},
+        {"task_key": "d21-s3", "problem_id": "CF891C", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/891/C", "level": "SIM", "required": true, "unlock_at": "2026-08-16"},
+        {"task_key": "d21-s4", "problem_id": "CF145E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/145/E", "level": "SIM", "required": true, "unlock_at": "2026-08-16"}
       ]
     },
     {
-      "stage_key": "d22",
-      "topic": "带修、回滚莫队",
-      "kind": "practice",
+      "day": 22, "date": "2026-08-17", "topic": "带修、回滚莫队", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d22-a1",
-          "platform": "luogu",
-          "problem_id": "P1903",
-          "url": "https://www.luogu.com.cn/problem/P1903",
-          "level": "A",
-          "tags": [],
-          "name": "P1903"
-        },
-        {
-          "task_key": "d22-b1",
-          "platform": "luogu",
-          "problem_id": "P5906",
-          "url": "https://www.luogu.com.cn/problem/P5906",
-          "level": "B",
-          "tags": [],
-          "name": "P5906"
-        },
-        {
-          "task_key": "d22-c1",
-          "platform": "codeforces",
-          "problem_id": "CF940F",
-          "url": "https://codeforces.com/problemset/problem/940/F",
-          "level": "C",
-          "tags": [],
-          "name": "CF940F"
-        }
+        {"task_key": "d22-a1", "problem_id": "P1903", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P1903", "level": "A", "required": true},
+        {"task_key": "d22-b1", "problem_id": "P5906", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P5906", "level": "B", "required": true},
+        {"task_key": "d22-c1", "problem_id": "CF940F", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/940/F", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d23",
-      "topic": "DSU on Tree",
-      "kind": "practice",
+      "day": 23, "date": "2026-08-18", "topic": "DSU on Tree", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d23-a1",
-          "platform": "codeforces",
-          "problem_id": "CF600E",
-          "url": "https://codeforces.com/problemset/problem/600/E",
-          "level": "A",
-          "tags": [],
-          "name": "CF600E"
-        },
-        {
-          "task_key": "d23-b1",
-          "platform": "codeforces",
-          "problem_id": "CF375D",
-          "url": "https://codeforces.com/problemset/problem/375/D",
-          "level": "B",
-          "tags": [],
-          "name": "CF375D"
-        },
-        {
-          "task_key": "d23-c1",
-          "platform": "codeforces",
-          "problem_id": "CF741D",
-          "url": "https://codeforces.com/problemset/problem/741/D",
-          "level": "C",
-          "tags": [],
-          "name": "CF741D"
-        }
+        {"task_key": "d23-a1", "problem_id": "CF600E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/600/E", "level": "A", "required": true},
+        {"task_key": "d23-b1", "problem_id": "CF375D", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/375/D", "level": "B", "required": true},
+        {"task_key": "d23-c1", "problem_id": "CF741D", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/741/D", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d24",
-      "topic": "Link Cut Tree",
-      "kind": "practice",
+      "day": 24, "date": "2026-08-19", "topic": "Link Cut Tree", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d24-a1",
-          "platform": "luogu",
-          "problem_id": "P3690",
-          "url": "https://www.luogu.com.cn/problem/P3690",
-          "level": "A",
-          "tags": [],
-          "name": "P3690"
-        },
-        {
-          "task_key": "d24-b1",
-          "platform": "luogu",
-          "problem_id": "P1501",
-          "url": "https://www.luogu.com.cn/problem/P1501",
-          "level": "B",
-          "tags": [],
-          "name": "P1501"
-        },
-        {
-          "task_key": "d24-c1",
-          "platform": "luogu",
-          "problem_id": "P2387",
-          "url": "https://www.luogu.com.cn/problem/P2387",
-          "level": "C",
-          "tags": [],
-          "name": "P2387"
-        }
+        {"task_key": "d24-a1", "problem_id": "P3690", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P3690", "level": "A", "required": true},
+        {"task_key": "d24-b1", "problem_id": "P1501", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P1501", "level": "B", "required": true},
+        {"task_key": "d24-c1", "problem_id": "P2387", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P2387", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d25",
-      "topic": "Trie、01-Trie、线性基",
-      "kind": "practice",
+      "day": 25, "date": "2026-08-20", "topic": "Trie、01-Trie、线性基", "kind": "practice",
       "tasks": [
-        {
-          "task_key": "d25-a1",
-          "platform": "luogu",
-          "problem_id": "P3812",
-          "url": "https://www.luogu.com.cn/problem/P3812",
-          "level": "A",
-          "tags": [],
-          "name": "P3812"
-        },
-        {
-          "task_key": "d25-b1",
-          "platform": "codeforces",
-          "problem_id": "CF706D",
-          "url": "https://codeforces.com/problemset/problem/706/D",
-          "level": "B",
-          "tags": [],
-          "name": "CF706D"
-        },
-        {
-          "task_key": "d25-b2",
-          "platform": "codeforces",
-          "problem_id": "CF923C",
-          "url": "https://codeforces.com/problemset/problem/923/C",
-          "level": "B",
-          "tags": [],
-          "name": "CF923C"
-        },
-        {
-          "task_key": "d25-c1",
-          "platform": "luogu",
-          "problem_id": "P4151",
-          "url": "https://www.luogu.com.cn/problem/P4151",
-          "level": "C",
-          "tags": [],
-          "name": "P4151"
-        }
+        {"task_key": "d25-a1", "problem_id": "P3812", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P3812", "level": "A", "required": true},
+        {"task_key": "d25-b1", "problem_id": "CF706D", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/706/D", "level": "B", "required": true},
+        {"task_key": "d25-b2", "problem_id": "CF923C", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/923/C", "level": "B", "required": true},
+        {"task_key": "d25-c1", "problem_id": "P4151", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P4151", "level": "C", "required": false}
       ]
     },
     {
-      "stage_key": "d26",
-      "topic": "3 小时虚拟赛",
-      "kind": "virtual_contest",
+      "day": 26, "date": "2026-08-21", "topic": "3 小时虚拟赛", "kind": "virtual_contest", "unlock_at": "2026-08-21",
       "tasks": [
-        {
-          "task_key": "d26-s1",
-          "platform": "codeforces",
-          "problem_id": "CF1797D",
-          "url": "https://codeforces.com/problemset/problem/1797/D",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF1797D"
-        },
-        {
-          "task_key": "d26-s2",
-          "platform": "codeforces",
-          "problem_id": "CF208E",
-          "url": "https://codeforces.com/problemset/problem/208/E",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF208E"
-        },
-        {
-          "task_key": "d26-s3",
-          "platform": "codeforces",
-          "problem_id": "CF620E",
-          "url": "https://codeforces.com/problemset/problem/620/E",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF620E"
-        },
-        {
-          "task_key": "d26-s4",
-          "platform": "codeforces",
-          "problem_id": "CF959F",
-          "url": "https://codeforces.com/problemset/problem/959/F",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF959F"
-        }
+        {"task_key": "d26-s1", "problem_id": "CF1797D", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/1797/D", "level": "SIM", "required": true, "unlock_at": "2026-08-21"},
+        {"task_key": "d26-s2", "problem_id": "CF208E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/208/E", "level": "SIM", "required": true, "unlock_at": "2026-08-21"},
+        {"task_key": "d26-s3", "problem_id": "CF620E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/620/E", "level": "SIM", "required": true, "unlock_at": "2026-08-21"},
+        {"task_key": "d26-s4", "problem_id": "CF959F", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/959/F", "level": "SIM", "required": true, "unlock_at": "2026-08-21"}
       ]
     },
     {
-      "stage_key": "d27",
-      "topic": "闭卷模板复习",
-      "kind": "review",
-      "tasks": [],
-      "selection_condition": "不做新题：闭卷复习 README 列出的十类数据结构模板。"
+      "day": 27, "date": "2026-08-22", "topic": "闭卷模板复习", "kind": "review",
+      "selection_condition": "不做新题：闭卷复习 README 列出的十类数据结构模板。",
+      "tasks": []
     },
     {
-      "stage_key": "d28",
-      "topic": "5 小时 ACM 风格模拟",
-      "kind": "contest",
+      "day": 28, "date": "2026-08-23", "topic": "5 小时 ACM 风格模拟", "kind": "contest", "unlock_at": "2026-08-23",
       "tasks": [
-        {
-          "task_key": "d28-s1",
-          "platform": "codeforces",
-          "problem_id": "CF1249D2",
-          "url": "https://codeforces.com/problemset/problem/1249/D2",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF1249D2"
-        },
-        {
-          "task_key": "d28-s2",
-          "platform": "codeforces",
-          "problem_id": "CF292E",
-          "url": "https://codeforces.com/problemset/problem/292/E",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF292E"
-        },
-        {
-          "task_key": "d28-s3",
-          "platform": "codeforces",
-          "problem_id": "CF1797D",
-          "url": "https://codeforces.com/problemset/problem/1797/D",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF1797D"
-        },
-        {
-          "task_key": "d28-s4",
-          "platform": "codeforces",
-          "problem_id": "CF1108E2",
-          "url": "https://codeforces.com/problemset/problem/1108/E2",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF1108E2"
-        },
-        {
-          "task_key": "d28-s5",
-          "platform": "codeforces",
-          "problem_id": "CF1252G",
-          "url": "https://codeforces.com/problemset/problem/1252/G",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF1252G"
-        },
-        {
-          "task_key": "d28-s6",
-          "platform": "codeforces",
-          "problem_id": "CF786B",
-          "url": "https://codeforces.com/problemset/problem/786/B",
-          "level": "SIM",
-          "tags": [],
-          "name": "CF786B"
-        }
+        {"task_key": "d28-s1", "problem_id": "CF1249D2", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/1249/D2", "level": "SIM", "required": true, "unlock_at": "2026-08-23"},
+        {"task_key": "d28-s2", "problem_id": "CF292E", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/292/E", "level": "SIM", "required": true, "unlock_at": "2026-08-23"},
+        {"task_key": "d28-s3", "problem_id": "CF1797D", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/1797/D", "level": "SIM", "required": true, "unlock_at": "2026-08-23"},
+        {"task_key": "d28-s4", "problem_id": "CF1108E2", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/1108/E2", "level": "SIM", "required": true, "unlock_at": "2026-08-23"},
+        {"task_key": "d28-s5", "problem_id": "CF1252G", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/1252/G", "level": "SIM", "required": true, "unlock_at": "2026-08-23"},
+        {"task_key": "d28-s6", "problem_id": "CF786B", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/786/B", "level": "SIM", "required": true, "unlock_at": "2026-08-23"}
       ],
       "replacements": [
-        {
-          "condition": {
-            "type": "ac",
-            "mode": "any",
-            "problem_keys": [
-              "codeforces:CF1797D"
-            ]
-          },
-          "replace_task_keys": [
-            "d28-s3"
-          ],
-          "replace_only_accepted": false,
-          "task": {
-            "task_key": "d28-r1",
-            "platform": "codeforces",
-            "problem_id": "CF1100F",
-            "url": "https://codeforces.com/problemset/problem/1100/F",
-            "level": "SIM",
-            "tags": [],
-            "name": "CF1100F"
-          }
-        }
+        {"condition": "若 D26 已完成 CF1797D，则替换 D28 第 3 题。", "task": {"task_key": "d28-r1", "problem_id": "CF1100F", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/1100/F", "level": "SIM", "required": true, "unlock_at": "2026-08-23"}}
       ]
     },
     {
-      "stage_key": "d29",
-      "topic": "错题回炉",
-      "kind": "review",
-      "tasks": [],
-      "selection_condition": "从本月看过题解、出现两个以上 WA、没有独立推出维护信息或虚拟赛选型错误的题中选 4 道闭卷重做。"
+      "day": 29, "date": "2026-08-24", "topic": "错题回炉", "kind": "review",
+      "selection_condition": "从本月看过题解、出现两个以上 WA、没有独立推出维护信息或虚拟赛选型错误的题中选 4 道闭卷重做。",
+      "tasks": []
     },
     {
-      "stage_key": "d30",
-      "topic": "最终验收",
-      "kind": "final",
+      "day": 30, "date": "2026-08-25", "topic": "最终验收", "kind": "final",
       "tasks": [
-        {
-          "task_key": "d30-f1",
-          "platform": "codeforces",
-          "problem_id": "CF438D",
-          "url": "https://codeforces.com/problemset/problem/438/D",
-          "level": "FINAL",
-          "tags": [],
-          "name": "CF438D"
-        },
-        {
-          "task_key": "d30-f2",
-          "platform": "luogu",
-          "problem_id": "P4197",
-          "url": "https://www.luogu.com.cn/problem/P4197",
-          "level": "FINAL",
-          "tags": [],
-          "name": "P4197"
-        }
+        {"task_key": "d30-f1", "problem_id": "CF438D", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/438/D", "level": "FINAL", "required": true},
+        {"task_key": "d30-f2", "problem_id": "P4197", "platform": "luogu", "url": "https://www.luogu.com.cn/problem/P4197", "level": "FINAL", "required": true}
       ],
       "replacements": [
-        {
-          "condition": {
-            "type": "ac",
-            "mode": "any",
-            "problem_keys": [
-              "codeforces:CF1100F"
-            ]
-          },
-          "replace_task_keys": [],
-          "replace_only_accepted": false,
-          "task": {
-            "task_key": "d30-r1",
-            "platform": "codeforces",
-            "problem_id": "CF1100F",
-            "url": "https://codeforces.com/problemset/problem/1100/F",
-            "level": "FINAL",
-            "tags": [],
-            "name": "CF1100F"
-          }
-        }
+        {"condition": "若任一最终验收题已经做过，则用 CF1100F 替换。", "task": {"task_key": "d30-r1", "problem_id": "CF1100F", "platform": "codeforces", "url": "https://codeforces.com/problemset/problem/1100/F", "level": "FINAL", "required": true}}
       ]
     }
   ]

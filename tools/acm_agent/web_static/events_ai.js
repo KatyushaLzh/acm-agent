@@ -1,39 +1,41 @@
-import {
-  $, api, jobIdOf, setBusy, setLocalFileSelection, state, toast, waitForJob,
-} from "./core.js";
+import { $, setBusy, setLocalFileSelection, state, toast } from "./core.js";
 import {
   applyKnowledgeProposal, cancelKnowledgeProposal, clearAiConversation,
-  clearAiCredential, isAbortError, loadAiProblemState, loadAiStatus,
+  deleteConnection, editConnection, isAbortError, loadAiProblemState, loadAiStatus,
   loadKnowledgeTargets, loadProblemContext, previewAiPatch,
   refreshKnowledgeProposal, registerKnowledgeTarget, removeKnowledgeTarget,
   renderSafeKnowledgeMarkdown, restoreAutomaticContext, revertKnowledgeProposal,
-  runPatchAction, saveAiCredential, saveAiSettings, saveManualContext,
-  streamAiChat,
+  refreshConnection, resetConnectionForm, runPatchAction, saveConnection,
+  saveManualContext, streamAiChat,
+  bindAiPolicyDraftEvents, resetAiPolicyDraft, saveAiPolicy, repriceAiCosts,
 } from "./view_ai.js";
+import { bindAiModelPickerEvents } from "./ai_model_controls.js";
 
 function bindAiEvents() {
-  $("#ai-settings-form").addEventListener("submit", event => {
+  bindAiModelPickerEvents(loadAiStatus);
+  $("#ai-connection-form").addEventListener("submit", event => {
     event.preventDefault();
-    saveAiSettings(event.currentTarget);
+    saveConnection(event.currentTarget).catch(error => toast("连接保存失败", error.message, "error"));
   });
-  $("#ai-credential-form").addEventListener("submit", event => {
+  $("#ai-connection-cancel").addEventListener("click", resetConnectionForm);
+  $("#ai-policy-form").addEventListener("submit", event => {
     event.preventDefault();
-    saveAiCredential(event.currentTarget);
+    saveAiPolicy($("#ai-policy-save")).catch(error => toast("策略保存失败", error.message, "error"));
   });
-  $("#ai-key-clear").addEventListener("click", event => clearAiCredential(event.currentTarget));
-  $("#ai-test-button").addEventListener("click", async event => {
-    const button = event.currentTarget;
-    setBusy(button, true, "测试中…");
-    try {
-      const started = await api("/api/jobs/ai/test", { body: {} });
-      const result = await waitForJob(jobIdOf(started), "正在验证 DeepSeek API…");
-      toast("DeepSeek 连接成功", result.model || "API 可用");
-      await loadAiStatus();
-    } catch (error) {
-      toast("DeepSeek 测试失败", error.message, "error");
-    } finally {
-      setBusy(button, false);
-    }
+  $("#ai-policy-reset").addEventListener("click", resetAiPolicyDraft);
+  bindAiPolicyDraftEvents();
+  $("#ai-cost-reprice").addEventListener("click", event => repriceAiCosts(event.currentTarget).catch(error => toast("费用重算失败", error.message, "error")));
+  $("#ai-connection-list").addEventListener("click", event => {
+    const button = event.target.closest("button[data-connection-action]");
+    if (!button) return;
+    const connectionId = button.closest("[data-connection-id]")?.dataset.connectionId || "";
+    const action = button.dataset.connectionAction;
+    const operation = action === "edit"
+      ? Promise.resolve().then(() => editConnection(connectionId))
+      : action === "refresh"
+        ? refreshConnection(connectionId, button)
+        : deleteConnection(connectionId, button);
+    operation.catch(error => toast("连接操作失败", error.message, "error"));
   });
   $("#ai-context-button").addEventListener("click", async event => {
     const button = event.currentTarget;

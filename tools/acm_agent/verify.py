@@ -26,8 +26,13 @@ from .workspace import ProblemRef, find_solution, parse_problem_ref
 # solutions that are comfortably in limit without sanitizers, which reads as a
 # real performance failure rather than as measurement overhead.
 _SANITIZER_TIMEOUT_SCALE = 4.0
+# Compiler diagnostics should stay compact, while legal contest input/output can
+# easily exceed 1 MiB (for example, 100k integers plus 100k operations).  Keep
+# both paths bounded, but do not apply the diagnostic cap to problem data.
 _MAX_STDOUT_BYTES = 1024 * 1024
 _MAX_STDERR_BYTES = 1024 * 1024
+_MAX_CONTEST_STDOUT_BYTES = 16 * 1024 * 1024
+_MAX_GENERATOR_STDOUT_BYTES = 64 * 1024 * 1024
 _WINDOWS_PROCESS_MEMORY_LIMIT = 512 * 1024 * 1024
 _WINDOWS_ACTIVE_PROCESS_LIMIT = 16
 
@@ -141,15 +146,16 @@ def verify_problem(
     generator_file: str | Path | None = None,
     reference_file: str | Path | None = None,
 ) -> VerifyResult:
-    """Compile and verify a problem while keeping artifacts under ``.acm``."""
-    timeout = float(timeout)
-    stress_iterations = int(stress_iterations)
-    if not math.isfinite(timeout) or timeout <= 0:
+    """Compile and verify using a disposable per-run build directory."""
+
+    validated_timeout = float(timeout)
+    validated_iterations = int(stress_iterations)
+    if not math.isfinite(validated_timeout) or validated_timeout <= 0:
         raise ValueError("timeout must be a finite number greater than 0")
-    if stress_iterations < 1:
+    if validated_iterations < 1:
         raise ValueError("stress_iterations must be at least 1")
     root_path = Path(root).resolve()
-    source, ref = _resolve_source(root_path, problem)
+    _, ref = _resolve_source(root_path, problem)
     build_dir = (
         root_path
         / ".acm"
@@ -158,6 +164,70 @@ def verify_problem(
         / f"{ref.problem_id}-{uuid.uuid4().hex}"
     )
     build_dir.mkdir(parents=True, exist_ok=True)
+    result: VerifyResult | None = None
+    try:
+        result = _verify_problem_in_build(
+            root_path,
+            problem,
+            exact=exact,
+            debug=debug,
+            compiler=compiler,
+            timeout=validated_timeout,
+            stress_iterations=validated_iterations,
+            seed=seed,
+            generator_file=generator_file,
+            reference_file=reference_file,
+            build_dir=build_dir,
+        )
+        return result
+    finally:
+        cleanup_error = _cleanup_run_build_dir(build_dir)
+        if cleanup_error is not None and result is not None:
+            result.warnings.append(
+                f"could not remove temporary build directory {build_dir}: {cleanup_error}"
+            )
+
+
+def _cleanup_run_build_dir(build_dir: Path) -> OSError | None:
+    """Remove a completed run directory, retrying transient Windows locks."""
+
+    last_error: OSError | None = None
+    for attempt in range(3):
+        try:
+            shutil.rmtree(build_dir)
+            return None
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.05 * (attempt + 1))
+    return last_error
+
+
+def _verify_problem_in_build(
+    root: str | Path,
+    problem: str | ProblemRef | Path,
+    *,
+    exact: bool = False,
+    debug: bool = False,
+    compiler: str = "g++",
+    timeout: float = 2.0,
+    stress_iterations: int = 100,
+    seed: int | None = None,
+    generator_file: str | Path | None = None,
+    reference_file: str | Path | None = None,
+    build_dir: Path,
+) -> VerifyResult:
+    """Compile and verify a problem inside an owned build directory."""
+    timeout = float(timeout)
+    stress_iterations = int(stress_iterations)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be a finite number greater than 0")
+    if stress_iterations < 1:
+        raise ValueError("stress_iterations must be at least 1")
+    root_path = Path(root).resolve()
+    source, ref = _resolve_source(root_path, problem)
 
     resolved_compiler = shutil.which(compiler)
     executable = build_dir / (f"{ref.problem_id}.exe" if os.name == "nt" else ref.problem_id)
@@ -246,6 +316,7 @@ def verify_problem(
             resolved_compiler,
             flags,
             build_dir,
+            mismatch_dir=source.parent,
             timeout=runtime_timeout,
             iterations=stress_iterations,
             seed=seed,
@@ -331,6 +402,8 @@ def _run(
     input_data: bytes | None = None,
     timeout: float,
     env: dict[str, str] | None = None,
+    stdout_limit: int = _MAX_STDOUT_BYTES,
+    stderr_limit: int = _MAX_STDERR_BYTES,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run an untrusted local child with bounded output and tree cleanup.
 
@@ -343,6 +416,8 @@ def _run(
     command_list = list(command)
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be a finite number greater than 0")
+    if stdout_limit < 1 or stderr_limit < 1:
+        raise ValueError("output limits must be at least 1 byte")
     popen_kwargs: dict[str, object] = {
         "stdin": subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
@@ -404,12 +479,12 @@ def _run(
     readers = [
         threading.Thread(
             target=drain,
-            args=(process.stdout, stdout_chunks, _MAX_STDOUT_BYTES, "stdout"),
+            args=(process.stdout, stdout_chunks, stdout_limit, "stdout"),
             daemon=True,
         ),
         threading.Thread(
             target=drain,
-            args=(process.stderr, stderr_chunks, _MAX_STDERR_BYTES, "stderr"),
+            args=(process.stderr, stderr_chunks, stderr_limit, "stderr"),
             daemon=True,
         ),
     ]
@@ -618,7 +693,10 @@ def _run_cases(
             continue
         started = time.monotonic()
         process = _run(
-            [str(executable)], input_data=input_path.read_bytes(), timeout=timeout
+            [str(executable)],
+            input_data=input_path.read_bytes(),
+            timeout=timeout,
+            stdout_limit=_MAX_CONTEST_STDOUT_BYTES,
         )
         _append_process_warnings(warnings, process)
         elapsed_ms = round((time.monotonic() - started) * 1000)
@@ -659,6 +737,7 @@ def _run_stress(
     flags: list[str],
     build_dir: Path,
     *,
+    mismatch_dir: Path,
     timeout: float,
     iterations: int,
     seed: int | None,
@@ -686,7 +765,12 @@ def _run_stress(
         env = os.environ.copy()
         env["ACM_STRESS_SEED"] = str(current_seed)
         generator_command = [str(generator), str(current_seed)]
-        generated = _run(generator_command, timeout=timeout, env=env)
+        generated = _run(
+            generator_command,
+            timeout=timeout,
+            env=env,
+            stdout_limit=_MAX_GENERATOR_STDOUT_BYTES,
+        )
         _append_process_warnings(warnings, generated)
         if _output_limited(generated):
             stream = getattr(generated, "acm_output_limit_stream", "output")
@@ -697,12 +781,22 @@ def _run_stress(
         if generated.returncode != 0:
             warnings.append(f"generator failed for seed {current_seed}")
             return "failed", offset, None, warnings
-        fast = _run([str(solution)], input_data=generated.stdout, timeout=timeout)
-        brute_run = _run([str(brute)], input_data=generated.stdout, timeout=timeout)
+        fast = _run(
+            [str(solution)],
+            input_data=generated.stdout,
+            timeout=timeout,
+            stdout_limit=_MAX_CONTEST_STDOUT_BYTES,
+        )
+        brute_run = _run(
+            [str(brute)],
+            input_data=generated.stdout,
+            timeout=timeout,
+            stdout_limit=_MAX_CONTEST_STDOUT_BYTES,
+        )
         _append_process_warnings(warnings, fast)
         _append_process_warnings(warnings, brute_run)
         if _timed_out(fast) or _timed_out(brute_run):
-            failure = _save_failure(
+            diagnostic = _save_failure(
                 build_dir,
                 ref,
                 current_seed,
@@ -712,9 +806,19 @@ def _run_stress(
                 generator_command,
                 "timeout",
             )
+            failure = _publish_stress_reproduction(
+                mismatch_dir,
+                ref,
+                generated.stdout,
+                user_output=fast.stdout,
+                reference_output=brute_run.stdout,
+                diagnostic_dir=diagnostic,
+                warnings=warnings,
+                seed=current_seed,
+            )
             return "timeout", offset + 1, failure, warnings
         if _output_limited(fast) or _output_limited(brute_run):
-            failure = _save_failure(
+            diagnostic = _save_failure(
                 build_dir,
                 ref,
                 current_seed,
@@ -725,13 +829,19 @@ def _run_stress(
                 "output_limit",
             )
             warnings.append(f"solution output limit exceeded for seed {current_seed}")
+            failure = _publish_stress_reproduction(
+                mismatch_dir,
+                ref,
+                generated.stdout,
+                user_output=fast.stdout,
+                reference_output=brute_run.stdout,
+                diagnostic_dir=diagnostic,
+                warnings=warnings,
+                seed=current_seed,
+            )
             return "output_limit", offset + 1, failure, warnings
-        if (
-            fast.returncode != 0
-            or brute_run.returncode != 0
-            or not outputs_equal(fast.stdout, brute_run.stdout)
-        ):
-            failure = _save_failure(
+        if fast.returncode != 0 or brute_run.returncode != 0:
+            diagnostic = _save_failure(
                 build_dir,
                 ref,
                 current_seed,
@@ -739,10 +849,124 @@ def _run_stress(
                 fast.stdout,
                 brute_run.stdout,
                 generator_command,
-                "mismatch",
+                "runtime_error",
+            )
+            failed_roles = []
+            if fast.returncode != 0:
+                failed_roles.append(f"user program exit code {fast.returncode}")
+            if brute_run.returncode != 0:
+                failed_roles.append(f"reference program exit code {brute_run.returncode}")
+            warnings.append(f"stress runtime error for seed {current_seed}: " + "; ".join(failed_roles))
+            failure = _publish_stress_reproduction(
+                mismatch_dir,
+                ref,
+                generated.stdout,
+                user_output=fast.stdout,
+                reference_output=brute_run.stdout,
+                diagnostic_dir=diagnostic,
+                warnings=warnings,
+                seed=current_seed,
             )
             return "failed", offset + 1, failure, warnings
+        if not outputs_equal(fast.stdout, brute_run.stdout):
+            try:
+                failure = _save_stress_assets(
+                    mismatch_dir,
+                    ref,
+                    generated.stdout,
+                    user_output=fast.stdout,
+                    reference_output=brute_run.stdout,
+                )
+                warnings.append(
+                    f"outputs differ for seed {current_seed}; saved "
+                    f"{ref.problem_id}.stress.in, {ref.problem_id}.reference.out, "
+                    f"and {ref.problem_id}.user.out beside the current source"
+                )
+            except OSError as exc:
+                warnings.append(
+                    "could not save mismatch files beside the current source; "
+                    f"fell back to .acm/failures: {exc}"
+                )
+                failure = _save_failure(
+                    build_dir,
+                    ref,
+                    current_seed,
+                    generated.stdout,
+                    fast.stdout,
+                    brute_run.stdout,
+                    generator_command,
+                    "mismatch",
+                )
+            return "failed", offset + 1, failure, warnings
     return "passed", iterations, None, warnings
+
+
+def _publish_stress_reproduction(
+    problem_dir: Path,
+    ref: ProblemRef,
+    input_data: bytes,
+    *,
+    user_output: bytes,
+    reference_output: bytes,
+    diagnostic_dir: Path,
+    warnings: list[str],
+    seed: int,
+) -> Path:
+    """Publish post-generator failure data beside the source when possible."""
+
+    try:
+        published_dir = _save_stress_assets(
+            problem_dir,
+            ref,
+            input_data,
+            user_output=user_output,
+            reference_output=reference_output,
+        )
+    except OSError as exc:
+        warnings.append(
+            "could not save stress reproduction files beside the current source; "
+            f"diagnostic assets remain at {diagnostic_dir}: {exc}"
+        )
+        return diagnostic_dir
+    warnings.append(
+        f"stress failed for seed {seed}; saved {ref.problem_id}.stress.in, "
+        f"{ref.problem_id}.reference.out, and {ref.problem_id}.user.out "
+        "beside the current source"
+    )
+    warnings.append(f"detailed diagnostic assets remain at {diagnostic_dir}")
+    return published_dir
+
+
+def _save_stress_assets(
+    problem_dir: Path,
+    ref: ProblemRef,
+    input_data: bytes,
+    *,
+    user_output: bytes,
+    reference_output: bytes,
+) -> Path:
+    """Atomically publish the latest stress reproduction beside the source."""
+
+    problem_dir = problem_dir.resolve(strict=True)
+    if not problem_dir.is_dir():
+        raise NotADirectoryError(problem_dir)
+    assets = {
+        problem_dir / f"{ref.problem_id}.stress.in": input_data,
+        problem_dir / f"{ref.problem_id}.reference.out": reference_output,
+        problem_dir / f"{ref.problem_id}.user.out": user_output,
+    }
+    pending: list[tuple[Path, Path]] = []
+    try:
+        for target, content in assets.items():
+            temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+            temporary.write_bytes(content)
+            pending.append((temporary, target))
+        for temporary, target in pending:
+            os.replace(temporary, target)
+    finally:
+        for temporary, _ in pending:
+            temporary.unlink(missing_ok=True)
+    return problem_dir
 
 
 def _save_failure(

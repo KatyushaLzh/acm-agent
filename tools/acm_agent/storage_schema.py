@@ -12,7 +12,7 @@ single migration in place mutate this same dict object.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 24
 
 
 MIGRATIONS: dict[int, str] = {
@@ -552,5 +552,378 @@ MIGRATIONS: dict[int, str] = {
     CREATE INDEX ai_runs_recent_idx ON ai_runs(created_at DESC, id);
     CREATE INDEX ai_runs_conversation_idx
         ON ai_runs(conversation_id, created_at DESC);
+    """,
+    18: """
+    ALTER TABLE ai_runs ADD COLUMN telemetry_json TEXT NOT NULL DEFAULT '{}';
+    ALTER TABLE ai_runs ADD COLUMN estimated_cost_json TEXT NOT NULL DEFAULT '{}';
+    """,
+    19: """
+    ALTER TABLE ai_runs ADD COLUMN provider_id TEXT;
+    ALTER TABLE ai_runs ADD COLUMN profile_id TEXT;
+    ALTER TABLE ai_runs ADD COLUMN requested_model TEXT;
+    ALTER TABLE ai_runs ADD COLUMN resolved_model TEXT;
+    ALTER TABLE ai_runs ADD COLUMN provider_origin TEXT;
+    ALTER TABLE ai_runs ADD COLUMN credential_slot_id TEXT;
+    ALTER TABLE ai_runs ADD COLUMN fallback_json TEXT;
+    ALTER TABLE ai_runs ADD COLUMN cache_status TEXT;
+    ALTER TABLE ai_runs ADD COLUMN cache_read_tokens INTEGER;
+    ALTER TABLE ai_runs ADD COLUMN cache_write_tokens INTEGER;
+
+    UPDATE ai_runs
+       SET provider_id='deepseek',
+           requested_model=model,
+           provider_origin='https://api.deepseek.com',
+           credential_slot_id='deepseek',
+           profile_id=CASE
+             WHEN kind='recommendation' THEN 'recommendation'
+             WHEN kind='coaching' THEN 'coaching'
+             WHEN kind='patch' THEN 'patch'
+             WHEN kind='markdown_summary' THEN 'summary'
+             WHEN kind='plan_import' AND json_valid(request_summary_json)
+               THEN CASE json_extract(request_summary_json,'$.mode')
+                 WHEN 'organize' THEN 'plan_organize'
+                 WHEN 'generate' THEN 'plan_generate'
+                 ELSE NULL END
+             ELSE NULL END,
+           cache_read_tokens=CASE WHEN json_valid(usage_json) THEN
+             COALESCE(
+               json_extract(usage_json,'$.cache_read_tokens'),
+               json_extract(usage_json,'$.prompt_cache_hit_tokens'),
+               json_extract(usage_json,'$.prompt_tokens_details.cached_tokens')
+             ) ELSE NULL END,
+           cache_write_tokens=CASE WHEN json_valid(usage_json) THEN
+              json_extract(usage_json,'$.cache_write_tokens') ELSE NULL END;
+    """,
+    20: """
+    ALTER TABLE ai_runs ADD COLUMN requested_reasoning_strength TEXT
+        CHECK (
+            requested_reasoning_strength IS NULL OR
+            requested_reasoning_strength IN ('auto', 'low', 'medium', 'high')
+        );
+    ALTER TABLE ai_runs ADD COLUMN resolved_reasoning_strength TEXT
+        CHECK (
+            resolved_reasoning_strength IS NULL OR
+            resolved_reasoning_strength IN ('auto', 'low', 'medium', 'high')
+        );
+
+    ALTER TABLE ai_conversations ADD COLUMN provider_id TEXT;
+    ALTER TABLE ai_conversations ADD COLUMN model TEXT;
+    ALTER TABLE ai_conversations ADD COLUMN reasoning_strength TEXT
+        CHECK (
+            reasoning_strength IS NULL OR
+            reasoning_strength IN ('auto', 'low', 'medium', 'high')
+        );
+    ALTER TABLE ai_conversations ADD COLUMN provider_definition_hash TEXT;
+    """,
+    21: """
+    ALTER TABLE ai_runs ADD COLUMN resolved_provider_id TEXT;
+    ALTER TABLE ai_runs ADD COLUMN governance_json TEXT NOT NULL DEFAULT '{}';
+
+    ALTER TABLE ai_conversations ADD COLUMN resolved_model TEXT;
+    ALTER TABLE ai_conversations ADD COLUMN cache_session_key TEXT;
+    ALTER TABLE ai_conversations ADD COLUMN route_policy_hash TEXT;
+
+    CREATE TABLE ai_run_legs (
+        run_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+        route_kind TEXT NOT NULL CHECK (route_kind IN ('primary','retry','fallback','legacy')),
+        provider_id TEXT,
+        profile_id TEXT,
+        requested_model TEXT,
+        resolved_model TEXT,
+        reasoning_strength TEXT,
+        status TEXT NOT NULL,
+        error_code TEXT,
+        provider_requests INTEGER,
+        usage_json TEXT NOT NULL DEFAULT '{}',
+        cache_status TEXT,
+        cache_read_tokens INTEGER,
+        cache_write_tokens INTEGER,
+        estimated_cost_json TEXT NOT NULL DEFAULT '{}',
+        PRIMARY KEY (run_id, ordinal),
+        FOREIGN KEY (run_id) REFERENCES ai_runs(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX ai_run_legs_route_idx
+        ON ai_run_legs(provider_id, profile_id, requested_model);
+
+    INSERT INTO ai_run_legs(
+        run_id,ordinal,route_kind,provider_id,profile_id,requested_model,
+        resolved_model,reasoning_strength,status,provider_requests,usage_json,
+        cache_status,cache_read_tokens,cache_write_tokens,estimated_cost_json
+    )
+    SELECT id,0,'legacy',provider_id,profile_id,requested_model,resolved_model,
+           resolved_reasoning_strength,status,
+           CASE WHEN json_valid(usage_json) THEN json_extract(usage_json,'$.provider_requests') END,
+           usage_json,cache_status,cache_read_tokens,cache_write_tokens,estimated_cost_json
+      FROM ai_runs;
+
+    CREATE TABLE ai_run_cost_estimates (
+        run_id TEXT NOT NULL,
+        catalog_version TEXT NOT NULL,
+        catalog_sha256 TEXT NOT NULL,
+        basis TEXT NOT NULL CHECK (basis IN ('at_run_time','repriced')),
+        status TEXT NOT NULL CHECK (status IN ('known','partial','unknown')),
+        currency TEXT,
+        amount_decimal TEXT,
+        cache_savings_decimal TEXT,
+        estimate_json TEXT NOT NULL,
+        computed_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, catalog_version, catalog_sha256),
+        FOREIGN KEY (run_id) REFERENCES ai_runs(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX ai_run_cost_estimates_version_idx
+        ON ai_run_cost_estimates(catalog_version, computed_at DESC);
+    """,
+    22: """
+    ALTER TABLE ai_runs ADD COLUMN local_cache_status TEXT CHECK (
+        local_cache_status IS NULL OR local_cache_status IN (
+            'bypass','miss','hit','coalesced','refresh'
+        )
+    );
+    ALTER TABLE ai_runs ADD COLUMN local_cache_key TEXT;
+    ALTER TABLE ai_runs ADD COLUMN cache_source_run_id TEXT;
+    ALTER TABLE ai_runs ADD COLUMN cache_validation_json TEXT NOT NULL DEFAULT '{}';
+
+    CREATE INDEX ai_runs_local_cache_idx
+        ON ai_runs(profile_id, local_cache_status, created_at DESC);
+
+    CREATE TABLE ai_cache_entries (
+        cache_key TEXT PRIMARY KEY CHECK (
+            length(cache_key)=64 AND cache_key NOT GLOB '*[^0-9a-f]*'
+        ),
+        profile_id TEXT NOT NULL CHECK (
+            profile_id IN ('recommendation','plan_organize','summary')
+        ),
+        manifest_hash TEXT NOT NULL CHECK (
+            length(manifest_hash)=64 AND manifest_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        artifact_json TEXT NOT NULL CHECK (json_valid(artifact_json)),
+        artifact_hash TEXT NOT NULL CHECK (
+            length(artifact_hash)=64 AND artifact_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        proof_json TEXT NOT NULL CHECK (json_valid(proof_json)),
+        proof_hash TEXT NOT NULL CHECK (
+            length(proof_hash)=64 AND proof_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+        source_run_id TEXT,
+        created_at TEXT NOT NULL,
+        last_accessed_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        hit_count INTEGER NOT NULL DEFAULT 0 CHECK (hit_count >= 0),
+        FOREIGN KEY (source_run_id) REFERENCES ai_runs(id) ON DELETE SET NULL
+    );
+
+    CREATE INDEX ai_cache_entries_expiry_idx
+        ON ai_cache_entries(expires_at, last_accessed_at);
+    CREATE INDEX ai_cache_entries_lru_idx
+        ON ai_cache_entries(last_accessed_at, created_at, cache_key);
+    CREATE INDEX ai_cache_entries_profile_idx
+        ON ai_cache_entries(profile_id, last_accessed_at DESC);
+
+    CREATE TABLE ai_request_flights (
+        cache_key TEXT PRIMARY KEY CHECK (
+            length(cache_key)=64 AND cache_key NOT GLOB '*[^0-9a-f]*'
+        ),
+        profile_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('running','complete','failed')),
+        lease_expires_at TEXT NOT NULL,
+        error_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX ai_request_flights_lease_idx
+        ON ai_request_flights(status, lease_expires_at);
+    """,
+    23: """
+    ALTER TABLE ai_runs ADD COLUMN provider_outcome TEXT CHECK (
+        provider_outcome IS NULL OR provider_outcome IN (
+            'not_called','succeeded','failed','mixed'
+        )
+    );
+    ALTER TABLE ai_runs ADD COLUMN artifact_outcome TEXT CHECK (
+        artifact_outcome IS NULL OR artifact_outcome IN (
+            'valid','repaired','partial','invalid','not_applicable'
+        )
+    );
+    ALTER TABLE ai_runs ADD COLUMN business_outcome TEXT CHECK (
+        business_outcome IS NULL OR business_outcome IN (
+            'complete','cache','hybrid','deterministic_fallback','partial','unavailable'
+        )
+    );
+    ALTER TABLE ai_runs ADD COLUMN usable INTEGER CHECK (
+        usable IS NULL OR usable IN (0,1)
+    );
+    ALTER TABLE ai_runs ADD COLUMN apply_ready INTEGER CHECK (
+        apply_ready IS NULL OR apply_ready IN (0,1)
+    );
+    ALTER TABLE ai_runs ADD COLUMN degraded INTEGER CHECK (
+        degraded IS NULL OR degraded IN (0,1)
+    );
+    ALTER TABLE ai_runs ADD COLUMN repair_attempts INTEGER NOT NULL DEFAULT 0
+        CHECK (repair_attempts >= 0);
+
+    ALTER TABLE ai_run_legs ADD COLUMN purpose TEXT NOT NULL DEFAULT 'legacy'
+        CHECK (purpose IN (
+            'initial','transport_retry','validation_repair','fallback','legacy'
+        ));
+    ALTER TABLE ai_run_legs ADD COLUMN validation_code TEXT;
+
+    CREATE INDEX ai_runs_outcome_idx
+        ON ai_runs(business_outcome,usable,degraded,created_at DESC);
+    """,
+    24: """
+    CREATE TABLE ai_conversations_v24 (
+        id TEXT PRIMARY KEY,
+        attempt_id INTEGER,
+        platform TEXT NOT NULL,
+        problem_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active'
+            CHECK (status IN ('active', 'closed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        closed_at TEXT,
+        closed_reason TEXT
+            CHECK (closed_reason IN ('user_cleared', 'attempt_closed', 'legacy')),
+        superseded_by TEXT,
+        provider_id TEXT,
+        model TEXT,
+        reasoning_strength TEXT CHECK (
+            reasoning_strength IS NULL OR
+            reasoning_strength IN ('auto', 'off', 'low', 'medium', 'high')
+        ),
+        provider_definition_hash TEXT,
+        resolved_model TEXT,
+        cache_session_key TEXT,
+        route_policy_hash TEXT,
+        FOREIGN KEY (attempt_id) REFERENCES attempts(id) ON DELETE CASCADE,
+        FOREIGN KEY (platform, problem_id)
+            REFERENCES problems(platform, problem_id) ON DELETE CASCADE
+    );
+
+    INSERT INTO ai_conversations_v24(
+        id,attempt_id,platform,problem_id,status,created_at,updated_at,closed_at,
+        closed_reason,superseded_by,provider_id,model,reasoning_strength,
+        provider_definition_hash,resolved_model,cache_session_key,route_policy_hash
+    )
+    SELECT
+        id,attempt_id,platform,problem_id,status,created_at,updated_at,closed_at,
+        closed_reason,superseded_by,provider_id,model,reasoning_strength,
+        provider_definition_hash,resolved_model,cache_session_key,route_policy_hash
+      FROM ai_conversations;
+
+    CREATE TABLE ai_runs_v24 (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        model TEXT NOT NULL,
+        conversation_id TEXT,
+        message_id TEXT,
+        request_summary_json TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL,
+        finish_reason TEXT,
+        usage_json TEXT NOT NULL DEFAULT '{}',
+        error_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        telemetry_json TEXT NOT NULL DEFAULT '{}',
+        estimated_cost_json TEXT NOT NULL DEFAULT '{}',
+        provider_id TEXT,
+        profile_id TEXT,
+        requested_model TEXT,
+        resolved_model TEXT,
+        provider_origin TEXT,
+        credential_slot_id TEXT,
+        fallback_json TEXT,
+        cache_status TEXT,
+        cache_read_tokens INTEGER,
+        cache_write_tokens INTEGER,
+        requested_reasoning_strength TEXT CHECK (
+            requested_reasoning_strength IS NULL OR
+            requested_reasoning_strength IN ('auto', 'off', 'low', 'medium', 'high')
+        ),
+        resolved_reasoning_strength TEXT CHECK (
+            resolved_reasoning_strength IS NULL OR
+            resolved_reasoning_strength IN ('auto', 'off', 'low', 'medium', 'high')
+        ),
+        resolved_provider_id TEXT,
+        governance_json TEXT NOT NULL DEFAULT '{}',
+        local_cache_status TEXT CHECK (
+            local_cache_status IS NULL OR local_cache_status IN (
+                'bypass','miss','hit','coalesced','refresh'
+            )
+        ),
+        local_cache_key TEXT,
+        cache_source_run_id TEXT,
+        cache_validation_json TEXT NOT NULL DEFAULT '{}',
+        provider_outcome TEXT CHECK (
+            provider_outcome IS NULL OR provider_outcome IN (
+                'not_called','succeeded','failed','mixed'
+            )
+        ),
+        artifact_outcome TEXT CHECK (
+            artifact_outcome IS NULL OR artifact_outcome IN (
+                'valid','repaired','partial','invalid','not_applicable'
+            )
+        ),
+        business_outcome TEXT CHECK (
+            business_outcome IS NULL OR business_outcome IN (
+                'complete','cache','hybrid','deterministic_fallback','partial','unavailable'
+            )
+        ),
+        usable INTEGER CHECK (usable IS NULL OR usable IN (0,1)),
+        apply_ready INTEGER CHECK (apply_ready IS NULL OR apply_ready IN (0,1)),
+        degraded INTEGER CHECK (degraded IS NULL OR degraded IN (0,1)),
+        repair_attempts INTEGER NOT NULL DEFAULT 0 CHECK (repair_attempts >= 0),
+        FOREIGN KEY (conversation_id)
+            REFERENCES ai_conversations(id) ON DELETE SET NULL,
+        FOREIGN KEY (message_id) REFERENCES ai_messages(id) ON DELETE SET NULL
+    );
+
+    INSERT INTO ai_runs_v24(
+        id,kind,model,conversation_id,message_id,request_summary_json,status,
+        finish_reason,usage_json,error_json,created_at,completed_at,telemetry_json,
+        estimated_cost_json,provider_id,profile_id,requested_model,resolved_model,
+        provider_origin,credential_slot_id,fallback_json,cache_status,
+        cache_read_tokens,cache_write_tokens,requested_reasoning_strength,
+        resolved_reasoning_strength,resolved_provider_id,governance_json,
+        local_cache_status,local_cache_key,cache_source_run_id,cache_validation_json,
+        provider_outcome,artifact_outcome,business_outcome,usable,apply_ready,degraded,
+        repair_attempts
+    )
+    SELECT
+        id,kind,model,conversation_id,message_id,request_summary_json,status,
+        finish_reason,usage_json,error_json,created_at,completed_at,telemetry_json,
+        estimated_cost_json,provider_id,profile_id,requested_model,resolved_model,
+        provider_origin,credential_slot_id,fallback_json,cache_status,
+        cache_read_tokens,cache_write_tokens,requested_reasoning_strength,
+        resolved_reasoning_strength,resolved_provider_id,governance_json,
+        local_cache_status,local_cache_key,cache_source_run_id,cache_validation_json,
+        provider_outcome,artifact_outcome,business_outcome,usable,apply_ready,degraded,
+        repair_attempts
+      FROM ai_runs;
+
+    DROP TABLE ai_runs;
+    DROP TABLE ai_conversations;
+    ALTER TABLE ai_conversations_v24 RENAME TO ai_conversations;
+    ALTER TABLE ai_runs_v24 RENAME TO ai_runs;
+
+    CREATE UNIQUE INDEX ai_conversations_active_attempt_idx
+        ON ai_conversations(attempt_id)
+        WHERE attempt_id IS NOT NULL AND status='active';
+    CREATE INDEX ai_conversations_problem_idx
+        ON ai_conversations(platform, problem_id, updated_at DESC);
+    CREATE INDEX ai_conversations_attempt_summary_idx
+        ON ai_conversations(attempt_id, closed_reason, updated_at DESC);
+    CREATE INDEX ai_runs_recent_idx ON ai_runs(created_at DESC, id);
+    CREATE INDEX ai_runs_conversation_idx
+        ON ai_runs(conversation_id, created_at DESC);
+    CREATE INDEX ai_runs_local_cache_idx
+        ON ai_runs(profile_id, local_cache_status, created_at DESC);
+    CREATE INDEX ai_runs_outcome_idx
+        ON ai_runs(business_outcome,usable,degraded,created_at DESC);
     """,
 }

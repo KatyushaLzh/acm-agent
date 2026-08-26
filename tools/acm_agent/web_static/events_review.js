@@ -1,10 +1,11 @@
-import { $, renderRecentSessions, state } from "./core.js";
+import { $, renderRecentSessions, state, toast } from "./core.js";
 import {
-  confirmSkip, copyPath, loadReview, unskipProblem,
+  confirmSkip, copyPath, loadReview, unskipProblem, repriceAiCostAudit,
 } from "./view_review.js";
 
 function bindReviewEvents() {
   $("#review-button").addEventListener("click", loadReview);
+  $("#ai-cost-reprice-review").addEventListener("click", event => repriceAiCostAudit(event.currentTarget).catch(error => toast("费用重算失败", error.message, "error")));
   $("#skip-confirm").addEventListener("click", event => confirmSkip(event.currentTarget));
   $("#skip-dialog").addEventListener("close", () => { state.skipCandidate = null; });
   $("#skipped-problems").addEventListener("click", event => {

@@ -9,7 +9,14 @@ import json
 from typing import Any, Callable, Mapping
 
 from .config import load_config, save_config
-from .deepseek import DeepSeekClient
+from .ai_cache import EXACT_CACHE_PROFILES
+from .provider_registry import ProviderRegistry, ProviderRoute
+from .provider_config import (
+    TASK_PROFILE_IDS,
+    validate_ai_policy,
+    validate_coaching_delivery_mode,
+)
+from .provider_governance import GovernedProviderClient, governance_from_error, governance_from_result
 from .plan_manager import PlanManager
 from .platforms import freshness
 from .recommend import LUOGU_CF_EQUIVALENT, recommendation_difficulty_targets
@@ -20,6 +27,43 @@ from .workspace import parse_problem_ref, scan_local_solutions
 
 
 class ServiceCoreMixin:
+    def ai_status(self) -> dict[str, Any]:
+        """Expose the delivery default without changing the legacy settings shape."""
+
+        result = dict(super().ai_status())
+        config = load_config(self.paths, required=False)
+        result["coaching_delivery_mode"] = validate_coaching_delivery_mode(
+            config["ai"].get("coaching_delivery_mode")
+        )
+        return result
+
+    def ai_policy_update(
+        self,
+        *,
+        policy: Mapping[str, Any],
+        coaching_delivery_mode: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically update governance policy and the independent delivery mode."""
+
+        normalized = validate_ai_policy(policy)
+        config = load_config(self.paths, required=False)
+        selected_delivery = validate_coaching_delivery_mode(
+            coaching_delivery_mode
+            if coaching_delivery_mode is not None
+            else config["ai"].get("coaching_delivery_mode")
+        )
+        config["ai"]["policy"] = normalized
+        config["ai"]["coaching_delivery_mode"] = selected_delivery
+        registry = ProviderRegistry(config["ai"])
+        for profile_id in TASK_PROFILE_IDS:
+            registry.route_plan(profile_id)
+        save_config(self.paths, config)
+        return {
+            "ok": True,
+            "coaching_delivery_mode": selected_delivery,
+            "governance": self.ai_governance(),
+        }
+
     @staticmethod
     def _accepts_keyword(function: Callable[..., Any], name: str) -> bool:
         side_effect = getattr(function, "side_effect", None)
@@ -45,13 +89,188 @@ class ServiceCoreMixin:
             and str(config["accounts"]["luogu"].get("uid") or "").strip()
         )
 
+    def _provider_registry(self) -> ProviderRegistry:
+        config = load_config(self.paths, required=False)
+        return ProviderRegistry(
+            config["ai"],
+            credential_vault=self._credential_vault,
+            injected_factory=(
+                None if self._provider_factory_is_default else self._provider_client_factory
+            ),
+        )
+
+    def _provider_route(
+        self,
+        profile_id: str,
+        *,
+        model_override: str | None = None,
+        model_ref: Mapping[str, Any] | None = None,
+        reasoning_strength: str | None = None,
+    ) -> ProviderRoute:
+        return self._provider_registry().route(
+            profile_id,
+            model_override=model_override,
+            model_ref=model_ref,
+            reasoning_strength=reasoning_strength,
+        )
+
+    def _provider_client(
+        self,
+        *,
+        profile_id: str = "coaching",
+        model_override: str | None = None,
+        model_ref: Mapping[str, Any] | None = None,
+        reasoning_strength: str | None = None,
+        route: ProviderRoute | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        registry = self._provider_registry()
+        selected = route or registry.route(
+            profile_id,
+            model_override=model_override,
+            model_ref=model_ref,
+            reasoning_strength=reasoning_strength,
+        )
+        routes = registry.route_plan(selected.profile_id, primary=selected)
+        return GovernedProviderClient(
+            routes,
+            lambda candidate, remaining: registry.client_for_route(
+                candidate,
+                timeout=min(
+                    remaining,
+                    float(timeout) if timeout is not None else float(candidate.budget["request_timeout_seconds"]),
+                ),
+            ),
+            allow_request=self._assert_ai_spend_available,
+        )
+
+    def _assert_ai_spend_available(self, route: ProviderRoute) -> None:
+        # Monetary hard limits currently govern only the built-in DeepSeek
+        # price catalog.  A relay or another provider must not be blocked by
+        # unknown DeepSeek spend, while a fallback entering DeepSeek must run
+        # this check immediately before its own outbound request.
+        if route.provider_id != "deepseek":
+            return
+        config = load_config(self.paths, required=False)
+        limits = config["ai"]["policy"]["hard_limits"]
+        if limits.get("daily_cny") is None and limits.get("monthly_cny") is None:
+            return
+        with Database(self.paths.database) as db:
+            spend = db.ai_cost_spend()
+        for period, key in (("daily", "daily_cny"), ("monthly", "monthly_cny")):
+            limit = limits.get(key)
+            if limit is None:
+                continue
+            if spend[period]["unknown_runs"]:
+                from .provider import ProviderConfigurationError
+
+                raise ProviderConfigurationError(
+                    "cost_limit_unknown",
+                    f"{period} AI spend contains runs with unknown cost; hard limit fails closed",
+                )
+            if float(spend[period]["known_cny"]) >= float(limit):
+                from .provider import ProviderConfigurationError
+
+                raise ProviderConfigurationError(
+                    "cost_limit_exceeded", f"{period} AI cost hard limit has been reached"
+                )
+
+    @staticmethod
+    def _route_storage_args(route: ProviderRoute) -> dict[str, Any]:
+        provider = route.provider
+        from .provider_config import endpoint_origin
+
+        return {
+            "provider_id": route.provider_id,
+            "profile_id": route.profile_id,
+            "requested_model": route.model,
+            "requested_reasoning_strength": route.reasoning_strength,
+            "provider_origin": endpoint_origin(provider["base_url"]),
+            "credential_slot_id": str(provider["credential_slot"]),
+        }
+
+    @staticmethod
+    def _governance_storage_args(value: Any, route: ProviderRoute) -> dict[str, Any]:
+        governance = (
+            governance_from_error(value)
+            if isinstance(value, BaseException)
+            else governance_from_result(value)
+        )
+        usage = getattr(value, "usage", {})
+        return ServiceCoreMixin._governance_storage_snapshot_args(
+            governance, route, usage if isinstance(usage, Mapping) else {}
+        )
+
+    @staticmethod
+    def _governance_storage_snapshot_args(
+        governance: Mapping[str, Any] | None,
+        route: ProviderRoute,
+        usage: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        actual = governance.get("actual") if isinstance(governance, Mapping) else None
+        fallbacks = governance.get("fallbacks") if isinstance(governance, Mapping) else None
+        cache_read = usage.get("cache_read_tokens") if isinstance(usage, Mapping) else None
+        cache_status = (
+            "hit" if isinstance(cache_read, (int, float)) and cache_read > 0
+            else "miss" if isinstance(cache_read, (int, float)) and cache_read == 0
+            else None
+        )
+        return {
+            "resolved_provider_id": (
+                str(actual.get("provider_id"))
+                if isinstance(actual, Mapping) and actual.get("provider_id") else route.provider_id
+            ),
+            "fallback": {
+                "version": 1,
+                "outcome": governance.get("outcome"),
+                "events": list(fallbacks or []),
+            } if isinstance(governance, Mapping) else None,
+            "governance": governance,
+            "cache_status": cache_status,
+        }
+
     def _deepseek_client(self, *, timeout: float | None = None) -> Any:
-        if self._deepseek_client_factory is DeepSeekClient:
-            return DeepSeekClient(
-                api_key=self._deepseek_api_key,
-                timeout=(60.0 if timeout is None else float(timeout)),
+        """Legacy internal injection alias retained during the migration window."""
+
+        return self._provider_client(timeout=timeout)
+
+    def ai_cache_status(self) -> dict[str, Any]:
+        config = load_config(self.paths, required=False)
+        policy = dict(config["ai"]["cache"])
+        with Database(self.paths.database) as db:
+            status = db.ai_cache_status()
+        return {
+            "ok": True,
+            **status,
+            "policy": policy,
+        }
+
+    def ai_cache_clear(
+        self, *, profile_ids: list[str] | None = None
+    ) -> dict[str, Any]:
+        if profile_ids is not None:
+            selected = [str(item).strip().lower() for item in profile_ids]
+            unknown = sorted(set(selected) - set(EXACT_CACHE_PROFILES))
+            if unknown:
+                raise ValueError(
+                    "只能清理支持精确缓存的 profile：" + ", ".join(unknown)
+                )
+        else:
+            selected = None
+        with Database(self.paths.database) as db:
+            result = db.clear_ai_cache(selected)
+            status = db.ai_cache_status()
+        return {"ok": True, **result, "status": status}
+
+    def ai_cache_prune(self) -> dict[str, Any]:
+        policy = dict(load_config(self.paths, required=False)["ai"]["cache"])
+        with Database(self.paths.database) as db:
+            result = db.prune_ai_cache(
+                max_entries=int(policy["max_entries"]),
+                max_bytes=int(policy["max_bytes"]),
             )
-        return self._deepseek_client_factory()
+            status = db.ai_cache_status()
+        return {"ok": True, **result, "status": status}
 
     @staticmethod
     def _recent_solved_difficulty_profile(

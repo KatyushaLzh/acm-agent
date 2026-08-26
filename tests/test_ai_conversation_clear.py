@@ -223,6 +223,54 @@ class AIConversationClearServiceTests(unittest.TestCase):
                 self.conversation_id,
             )
 
+    def test_route_switch_archives_old_conversation_and_clear_preserves_pin(self) -> None:
+        selection = {
+            "model_ref": {
+                "provider_id": "deepseek",
+                "model": "deepseek-v4-flash",
+            },
+            "reasoning_strength": "medium",
+        }
+        switched = self.service.ai_conversation_switch(
+            self.conversation_id, **selection
+        )
+        self.assertNotEqual(switched["conversation_id"], self.conversation_id)
+        with Database(self.service.paths.database) as db:
+            old = db.ai_conversation(self.conversation_id)
+            current = db.ai_conversation(switched["conversation_id"])
+            self.assertEqual(old["status"], "closed")
+            self.assertEqual(old["closed_reason"], "user_cleared")
+            self.assertEqual(current["provider_id"], "deepseek")
+            self.assertEqual(current["model"], "deepseek-v4-flash")
+            self.assertEqual(current["reasoning_strength"], "medium")
+
+        cleared = self.service.ai_conversation_clear(switched["conversation_id"])
+        with Database(self.service.paths.database) as db:
+            replacement = db.ai_conversation(cleared["conversation_id"])
+            self.assertEqual(replacement["provider_id"], "deepseek")
+            self.assertEqual(replacement["model"], "deepseek-v4-flash")
+            self.assertEqual(replacement["reasoning_strength"], "medium")
+
+    def test_route_switch_rejects_streaming_conversation_with_409_conflict(self) -> None:
+        with Database(self.service.paths.database) as db:
+            db.create_ai_message(
+                "assistant-streaming-switch",
+                self.conversation_id,
+                role="assistant",
+                status="streaming",
+            )
+        self._assert_conflict(
+            "conversation_busy",
+            lambda: self.service.ai_conversation_switch(
+                self.conversation_id,
+                model_ref={
+                    "provider_id": "deepseek",
+                    "model": "deepseek-v4-flash",
+                },
+                reasoning_strength="auto",
+            ),
+        )
+
 
 class _ClearWebService:
     def __init__(self) -> None:

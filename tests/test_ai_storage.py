@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tools.acm_agent.ai_reliability import build_ai_outcome
+
 from tools.acm_agent.storage import (
     Database,
     MIGRATIONS,
@@ -108,6 +110,128 @@ def create_legacy_database(path: Path, version: int) -> None:
 
 
 class AiStorageMigrationTests(unittest.TestCase):
+    def test_v24_accepts_off_and_preserves_parent_rows_and_foreign_keys(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.db"
+            connection = sqlite3.connect(path)
+            try:
+                for version in range(1, 24):
+                    connection.executescript(MIGRATIONS[version])
+                    connection.execute(f"PRAGMA user_version={version}")
+                connection.execute(
+                    """INSERT INTO problems(
+                           platform,problem_id,tags_json,source_json,updated_at)
+                       VALUES('codeforces','1A','[]','{}','2026-08-26T00:00:00+00:00')"""
+                )
+                connection.execute(
+                    """INSERT INTO ai_conversations(
+                           id,platform,problem_id,status,created_at,updated_at,
+                           reasoning_strength)
+                       VALUES('conversation','codeforces','1A','active',
+                              '2026-08-26T00:00:00+00:00',
+                              '2026-08-26T00:00:00+00:00','auto')"""
+                )
+                connection.execute(
+                    """INSERT INTO ai_runs(
+                           id,kind,model,conversation_id,request_summary_json,status,
+                           usage_json,error_json,created_at,telemetry_json,
+                           estimated_cost_json,governance_json,cache_validation_json,
+                           requested_reasoning_strength,resolved_reasoning_strength)
+                       VALUES('run','coaching','model','conversation','{}','complete',
+                              '{}','{}','2026-08-26T00:00:00+00:00','{}','{}','{}','{}',
+                              'auto','auto')"""
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with Database(path) as database:
+                database.connection.execute(
+                    "UPDATE ai_conversations SET reasoning_strength='off' WHERE id='conversation'"
+                )
+                database.connection.execute(
+                    """UPDATE ai_runs
+                          SET requested_reasoning_strength='off',
+                              resolved_reasoning_strength='off'
+                        WHERE id='run'"""
+                )
+                self.assertEqual(database.ai_run("run")["resolved_reasoning_strength"], "off")
+                self.assertEqual(
+                    database.ai_conversation("conversation")["reasoning_strength"], "off"
+                )
+                self.assertEqual(list(database.connection.execute("PRAGMA foreign_key_check")), [])
+            self.assertTrue(path.with_name("state.db.v23.bak").exists())
+
+    def test_v22_to_v23_preserves_rows_and_reopen_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.db"
+            connection = sqlite3.connect(path)
+            try:
+                for version in range(1, 23):
+                    connection.executescript(MIGRATIONS[version])
+                    connection.execute(f"PRAGMA user_version={version}")
+                connection.execute(
+                    """INSERT INTO ai_runs(
+                           id,kind,model,request_summary_json,status,usage_json,
+                           error_json,created_at,telemetry_json,estimated_cost_json,
+                           governance_json,cache_validation_json)
+                       VALUES('old','recommendation','model','{}','complete','{}','{}',
+                              '2026-08-26T00:00:00+00:00','{}','{}','{}','{}')"""
+                )
+                connection.execute(
+                    """INSERT INTO ai_run_legs(
+                           run_id,ordinal,route_kind,status,usage_json,
+                           estimated_cost_json)
+                       VALUES('old',0,'legacy','complete','{}','{}')"""
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with Database(path) as database:
+                self.assertEqual(
+                    database.connection.execute("PRAGMA user_version").fetchone()[0], 24
+                )
+                self.assertIsNone(database.ai_run("old")["business_outcome"])
+                self.assertEqual(database.ai_run("old")["repair_attempts"], 0)
+                self.assertEqual(database.ai_run_legs("old")[0]["purpose"], "legacy")
+            with Database(path) as reopened:
+                self.assertEqual(
+                    reopened.connection.execute("PRAGMA user_version").fetchone()[0], 24
+                )
+
+    def test_failed_v23_migration_rolls_back_then_restart_succeeds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.db"
+            connection = sqlite3.connect(path)
+            try:
+                for version in range(1, 23):
+                    connection.executescript(MIGRATIONS[version])
+                    connection.execute(f"PRAGMA user_version={version}")
+                connection.commit()
+            finally:
+                connection.close()
+            original = MIGRATIONS[23]
+            try:
+                MIGRATIONS[23] = original + "\nINSERT INTO missing_v23_table VALUES(1);"
+                with self.assertRaises(sqlite3.OperationalError):
+                    Database(path)
+            finally:
+                MIGRATIONS[23] = original
+            connection = sqlite3.connect(path)
+            try:
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 22)
+                self.assertNotIn(
+                    "provider_outcome",
+                    {row[1] for row in connection.execute("PRAGMA table_info(ai_runs)")},
+                )
+            finally:
+                connection.close()
+            with Database(path) as database:
+                self.assertEqual(
+                    database.connection.execute("PRAGMA user_version").fetchone()[0], 24
+                )
+
     def assert_v16_retirement_backup(self, backup: Path) -> None:
         self.assertTrue(backup.exists())
         connection = sqlite3.connect(backup)
@@ -134,6 +258,34 @@ class AiStorageMigrationTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_v18_adds_unknown_telemetry_without_zero_backfill(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "state.db"
+            connection = sqlite3.connect(path)
+            try:
+                for version in range(1, 18):
+                    connection.executescript(MIGRATIONS[version])
+                    connection.execute(f"PRAGMA user_version = {version}")
+                connection.execute(
+                    """INSERT INTO ai_runs(
+                           id,kind,model,request_summary_json,status,usage_json,
+                           error_json,created_at)
+                       VALUES('historical','recommendation','deepseek-v4-flash',
+                              '{}','failed','{}','{}','2026-08-25T00:00:00+00:00')"""
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with Database(path) as database:
+                row = database.ai_run("historical")
+                self.assertEqual(
+                    database.connection.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+                self.assertEqual(json.loads(row["telemetry_json"]), {})
+                self.assertEqual(json.loads(row["estimated_cost_json"]), {})
+
     def test_v5_migration_creates_one_consistent_backup_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "state.db"
@@ -150,7 +302,7 @@ class AiStorageMigrationTests(unittest.TestCase):
                 connection.close()
 
             with Database(path) as database:
-                self.assertEqual(SCHEMA_VERSION, 17)
+                self.assertEqual(SCHEMA_VERSION, 24)
                 self.assertEqual(
                     database.connection.execute("PRAGMA user_version").fetchone()[0],
                     SCHEMA_VERSION,
@@ -324,6 +476,63 @@ class AiStorageMigrationTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_v24_refuses_valid_backup_from_a_different_v23_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "state.db"
+            other_path = root / "other.db"
+
+            for database_path, problem_id in (
+                (path, "source-problem"),
+                (other_path, "other-problem"),
+            ):
+                connection = sqlite3.connect(database_path)
+                try:
+                    for version in range(1, 24):
+                        connection.executescript(MIGRATIONS[version])
+                        connection.execute(f"PRAGMA user_version = {version}")
+                    connection.execute(
+                        """INSERT INTO problems(
+                               platform,problem_id,tags_json,source_json,updated_at)
+                           VALUES('codeforces',?,'[]','{}',
+                                  '2026-08-27T00:00:00+00:00')""",
+                        (problem_id,),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+
+            backup = path.with_name("state.db.v23.bak")
+            source = sqlite3.connect(other_path)
+            destination = sqlite3.connect(backup)
+            try:
+                source.backup(destination)
+                destination.commit()
+            finally:
+                destination.close()
+                source.close()
+            original_backup = backup.read_bytes()
+
+            with self.assertRaisesRegex(
+                RuntimeError, "backup does not match source database"
+            ):
+                Database(path)
+
+            self.assertEqual(backup.read_bytes(), original_backup)
+            connection = sqlite3.connect(path)
+            try:
+                self.assertEqual(
+                    connection.execute("PRAGMA user_version").fetchone()[0], 23
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT problem_id FROM problems"
+                    ).fetchone()[0],
+                    "source-problem",
+                )
+            finally:
+                connection.close()
+
     def test_failed_v17_retirement_rolls_back_all_destructive_ddl(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "state.db"
@@ -363,7 +572,7 @@ class AiStorageMigrationTests(unittest.TestCase):
             with Database(path) as database:
                 self.assertEqual(
                     database.connection.execute("PRAGMA user_version").fetchone()[0],
-                    17,
+                    SCHEMA_VERSION,
                 )
             self.assertEqual(backup.read_bytes(), original_backup)
 
@@ -393,6 +602,58 @@ class AiStorageMigrationTests(unittest.TestCase):
                     },
                 )
 
+    def test_v20_adds_nullable_reasoning_and_conversation_route_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "state.db"
+            connection = sqlite3.connect(path)
+            try:
+                for version in range(1, 20):
+                    connection.executescript(MIGRATIONS[version])
+                    connection.execute(f"PRAGMA user_version = {version}")
+                connection.execute(
+                    """INSERT INTO problems(
+                           platform,problem_id,tags_json,source_json,updated_at)
+                       VALUES('codeforces','1A','[]','{}','2026-08-25T00:00:00+00:00')"""
+                )
+                connection.execute(
+                    """INSERT INTO ai_conversations(
+                           id,platform,problem_id,status,created_at,updated_at)
+                       VALUES('historical-conversation','codeforces','1A','closed',
+                              '2026-08-25T00:00:00+00:00',
+                              '2026-08-25T00:00:00+00:00')"""
+                )
+                connection.execute(
+                    """INSERT INTO ai_runs(
+                           id,kind,model,request_summary_json,status,usage_json,
+                           error_json,created_at)
+                       VALUES('historical-run','patch','model','{}','complete','{}','{}',
+                              '2026-08-25T00:00:00+00:00')"""
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with Database(path) as database:
+                run = database.ai_run("historical-run")
+                conversation = database.ai_conversation("historical-conversation")
+                self.assertEqual(
+                    database.connection.execute("PRAGMA user_version").fetchone()[0],
+                    24,
+                )
+                self.assertIsNone(run["requested_reasoning_strength"])
+                self.assertIsNone(run["resolved_reasoning_strength"])
+                for column in (
+                    "provider_id", "model", "reasoning_strength",
+                    "provider_definition_hash",
+                ):
+                    self.assertIsNone(conversation[column])
+
+            with Database(path) as database:
+                self.assertEqual(
+                    database.connection.execute("PRAGMA user_version").fetchone()[0],
+                    24,
+                )
+
 
 class AiStorageRepositoryTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -409,6 +670,50 @@ class AiStorageRepositoryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.db.close()
         self.temp.cleanup()
+
+    def test_outcome_and_leg_purpose_are_persisted_and_audited(self):
+        outcome = build_ai_outcome(
+            provider_outcome="succeeded",
+            artifact_outcome="repaired",
+            business_outcome="complete",
+            usable=True,
+            apply_ready=True,
+            degraded=False,
+            repair_attempts=1,
+        )
+        self.db.create_ai_run(
+            "outcome-run", kind="summary", model="deepseek-v4-flash",
+            status="complete", profile_id="summary", outcome=outcome,
+        )
+        self.db.update_ai_run(
+            "outcome-run",
+            governance={
+                "legs": [
+                    {
+                        "provider_id": "deepseek",
+                        "model": "deepseek-v4-flash",
+                        "resolved_model": "deepseek-v4-flash",
+                        "reasoning_strength": "medium",
+                        "status": "complete",
+                        "usage": {"provider_requests": 1, "total_tokens": 2},
+                        "purpose": "validation_repair",
+                        "validation_code": "invalid_summary_entry",
+                    }
+                ]
+            },
+        )
+        row = self.db.ai_run("outcome-run")
+        self.assertEqual(row["business_outcome"], "complete")
+        self.assertEqual(row["repair_attempts"], 1)
+        leg = self.db.ai_run_legs("outcome-run")[0]
+        self.assertEqual(leg["purpose"], "validation_repair")
+        self.assertEqual(leg["validation_code"], "invalid_summary_entry")
+        metrics = self.db.ai_cost_audit()["outcome_metrics"]
+        self.assertEqual(metrics["observed_runs"], 1)
+        self.assertEqual(metrics["provider_leg_success_rate_percent"], 100.0)
+        self.assertEqual(metrics["provider_valid_artifact_rate_percent"], 100.0)
+        self.assertEqual(metrics["repair_recovery_rate_percent"], 100.0)
+        self.assertEqual(metrics["full_business_success_rate_percent"], 100.0)
 
     def test_context_manual_precedence_and_hash_guard(self) -> None:
         automatic = self.db.save_problem_context(
@@ -504,6 +809,40 @@ class AiStorageRepositoryTests(unittest.TestCase):
         )
         self.assertTrue(self.db.close_ai_conversation(conversation["id"]))
 
+    def test_conversation_route_is_bound_once(self) -> None:
+        conversation, created = self.db.get_or_create_ai_conversation(
+            "conversation-route",
+            self.attempt_id,
+            "codeforces",
+            "1A",
+            provider_id="relay-a",
+            model="shared-model",
+            reasoning_strength="medium",
+            provider_definition_hash="definition-v1",
+        )
+        self.assertTrue(created)
+        self.assertEqual(conversation["provider_id"], "relay-a")
+        self.assertEqual(conversation["model"], "shared-model")
+        self.assertEqual(conversation["reasoning_strength"], "medium")
+        self.assertEqual(conversation["provider_definition_hash"], "definition-v1")
+
+        same, created = self.db.get_or_create_ai_conversation(
+            "ignored",
+            self.attempt_id,
+            "codeforces",
+            "1A",
+            provider_id="relay-a",
+            model="shared-model",
+            reasoning_strength="medium",
+            provider_definition_hash="definition-v1",
+        )
+        self.assertFalse(created)
+        self.assertEqual(same["id"], conversation["id"])
+        with self.assertRaisesRegex(ValueError, "already bound"):
+            self.db.bind_ai_conversation_route(
+                conversation["id"], model="different-model"
+            )
+
     def test_problem_samples_deduplicate_content_and_merge_metadata(self) -> None:
         first = self.db.upsert_problem_sample(
             "codeforces",
@@ -565,6 +904,7 @@ class AiStorageRepositoryTests(unittest.TestCase):
             model="deepseek-v4-flash",
             conversation_id=conversation["id"],
             request_summary={"problem": "codeforces:1A"},
+            requested_reasoning_strength="high",
         )
         self.assertEqual(run["status"], "pending")
         run = self.db.update_ai_run(
@@ -573,10 +913,19 @@ class AiStorageRepositoryTests(unittest.TestCase):
             status="complete",
             finish_reason="stop",
             usage={"total_tokens": 42},
+            telemetry={"provider_requests": 2, "protocol_repairs": 1},
             completed_at="2026-08-04T01:02:00+00:00",
+            resolved_reasoning_strength="medium",
         )
         self.assertEqual(json.loads(run["usage_json"])["total_tokens"], 42)
+        self.assertEqual(json.loads(run["telemetry_json"])["provider_requests"], 2)
+        self.assertEqual(
+            json.loads(run["estimated_cost_json"])["unknown_reason"],
+            "usage_incomplete",
+        )
         self.assertEqual(json.loads(run["request_summary_json"])["rounds"], 2)
+        self.assertEqual(run["requested_reasoning_strength"], "high")
+        self.assertEqual(run["resolved_reasoning_strength"], "medium")
 
         proposal = self.db.create_ai_patch_proposal(
             "patch-1",
@@ -608,6 +957,297 @@ class AiStorageRepositoryTests(unittest.TestCase):
             reverted_at="2026-08-04T01:04:00+00:00",
         )
         self.assertEqual(proposal["status"], "reverted")
+
+
+class AiCostScopeTests(unittest.TestCase):
+    @staticmethod
+    def _record_run(
+        database: Database,
+        run_id: str,
+        *,
+        provider_id: str,
+        model: str,
+        usage: dict[str, int],
+        legs: list[dict[str, object]],
+        route_fallbacks: list[dict[str, object]] | None = None,
+        business_fallback: dict[str, object] | None = None,
+        created_at: str = "2026-08-26T01:00:00+00:00",
+    ) -> None:
+        database.create_ai_run(
+            run_id,
+            kind="recommendation",
+            model=model,
+            provider_id=provider_id,
+            profile_id="recommendation",
+            requested_model=model,
+            created_at=created_at,
+        )
+        governance = {
+            "version": 1,
+            "profile_id": "recommendation",
+            "outcome": "complete",
+            "actual": {
+                "provider_id": str(legs[-1]["provider_id"]),
+                "model": str(legs[-1]["resolved_model"]),
+            },
+            "fallbacks": list(route_fallbacks or []),
+            "legs": legs,
+        }
+        database.update_ai_run(
+            run_id,
+            status="complete",
+            usage=usage,
+            resolved_provider_id=str(legs[-1]["provider_id"]),
+            resolved_model=str(legs[-1]["resolved_model"]),
+            governance=governance,
+            fallback=business_fallback,
+            completed_at=created_at,
+        )
+
+    @staticmethod
+    def _leg(
+        provider_id: str,
+        model: str,
+        usage: dict[str, int],
+        ordinal: int,
+    ) -> dict[str, object]:
+        return {
+            "ordinal": ordinal,
+            "route_kind": "primary" if ordinal == 0 else "fallback",
+            "provider_id": provider_id,
+            "model": model,
+            "resolved_model": model,
+            "reasoning_strength": "auto",
+            "status": "complete",
+            "usage": usage,
+        }
+
+    def test_deepseek_cost_is_leg_scoped_while_tokens_cover_all_models(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Database(Path(temporary) / "state.db") as database:
+                deepseek_usage = {
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "total_tokens": 110,
+                    "cache_read_tokens": 20,
+                    "cache_miss_tokens": 80,
+                }
+                relay_usage = {
+                    "input_tokens": 200,
+                    "output_tokens": 20,
+                    "total_tokens": 220,
+                }
+                self._record_run(
+                    database,
+                    "deepseek-only",
+                    provider_id="deepseek",
+                    model="deepseek-v4-flash",
+                    usage=deepseek_usage,
+                    legs=[self._leg("deepseek", "deepseek-v4-flash", deepseek_usage, 0)],
+                )
+                self._record_run(
+                    database,
+                    "relay-only",
+                    provider_id="relay",
+                    model="relay-model",
+                    usage=relay_usage,
+                    legs=[self._leg("relay", "relay-model", relay_usage, 0)],
+                )
+
+                mixed_one_usage = {
+                    "input_tokens": 300,
+                    "output_tokens": 30,
+                    "total_tokens": 330,
+                    "cache_read_tokens": 60,
+                }
+                self._record_run(
+                    database,
+                    "deepseek-to-relay",
+                    provider_id="deepseek",
+                    model="deepseek-v4-flash",
+                    usage=mixed_one_usage,
+                    legs=[
+                        self._leg(
+                            "deepseek",
+                            "deepseek-v4-flash",
+                            {**deepseek_usage, "input_tokens": 120, "cache_read_tokens": 30, "cache_miss_tokens": 90},
+                            0,
+                        ),
+                        self._leg("relay", "relay-model", relay_usage, 1),
+                    ],
+                )
+                mixed_two_usage = {
+                    "input_tokens": 400,
+                    "output_tokens": 40,
+                    "total_tokens": 440,
+                    "cache_read_tokens": 100,
+                }
+                self._record_run(
+                    database,
+                    "relay-to-deepseek",
+                    provider_id="relay",
+                    model="relay-model",
+                    usage=mixed_two_usage,
+                    legs=[
+                        self._leg("relay", "relay-model", relay_usage, 0),
+                        self._leg(
+                            "deepseek",
+                            "deepseek-v4-flash",
+                            {**deepseek_usage, "input_tokens": 140, "cache_read_tokens": 40, "cache_miss_tokens": 100},
+                            1,
+                        ),
+                    ],
+                )
+
+                audit = database.ai_cost_audit(days=30)
+                self.assertEqual(audit["deepseek_cost"]["runs"], 3)
+                self.assertEqual(audit["deepseek_cost"]["unknown_cost_runs"], 0)
+                self.assertGreater(audit["deepseek_cost"]["known_estimated_cny"], 0)
+                self.assertEqual(audit["deepseek_cost"]["currency"], "CNY")
+                self.assertEqual(audit["all_model_tokens"]["total_tokens_known"], 1100)
+                self.assertEqual(audit["all_model_tokens"]["unknown_runs"], 0)
+                self.assertEqual(audit["cache_metrics"]["eligible_input_tokens"], 800)
+                self.assertEqual(audit["cache_metrics"]["cache_read_tokens_known"], 180)
+                self.assertEqual(audit["cache_metrics"]["hit_rate_percent"], 22.5)
+                self.assertEqual(audit["cache_metrics"]["observed_runs"], 3)
+                self.assertEqual(audit["cache_metrics"]["unknown_runs"], 1)
+                self.assertEqual(audit["totals"]["provider_route_fallbacks"], 2)
+                self.assertEqual(audit["totals"]["route_fallbacks"], 2)
+                self.assertEqual(audit["totals"]["business_fallbacks"], 0)
+                recent = {row["id"]: row for row in audit["recent_runs"]}
+                self.assertEqual(
+                    recent["relay-only"]["deepseek_cost"]["status"], "out_of_scope"
+                )
+                self.assertEqual(
+                    recent["deepseek-to-relay"]["deepseek_cost"]["status"], "known"
+                )
+                spend = database.ai_cost_spend(now="2026-08-26T12:00:00+00:00")
+                self.assertEqual(spend["daily"]["provider_id"], "deepseek")
+                self.assertEqual(spend["daily"]["runs"], 3)
+                self.assertEqual(spend["daily"]["unknown_runs"], 0)
+                self.assertEqual(
+                    spend["daily"]["known_cny"],
+                    audit["deepseek_cost"]["known_estimated_cny"],
+                )
+
+    def test_provider_route_and_business_fallback_metrics_are_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Database(Path(temporary) / "state.db") as database:
+                failed_usage = {"provider_requests": 1}
+                relay_usage = {
+                    "provider_requests": 1,
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "total_tokens": 12,
+                }
+                primary = self._leg(
+                    "deepseek", "deepseek-v4-flash", failed_usage, 0
+                )
+                primary["status"] = "failed"
+                primary["error_code"] = "network_error"
+                fallback_leg = self._leg("relay", "relay-model", relay_usage, 1)
+                fallback_retry = self._leg("relay", "relay-model", relay_usage, 2)
+                route_event = {
+                    "from": {
+                        "provider_id": "deepseek",
+                        "model": "deepseek-v4-flash",
+                    },
+                    "to": {"provider_id": "relay", "model": "relay-model"},
+                    "error_code": "network_error",
+                }
+                self._record_run(
+                    database,
+                    "provider-route-fallback",
+                    provider_id="deepseek",
+                    model="deepseek-v4-flash",
+                    usage=relay_usage,
+                    legs=[primary, fallback_leg, fallback_retry],
+                    route_fallbacks=[route_event],
+                    # The storage snapshot mirrors provider routing here; it must
+                    # not also become a business fallback.
+                    business_fallback={
+                        "version": 1,
+                        "outcome": "complete",
+                        "events": [route_event],
+                    },
+                )
+                self._record_run(
+                    database,
+                    "business-fallback",
+                    provider_id="deepseek",
+                    model="deepseek-v4-flash",
+                    usage=failed_usage,
+                    legs=[primary],
+                    business_fallback={
+                        "version": 1,
+                        "outcome": "deterministic_fallback",
+                        "events": [
+                            {
+                                "error_code": "invalid_ai_ranking",
+                                "target": "deterministic_ranking",
+                            }
+                        ],
+                    },
+                )
+
+                audit = database.ai_cost_audit(days=30)
+                self.assertEqual(audit["totals"]["provider_route_fallbacks"], 1)
+                self.assertEqual(audit["totals"]["route_fallbacks"], 1)
+                self.assertEqual(audit["totals"]["business_fallbacks"], 1)
+                recent = {row["id"]: row for row in audit["recent_runs"]}
+                self.assertEqual(recent["provider-route-fallback"]["fallback_count"], 1)
+                self.assertEqual(
+                    recent["provider-route-fallback"]["provider_route_fallback_count"],
+                    1,
+                )
+                self.assertEqual(
+                    recent["provider-route-fallback"]["business_fallback_count"], 0
+                )
+                self.assertEqual(recent["business-fallback"]["fallback_count"], 0)
+                self.assertEqual(
+                    recent["business-fallback"]["provider_route_fallback_count"], 0
+                )
+                self.assertEqual(
+                    recent["business-fallback"]["business_fallback_count"], 1
+                )
+
+    def test_cache_rate_distinguishes_zero_denominator_missing_and_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Database(Path(temporary) / "state.db") as database:
+                for run_id, usage in (
+                    (
+                        "zero",
+                        {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "total_tokens": 0,
+                            "cache_read_tokens": 0,
+                        },
+                    ),
+                    (
+                        "invalid",
+                        {
+                            "input_tokens": 10,
+                            "output_tokens": 1,
+                            "total_tokens": 11,
+                            "cache_read_tokens": 11,
+                        },
+                    ),
+                    ("missing", {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6}),
+                ):
+                    self._record_run(
+                        database,
+                        run_id,
+                        provider_id="relay",
+                        model="relay-model",
+                        usage=usage,
+                        legs=[self._leg("relay", "relay-model", usage, 0)],
+                    )
+                metrics = database.ai_cost_audit(days=30)["cache_metrics"]
+                self.assertIsNone(metrics["hit_rate_percent"])
+                self.assertEqual(metrics["observed_runs"], 1)
+                self.assertEqual(metrics["invalid_runs"], 1)
+                self.assertEqual(metrics["unknown_runs"], 1)
 
 
 if __name__ == "__main__":

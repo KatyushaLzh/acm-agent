@@ -5,6 +5,20 @@ import {
 } from "./core.js";
 import { postEventStream } from "./sse.js";
 import { renderRecommendations } from "./view_today.js";
+import {
+  PROFILE_LABELS, aiRequestSelection, connectionRows, ensureSelectionVerified,
+  modelFor, modelOptionValue,
+  modelRows, modelVerifiedForProfile, parseModelOption, profileSelection,
+  renderAiAuditCards, renderAiModelPickers, selectableStrengths,
+} from "./ai_model_controls.js";
+
+const POLICY_PROFILES = ["recommendation", "plan_organize", "plan_generate", "coaching", "patch", "summary"];
+let savedAiPolicy = null;
+let aiPolicyDirty = false;
+
+function aiOutcome(payload) {
+  return asObject(payload?.ai?.outcome || payload?.outcome);
+}
 
 function knowledgeSchemaSelection() {
   const selected = $("#knowledge-schema-mode").value;
@@ -187,6 +201,10 @@ function renderSafeKnowledgeMarkdown(container, markdown) {
 
 function knowledgeWarningItems(proposal) {
   const warnings = Array.isArray(proposal.warnings) ? [...proposal.warnings] : [];
+  const confidence = Number(proposal.confidence ?? proposal.entry?.confidence ?? 1);
+  if (Number.isFinite(confidence) && confidence < 0.75 && !warnings.includes("模型置信度低，需人工核对")) {
+    warnings.push("模型置信度低，需人工核对");
+  }
   const duplicate = proposal.duplicate_diagnosis;
   const duplicateKind = String(duplicate?.kind || duplicate?.status || "none").toLowerCase();
   if (duplicateKind === "exact_source") warnings.push(duplicate?.message || "检测到题号完全相同的条目，已由 AI 合并内容。");
@@ -222,14 +240,14 @@ function renderKnowledgeProposal(proposal, epoch = state.knowledgeEpoch) {
   ].filter(Boolean).map(item => `<span class="tag">${escapeHtml(item)}</span>`).join("");
   const warnings = knowledgeWarningItems(proposal);
   const warningBox = $("#knowledge-warnings");
-  const warningIsBlocking = Boolean(proposal.can_apply === false || proposal.apply_allowed === false || proposal.apply_blocked || proposal.apply_blocked_reason);
-  warningBox.className = `result-box ${warnings.length ? (warningIsBlocking ? "error" : "") : "hidden"}`;
+  const warningIsBlocking = status === "preview" && Boolean(proposal.can_apply === false || proposal.apply_allowed === false || proposal.apply_blocked || proposal.apply_blocked_reason);
+  warningBox.className = `result-box ${warnings.length ? (warningIsBlocking ? "error" : "warning") : "hidden"}`;
   warningBox.textContent = warnings.join("；");
   const markdown = knowledgeMarkdown(proposal);
   $("#knowledge-markdown-editor").value = markdown;
   const preview = $("#knowledge-rendered-preview");
   renderSafeKnowledgeMarkdown(preview, markdown);
-  const blocked = Boolean(proposal.can_apply === false || proposal.apply_allowed === false || proposal.apply_blocked || proposal.apply_blocked_reason || Number(proposal.confidence ?? proposal.entry?.confidence ?? 1) < 0.75);
+  const blocked = Boolean(proposal.can_apply === false || proposal.apply_allowed === false || proposal.apply_blocked || proposal.apply_blocked_reason);
   $("#knowledge-refresh").disabled = status !== "preview";
   $("#knowledge-apply").disabled = status !== "preview" || blocked;
   $("#knowledge-revert").classList.toggle("hidden", status !== "applied");
@@ -248,7 +266,7 @@ async function waitForKnowledgeJob(jobId, epoch, label) {
 }
 
 async function previewKnowledgeSummary(attemptId, epoch) {
-  if (!state.aiStatus?.api_key_detected) throw new Error("尚未配置 DeepSeek API Key；session 已结束，但未生成总结");
+  if (!profileCredentialReady(state.aiStatus, "summary")) throw new Error("Summary TaskProfile 的 Provider 凭据不可用；session 已结束，但未生成总结");
   const targetId = $("#knowledge-target").value;
   if (!targetId) throw new Error("请先选择或保存一个 Markdown 目标");
   const selection = knowledgeSchemaSelection();
@@ -258,14 +276,27 @@ async function previewKnowledgeSummary(attemptId, epoch) {
     schema_mode: selection.schema_mode,
     preset: selection.preset,
     schema: selection.schema,
+    ...aiRequestSelection("summary"),
   } });
   const jobId = jobIdOf(started);
   const result = jobId
     ? await waitForKnowledgeJob(jobId, epoch, "正在生成 Markdown 总结预览…")
     : started;
   if (result && epoch === state.knowledgeEpoch) {
-    renderKnowledgeProposal(knowledgeProposalPayload(result), epoch);
-    toast("总结预览已生成", "目标文件尚未修改，请检查可编辑内容与安全预览。", "success");
+    const proposal = result.proposal && typeof result.proposal === "object" ? result.proposal : null;
+    const outcome = aiOutcome(result);
+    if (!proposal) {
+      const message = result.error?.message || "模型未能生成通过业务校验的总结；目标文件未修改。";
+      toast("总结当前不可用", message, "error");
+      return;
+    }
+    renderKnowledgeProposal(proposal, epoch);
+    const partial = outcome.business_outcome === "partial" || outcome.apply_ready === false;
+    toast(
+      partial ? "总结预览不可应用" : "总结预览已生成",
+      partial ? "业务门禁未通过，只供检查。" : "目标文件尚未修改，请检查可编辑内容与安全预览。",
+      partial ? "error" : "success",
+    );
   }
 }
 
@@ -333,8 +364,8 @@ async function requestAiRecommendations(button, aiMode = "gap_fill") {
   const modeLabel = aiMode === "specialization" ? "专项强化" : "查漏补缺";
   setBusy(button, true, `${modeLabel}中…`);
   try {
-    if (!state.aiStatus?.api_key_detected) {
-      toast("尚未启用 DeepSeek", "请先在设置页输入 API Key 并保存。", "error");
+    if (!profileCredentialReady(state.aiStatus, "recommendation")) {
+      toast("推荐 Provider 不可用", "请先为 recommendation TaskProfile 配置可用凭据。", "error");
       navigate("settings");
       return;
     }
@@ -345,6 +376,7 @@ async function requestAiRecommendations(button, aiMode = "gap_fill") {
       source_mode: form.elements.source_mode.value,
       plan_ids: planIds.length ? planIds : null,
       ai_mode: aiMode,
+      ...aiRequestSelection("recommendation"),
     }, signal: controller.signal });
     const result = await waitForJob(
       jobIdOf(started),
@@ -365,98 +397,496 @@ async function requestAiRecommendations(button, aiMode = "gap_fill") {
   }
 }
 
+function renderSecureStoreStatus(status) {
+  const container = $("#ai-secure-store-status");
+  const title = $("#ai-secure-store-title");
+  const message = $("#ai-secure-store-message");
+  const code = $("#ai-secure-store-code");
+  const secureStore = asObject(status?.secure_store);
+  const backend = String(secureStore.backend || "unavailable");
+  const backendLabels = {
+    dpapi: "Windows DPAPI",
+    keychain: "macOS Keychain",
+    secret_service: "Linux Secret Service",
+    unavailable: "系统安全存储",
+  };
+  const label = backendLabels[backend] || "系统安全存储";
+  const reported = Object.prototype.hasOwnProperty.call(secureStore, "available") || Boolean(secureStore.backend);
+  const available = secureStore.available === true;
+  container.className = `secure-store-status ${reported ? (available ? "good" : "warn") : "pending"}`;
+  title.textContent = reported ? `${label}${available ? "可用" : "不可用"}` : "正在检测系统安全存储";
+  const diagnostic = typeof secureStore.message === "string" ? secureStore.message.trim() : "";
+  if (diagnostic) {
+    message.textContent = diagnostic;
+  } else if (available) {
+    message.textContent = "新保存的 API Key 会写入当前用户的系统安全存储，不会进入配置、SQLite 或浏览器存储。";
+  } else if (backend === "secret_service") {
+    message.textContent = "请确认当前桌面会话的 D-Bus 与 Secret Service 已启动并解锁；Dashboard 不会自动启动服务或代替你解锁。";
+  } else if (reported) {
+    message.textContent = "Dashboard 可以继续运行，但保存 API Key 会明确失败；可临时使用下方环境变量回退。";
+  } else {
+    message.textContent = "Dashboard 仍可在安全存储不可用时启动，但不会把 API Key 写入明文或弱加密文件。";
+  }
+  const errorCode = typeof secureStore.error_code === "string" ? secureStore.error_code.trim() : "";
+  code.textContent = errorCode;
+  code.classList.toggle("hidden", !errorCode);
+}
+
 async function loadAiStatus() {
   try {
     const status = await api("/api/ai/status");
     state.aiStatus = status;
-    const sourceLabels = {
-      secure_store: "已安全保存",
-      environment: "环境变量",
-      injected: "测试凭据",
-      none: "未配置",
-    };
-    const sourceLabel = sourceLabels[status.credential_source] || "状态未知";
+    state.aiSelections = {};
+    if (state.aiConversationId && state.aiConversationSelection) {
+      state.aiSelections.coaching = state.aiConversationSelection;
+    }
+    renderSecureStoreStatus(status);
+    const connections = connectionRows(status);
+    const readyConnections = connections.filter(item => item.enabled !== false && item.credential?.detected && !item.credential?.error);
     const badge = $("#ai-key-state");
-    badge.className = `badge ${status.api_key_detected ? "good" : "warn"}`;
-    badge.textContent = status.api_key_detected ? sourceLabel : "未配置";
-    $("#ai-chat-state").className = `badge ${status.api_key_detected ? "good" : "warn"}`;
-    $("#ai-chat-state").textContent = status.api_key_detected ? "可用" : "未配置";
+    badge.className = `badge ${readyConnections.length ? "good" : "warn"}`;
+    badge.textContent = readyConnections.length ? `${readyConnections.length} 个可用` : "暂无可用连接";
+    const coachingReady = profileCredentialReady(status, "coaching");
+    const summaryReady = profileCredentialReady(status, "summary");
+    const canConfigureSummary = readyConnections.length > 0;
+    $("#ai-chat-state").className = `badge ${coachingReady ? "good" : "warn"}`;
+    $("#ai-chat-state").textContent = coachingReady ? "可用" : "未配置";
     const knowledgeToggle = $("#knowledge-enabled");
-    knowledgeToggle.disabled = !status.api_key_detected;
-    knowledgeToggle.title = status.api_key_detected ? "" : "请先在设置页保存并启用 DeepSeek API Key";
-    $("#knowledge-key-hint").textContent = status.api_key_detected
-      ? "仅在勾选后调用 DeepSeek；关闭 session 本身不会产生 AI 费用。"
-      : "需要先在设置页保存并启用 DeepSeek API Key。";
-    if (!status.api_key_detected) {
+    knowledgeToggle.disabled = !canConfigureSummary;
+    knowledgeToggle.title = canConfigureSummary ? "" : "请先在设置页添加可用模型连接";
+    $("#knowledge-key-hint").textContent = summaryReady
+      ? "仅在勾选后调用 Summary TaskProfile；关闭 session 本身不会产生 AI 费用。"
+      : canConfigureSummary
+        ? "勾选后可选择并验证 Markdown 总结模型；关闭 session 本身不会产生 AI 费用。"
+        : "需要先在设置页添加连接并选择可用模型。";
+    if (!canConfigureSummary) {
       knowledgeToggle.checked = false;
       $("#knowledge-options").classList.add("hidden");
     }
-    const detail = $("#ai-key-detail");
-    detail.className = `credential-detail${status.credential_error ? " error" : ""}`;
-    detail.textContent = status.credential_error
-      ? `已保存凭据无法加载：${status.credential_error}`
-      : status.credential_source === "secure_store"
-        ? "已使用 Windows DPAPI 加密保存；重启本地服务后仍会自动启用。"
-        : status.credential_source === "environment"
-          ? "当前使用 DEEPSEEK_API_KEY 环境变量；可在上方输入新 Key 并改用加密存储。"
-          : status.api_key_detected
-            ? "当前测试服务已注入凭据。"
-            : "尚未配置。输入 Key 后点击“保存并启用”。";
-    const form = $("#ai-settings-form");
-    form.elements.recommendation_model.value = status.settings?.recommendation_model || "deepseek-v4-flash";
-    form.elements.coaching_model.value = status.settings?.coaching_model || "deepseek-v4-flash";
-    form.elements.summary_model.value = status.settings?.summary_model || status.settings?.coaching_model || "deepseek-v4-flash";
-    form.elements.coaching_thinking.checked = Boolean(status.settings?.coaching_thinking);
-    form.elements.reasoning_effort.value = status.settings?.reasoning_effort || "high";
-    form.elements.summary_thinking.checked = Boolean(status.settings?.summary_thinking);
-    form.elements.summary_reasoning_effort.value = status.settings?.summary_reasoning_effort || status.settings?.reasoning_effort || "high";
+    renderConnectionManagement(status);
+    renderAiModelPickers(status);
+    renderAiGovernance(status.governance);
   } catch (error) { toast("AI 状态读取失败", error.message, "error"); }
 }
 
-async function saveAiCredential(form) {
-  const button = $("button[type=submit]", form);
-  const input = form.elements.api_key;
-  const key = input.value;
-  if (!key.trim()) return toast("无法启用", "请输入 DeepSeek API Key。", "error");
-  setBusy(button, true, "正在安全保存…");
+function clonePolicy(policy) {
+  return JSON.parse(JSON.stringify(policy));
+}
+
+function fallbackModelOptions(profileId, selected) {
+  const options = ['<option value="">不启用</option>'];
+  let selectedFound = false;
+  for (const connection of connectionRows()) {
+    for (const model of modelRows(connection)) {
+      const value = modelOptionValue(connection.id, model.id);
+      const usable = connection.enabled !== false && model.available !== false
+        && connection.credential?.detected && !connection.credential?.error
+        && modelVerifiedForProfile(model, profileId, "auto");
+      const isSelected = value === selected;
+      selectedFound ||= isSelected;
+      options.push(`<option value="${escapeHtml(value)}"${isSelected ? " selected" : ""}${usable ? "" : " disabled"}>${escapeHtml(`${connection.display_name || connection.id} / ${model.id}${usable ? "" : "（不可用）"}`)}</option>`);
+    }
+  }
+  if (selected && !selectedFound) {
+    const ref = parseModelOption(selected);
+    options.push(`<option value="${escapeHtml(selected)}" selected>${escapeHtml(`${ref.provider_id} / ${ref.model}（已失效）`)}</option>`);
+  }
+  return options.join("");
+}
+
+function fallbackStrengthOptions(profileId, modelValue, selected = "auto") {
+  const ref = parseModelOption(modelValue);
+  const connection = connectionRows().find(item => String(item.id) === ref.provider_id);
+  const model = modelFor({ model_ref: ref });
+  const selectable = selectableStrengths(model, connection);
+  return Object.entries({ auto: "Provider 默认", off: "关闭", low: "低", medium: "中", high: "高" }).map(([value, label]) => {
+    const disabled = !modelValue || !selectable.has(value);
+    return `<option value="${value}"${value === selected ? " selected" : ""}${disabled ? " disabled" : ""}>${label}${disabled && modelValue ? "（不支持）" : ""}</option>`;
+  }).join("");
+}
+
+function budgetInput(profileId, name, label, explanation, value, { integer = true, min = 1, step = 1 } = {}) {
+  return `<label>${label}<input name="${profileId}_${name}" data-budget="${name}" type="number" min="${min}" step="${step}" value="${escapeHtml(value)}" inputmode="${integer ? "numeric" : "decimal"}" required><small>${explanation}</small></label>`;
+}
+
+function fallbackEditor(profileId, index, route = {}) {
+  const item = asObject(route);
+  const modelValue = item.provider_id && item.model ? modelOptionValue(item.provider_id, item.model) : "";
+  const ref = parseModelOption(modelValue);
+  const connection = connectionRows().find(candidate => String(candidate.id) === ref.provider_id);
+  const model = modelFor({ model_ref: ref });
+  const valid = !modelValue || (connection && connection.enabled !== false && connection.credential?.detected
+    && !connection.credential?.error && model?.available !== false
+    && modelVerifiedForProfile(model, profileId, item.reasoning_strength || "auto"));
+  return `<div class="fallback-route-editor${valid ? "" : " fallback-invalid"}" data-fallback-slot="${index}">
+    <span>备用 ${index + 1}</span>
+    <select data-fallback-model aria-label="${escapeHtml(PROFILE_LABELS[profileId])}备用模型 ${index + 1}">${fallbackModelOptions(profileId, modelValue)}</select>
+    <select data-fallback-strength aria-label="${escapeHtml(PROFILE_LABELS[profileId])}备用推理强度 ${index + 1}"${modelValue ? "" : " disabled"}>${fallbackStrengthOptions(profileId, modelValue, item.reasoning_strength || "auto")}</select>
+    <button class="button secondary fallback-remove" type="button" data-fallback-remove>删除</button>
+    ${valid ? "" : "<small class=\"fallback-invalid-note\">历史路由已失效，请删除或替换后再保存。</small>"}
+  </div>`;
+}
+
+function fallbackEditors(profileId, routes) {
+  if (profileId === "coaching") {
+    return '<div class="fallback-disabled"><span class="badge neutral">已禁用</span><small>会话路由固定，不能跨模型回退。</small><select disabled aria-label="Coaching fallback 已禁用"><option>不允许配置</option></select></div>';
+  }
+  const items = (Array.isArray(routes) ? routes : []).slice(0, 3);
+  return `${items.map((route, index) => fallbackEditor(profileId, index, route)).join("")}
+    <button class="button secondary fallback-add" type="button" data-fallback-add${items.length >= 3 ? " disabled" : ""}>添加备用路由</button>`;
+}
+
+function renderAiPolicyEditor(policy, { force = false } = {}) {
+  if (aiPolicyDirty && !force) return;
+  const normalized = clonePolicy(policy);
+  savedAiPolicy = normalized;
+  aiPolicyDirty = false;
+  const form = $("#ai-policy-form");
+  const limits = asObject(normalized.hard_limits);
+  form.elements.daily_cny.value = limits.daily_cny ?? "";
+  form.elements.monthly_cny.value = limits.monthly_cny ?? "";
+  const profiles = asObject(state.aiStatus?.profiles);
+  const rows = POLICY_PROFILES.map(profileId => {
+    const profile = asObject(profiles[profileId]);
+    const budget = asObject(asObject(normalized.budgets)[profileId]);
+    const fallbacks = Array.isArray(asObject(normalized.fallbacks)[profileId]) ? normalized.fallbacks[profileId] : [];
+    const provider = profile.provider_id || "?";
+    const model = profile.model || "?";
+    const strength = profile.reasoning_strength || "auto";
+    return `<section class="governance-row policy-profile-row" data-policy-profile="${profileId}">
+      <div class="policy-profile-summary">
+        <div data-label="任务" class="policy-task"><span class="policy-field-label">任务</span><strong>${escapeHtml(PROFILE_LABELS[profileId] || profileId)}</strong><small>TaskProfile · ${escapeHtml(profileId)}</small></div>
+        <div data-label="主路由" class="policy-primary-route"><span class="policy-field-label">主路由</span><strong>${escapeHtml(model)}</strong><small>${escapeHtml(provider)}</small><span class="badge neutral">推理强度 · ${escapeHtml(strength)}</span></div>
+        <div data-label="能力" class="policy-capability"><span class="policy-field-label">能力</span><span class="badge ${profile.ready ? "good" : "warn"}">${profile.ready ? "已验证" : "不可用"}</span><small>${profile.ready ? "所需能力与推理证据完整" : escapeHtml(profile.error || "路由能力尚未满足")}</small></div>
+        <div data-label="模型路由回退" class="policy-fallback-grid"><span class="policy-field-label">模型路由回退</span>${fallbackEditors(profileId, fallbacks)}</div>
+      </div>
+      <div data-label="预算" class="policy-budget-section">
+        <span class="policy-field-label">预算</span>
+        <div class="policy-budget-grid">
+          ${budgetInput(profileId, "max_requests", "最大请求数", "包含 transport retry、JSON repair 和 fallback。", budget.max_requests)}
+          ${budgetInput(profileId, "max_retries", "最大重试次数", "仅 transport retry，必须小于最大请求数。", budget.max_retries, { min: 0 })}
+          ${budgetInput(profileId, "request_timeout_seconds", "任务超时（秒）", "整个任务跨重试和 fallback 共享的总时限。", budget.request_timeout_seconds, { integer: false, min: 0.1, step: 0.1 })}
+          ${budgetInput(profileId, "max_output_tokens", "最大输出 Token", "单次 Provider 响应的输出上限。", budget.max_output_tokens)}
+          ${budgetInput(profileId, "max_total_tokens", "最大总 Token", "整个任务跨重试和 fallback 的累计上限。", budget.max_total_tokens)}
+        </div>
+      </div>
+    </section>`;
+  });
+  const table = $("#ai-route-policy-table");
+  table.className = "governance-table";
+  table.innerHTML = rows.join("");
+  updateAiPolicyDirtyState();
+}
+
+function updateAiPolicyDirtyState() {
+  const status = $("#ai-policy-dirty-state");
+  status.className = `subtle${aiPolicyDirty ? " policy-dirty" : ""}`;
+  status.textContent = aiPolicyDirty ? "有未保存修改；刷新或关闭页面前请先保存或放弃。" : "策略与已保存版本一致。";
+  $("#ai-policy-save").disabled = !aiPolicyDirty;
+  $("#ai-policy-reset").disabled = !aiPolicyDirty;
+}
+
+function markAiPolicyDirty() {
+  aiPolicyDirty = true;
+  updateAiPolicyDirtyState();
+}
+
+function resetAiPolicyDraft() {
+  if (!savedAiPolicy) return;
+  renderAiPolicyEditor(savedAiPolicy, { force: true });
+  toast("已放弃未保存修改", "当前策略已恢复为服务端保存版本。");
+}
+
+function bindAiPolicyDraftEvents() {
+  const form = $("#ai-policy-form");
+  form.addEventListener("click", event => {
+    const add = event.target.closest("[data-fallback-add]");
+    if (add) {
+      const grid = add.closest(".policy-fallback-grid");
+      const row = add.closest("[data-policy-profile]");
+      const count = $$("[data-fallback-slot]", grid).length;
+      if (count < 3) add.insertAdjacentHTML("beforebegin", fallbackEditor(row.dataset.policyProfile, count));
+      add.disabled = count + 1 >= 3;
+      markAiPolicyDirty();
+      return;
+    }
+    const remove = event.target.closest("[data-fallback-remove]");
+    if (remove) {
+      const grid = remove.closest(".policy-fallback-grid");
+      const profileId = remove.closest("[data-policy-profile]").dataset.policyProfile;
+      remove.closest("[data-fallback-slot]").remove();
+      const routes = $$("[data-fallback-slot]", grid).map(editor => {
+        const ref = parseModelOption($("[data-fallback-model]", editor).value);
+        return { ...ref, reasoning_strength: $("[data-fallback-strength]", editor).value || "auto" };
+      });
+      grid.innerHTML = fallbackEditors(profileId, routes.filter(route => route.provider_id && route.model));
+      markAiPolicyDirty();
+    }
+  });
+  form.addEventListener("input", event => {
+    event.target.setCustomValidity?.("");
+    markAiPolicyDirty();
+  });
+  form.addEventListener("change", event => {
+    if (event.target.matches("[data-fallback-model]")) {
+      const editor = event.target.closest("[data-fallback-slot]");
+      const strength = $("[data-fallback-strength]", editor);
+      strength.innerHTML = fallbackStrengthOptions(editor.closest("[data-policy-profile]").dataset.policyProfile, event.target.value, "auto");
+      strength.disabled = !event.target.value;
+      editor.classList.remove("fallback-invalid");
+      $(".fallback-invalid-note", editor)?.remove();
+    }
+    markAiPolicyDirty();
+  });
+  window.addEventListener("beforeunload", event => {
+    if (!aiPolicyDirty) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
+}
+
+function invalidPolicyField(input, message) {
+  input.setCustomValidity(message);
+  input.reportValidity();
+  input.focus();
+  throw new Error(message);
+}
+
+function readPolicyNumber(input, label, { integer = true, allowBlank = false, min = 0 } = {}) {
+  const raw = input.value.trim();
+  if (!raw && allowBlank) return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= min || (integer && !Number.isInteger(value))) {
+    return invalidPolicyField(input, `${label}必须是${integer ? "整数" : "数字"}且大于 ${min}`);
+  }
+  return value;
+}
+
+function readAiPolicyDraft() {
+  const form = $("#ai-policy-form");
+  $$('[name], select', form).forEach(input => input.setCustomValidity?.(""));
+  const policy = { budgets: {}, fallbacks: {}, hard_limits: {} };
+  policy.hard_limits.daily_cny = readPolicyNumber(form.elements.daily_cny, "每日上限", { integer: false, allowBlank: true, min: 0 });
+  policy.hard_limits.monthly_cny = readPolicyNumber(form.elements.monthly_cny, "每月上限", { integer: false, allowBlank: true, min: 0 });
+  if (policy.hard_limits.daily_cny != null && policy.hard_limits.monthly_cny != null && policy.hard_limits.daily_cny > policy.hard_limits.monthly_cny) {
+    invalidPolicyField(form.elements.monthly_cny, "每月上限不能小于每日上限");
+  }
+  for (const profileId of POLICY_PROFILES) {
+    const row = $(`[data-policy-profile="${profileId}"]`, form);
+    const value = name => $(`[data-budget="${name}"]`, row);
+    const savedBudget = asObject(asObject(savedAiPolicy?.budgets)[profileId]);
+    const budget = {
+      max_output_tokens: readPolicyNumber(value("max_output_tokens"), `${PROFILE_LABELS[profileId]}最大输出`),
+      request_timeout_seconds: readPolicyNumber(value("request_timeout_seconds"), `${PROFILE_LABELS[profileId]}单请求秒数`, { integer: false }),
+      max_retries: readPolicyNumber(value("max_retries"), `${PROFILE_LABELS[profileId]}最多重试`, { min: -1 }),
+      max_validation_repairs: Number.isInteger(savedBudget.max_validation_repairs)
+        ? savedBudget.max_validation_repairs : 0,
+      max_requests: readPolicyNumber(value("max_requests"), `${PROFILE_LABELS[profileId]}最多请求`),
+      max_total_tokens: readPolicyNumber(value("max_total_tokens"), `${PROFILE_LABELS[profileId]}总 token`),
+    };
+    if (budget.max_retries >= budget.max_requests) invalidPolicyField(value("max_retries"), `${PROFILE_LABELS[profileId]}最多重试必须小于最多请求`);
+    policy.budgets[profileId] = budget;
+    const routes = [];
+    for (const editor of $$('[data-fallback-slot]', row)) {
+      const modelSelect = $("[data-fallback-model]", editor);
+      if (!modelSelect.value) continue;
+      const modelRef = parseModelOption(modelSelect.value);
+      const strengthSelect = $("[data-fallback-strength]", editor);
+      const route = { ...modelRef, reasoning_strength: strengthSelect.value || "auto" };
+      const connection = connectionRows().find(item => String(item.id) === modelRef.provider_id);
+      const model = modelFor({ model_ref: modelRef });
+      const usable = connection && connection.enabled !== false && connection.credential?.detected
+        && !connection.credential?.error && model?.available !== false;
+      if (!usable || !model || !modelVerifiedForProfile(model, profileId, route.reasoning_strength)) {
+        invalidPolicyField(modelSelect, `${PROFILE_LABELS[profileId]}备用模型尚未通过所需能力与推理强度验证`);
+      }
+      routes.push(route);
+    }
+    if (profileId === "coaching" && routes.length) throw new Error("Coaching 禁止配置跨模型回退");
+    if (routes.length > 3) throw new Error(`${PROFILE_LABELS[profileId]}最多只能配置 3 条备用路由`);
+    const primary = profileSelection(profileId);
+    const identities = new Set([`${primary.model_ref.provider_id}\0${primary.model_ref.model}\0${primary.reasoning_strength}`]);
+    for (const route of routes) {
+      const identity = `${route.provider_id}\0${route.model}\0${route.reasoning_strength}`;
+      if (identities.has(identity)) throw new Error(`${PROFILE_LABELS[profileId]}备用路由不能重复主路由或前序备用路由`);
+      identities.add(identity);
+    }
+    policy.fallbacks[profileId] = routes;
+  }
+  return policy;
+}
+
+function renderAiGovernance(governance, options = {}) {
+  const data = asObject(governance);
+  const catalog = asObject(data.price_catalog);
+  const policy = asObject(data.policy);
+  $("#ai-price-version").textContent = catalog.version || "价格未知";
+  renderAiAuditCards($("#ai-governance-summary"), data.audit, "近 30 天");
+  if (policy.budgets && policy.fallbacks && policy.hard_limits) renderAiPolicyEditor(policy, { force: options.forcePolicy });
+}
+
+async function saveAiPolicy(button) {
+  const policy = readAiPolicyDraft();
+  setBusy(button, true, "校验中…");
   try {
-    state.aiStatus = await api("/api/ai/credential", { body: { api_key: key } });
-    toast("DeepSeek 已启用", "密钥已由 Windows DPAPI 加密保存，服务重启后无需重新输入。");
+    const result = await api("/api/ai/policy", { body: { policy } });
+    aiPolicyDirty = false;
+    if (result.governance) renderAiGovernance(result.governance, { forcePolicy: true });
     await loadAiStatus();
-  } catch (error) { toast("API Key 保存失败", error.message, "error"); }
-  finally {
-    input.value = "";
+    toast("策略已保存", "六类预算、能力门禁与模型路由回退均已重新校验。");
+  } finally {
+    setBusy(button, false);
+    updateAiPolicyDirtyState();
+  }
+}
+
+async function repriceAiCosts(button) {
+  setBusy(button, true, "重算中…");
+  try {
+    await api("/api/ai/costs/reprice", { body: {} });
+    await loadAiStatus();
+    toast("DeepSeek 费用已重算", "已追加当前 DeepSeek 价格版本；全模型历史 token 未修改。");
+  } finally { setBusy(button, false); }
+}
+
+function profileCredentialReady(status, profileId) {
+  const profile = asObject(asObject(status?.profiles)[profileId]);
+  if (typeof profile.ready === "boolean") return profile.ready;
+  const provider = connectionRows(status).find(item => item.id === profile.provider_id);
+  return Boolean(provider?.enabled !== false && provider?.credential?.detected && !provider?.credential?.error);
+}
+
+function resetConnectionForm() {
+  const form = $("#ai-connection-form");
+  form.reset();
+  form.elements.connection_id.value = "";
+  form.elements.base_url.readOnly = false;
+  form.elements.base_url.title = "";
+  $("button[type=submit]", form).textContent = "添加连接";
+  $("#ai-connection-cancel").classList.add("hidden");
+}
+
+function connectionModels(connection) {
+  if (Array.isArray(connection?.models)) return connection.models;
+  return Object.entries(asObject(connection?.models)).map(([id, value]) => ({ id, ...asObject(value) }));
+}
+
+function renderConnectionManagement(status) {
+  const container = $("#ai-connection-list");
+  container.replaceChildren();
+  const connections = connectionRows(status);
+  if (!connections.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty-state compact";
+    empty.textContent = "暂无模型连接。填写上方三个字段即可自动发现模型。";
+    container.append(empty);
+    return;
+  }
+  for (const connection of connections) {
+    const card = document.createElement("article");
+    card.className = "ai-connection-card";
+    card.dataset.connectionId = connection.id;
+    const heading = document.createElement("div");
+    heading.className = "ai-connection-heading";
+    const identity = document.createElement("div");
+    identity.className = "ai-connection-identity";
+    const name = document.createElement("strong");
+    name.textContent = connection.display_name || connection.id;
+    name.title = name.textContent;
+    const url = document.createElement("span");
+    url.textContent = connection.base_url || "";
+    url.title = url.textContent;
+    identity.append(name, url);
+    const ready = connection.enabled !== false && connection.credential?.detected && !connection.credential?.error;
+    const badge = document.createElement("span");
+    badge.className = `badge ${ready ? "good" : "warn"}`;
+    badge.textContent = ready ? "凭据可用" : (connection.credential?.error ? "凭据错误" : "缺少凭据");
+    heading.append(identity, badge);
+    const models = document.createElement("div");
+    models.className = "ai-connection-models";
+    for (const model of connectionModels(connection)) {
+      const chip = document.createElement("span");
+      chip.className = `chip${model.available === false ? " unavailable" : ""}`;
+      chip.textContent = model.id;
+      chip.title = model.id;
+      models.append(chip);
+    }
+    if (!models.childElementCount) models.textContent = "尚未发现模型";
+    const actions = document.createElement("div");
+    actions.className = "card-actions ai-connection-actions";
+    for (const [action, label, className] of [
+      ["refresh", "刷新模型", "button secondary"],
+      ["edit", "编辑", "button secondary"],
+      ["delete", "删除", "button danger"],
+    ]) {
+      if (connection.builtin && action === "delete") continue;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = className;
+      button.dataset.connectionAction = action;
+      button.textContent = label;
+      actions.append(button);
+    }
+    card.append(heading, models, actions);
+    container.append(card);
+  }
+}
+
+async function saveConnection(form) {
+  const button = $("button[type=submit]", form);
+  setBusy(button, true, "保存中…");
+  const keyInput = form.elements.api_key;
+  try {
+    const connectionId = form.elements.connection_id.value.trim();
+    if (!connectionId && !keyInput.value.trim()) throw new Error("新建连接时 API Key 不能为空");
+    await api("/api/ai/connections", { body: {
+      ...(connectionId ? { connection_id: connectionId } : {}),
+      display_name: form.elements.display_name.value.trim(),
+      base_url: form.elements.base_url.value.trim(),
+      api_key: keyInput.value,
+    } });
+    toast(connectionId ? "连接已更新" : "连接已添加", "模型列表已从标准 /models 自动发现。");
+    resetConnectionForm();
+    await loadAiStatus();
+  } finally {
+    keyInput.value = "";
     setBusy(button, false);
   }
 }
 
-async function clearAiCredential(button) {
-  if (!window.confirm("确认删除已加密保存的 DeepSeek API Key？")) return;
-  setBusy(button, true, "正在清除…");
-  try {
-    state.aiStatus = await api("/api/ai/credential", { body: { clear: true } });
-    toast("已清除保存的 Key", state.aiStatus.api_key_detected ? "环境变量中的 Key 仍然可用。" : "DeepSeek 已停用。");
-    await loadAiStatus();
-  } catch (error) { toast("API Key 清除失败", error.message, "error"); }
-  finally { setBusy(button, false); }
+function editConnection(connectionId) {
+  const connection = connectionRows().find(item => String(item.id) === String(connectionId));
+  if (!connection) throw new Error("连接已不存在，请刷新页面");
+  const form = $("#ai-connection-form");
+  form.elements.connection_id.value = connection.id;
+  form.elements.display_name.value = connection.display_name || connection.id;
+  form.elements.base_url.value = connection.base_url || "";
+  form.elements.base_url.readOnly = Boolean(connection.builtin);
+  form.elements.base_url.title = connection.builtin ? "内置 DeepSeek 固定使用官方 Base URL" : "";
+  form.elements.api_key.value = "";
+  $("button[type=submit]", form).textContent = "保存更改";
+  $("#ai-connection-cancel").classList.remove("hidden");
+  form.elements.display_name.focus();
 }
 
-async function saveAiSettings(form) {
-  const button = $("button[type=submit]", form); setBusy(button, true);
+async function refreshConnection(connectionId, button) {
+  setBusy(button, true, "刷新中…");
   try {
-    state.aiStatus = await api("/api/ai/settings", { body: {
-      recommendation_model: form.elements.recommendation_model.value,
-      coaching_model: form.elements.coaching_model.value,
-      summary_model: form.elements.summary_model.value,
-      coaching_thinking: form.elements.coaching_thinking.checked,
-      reasoning_effort: form.elements.reasoning_effort.value,
-      summary_thinking: form.elements.summary_thinking.checked,
-      summary_reasoning_effort: form.elements.summary_reasoning_effort.value,
-    } });
-    toast("AI 设置已保存", "模型与 thinking 设置已更新。凭据由独立的 DPAPI 存储管理。");
+    await api("/api/ai/connections/refresh", { body: { connection_id: connectionId } });
+    toast("模型列表已刷新", "已消失的模型会保留为不可用，不会自动换模。");
     await loadAiStatus();
-  } catch (error) { toast("AI 设置失败", error.message, "error"); }
-  finally { setBusy(button, false); }
+  } finally { setBusy(button, false); }
+}
+
+async function deleteConnection(connectionId, button) {
+  if (!window.confirm("删除此模型连接？正在引用它的功能会阻止删除，并明确列出引用。")) return;
+  setBusy(button, true, "删除中…");
+  try {
+    await api("/api/ai/connections/delete", { body: { connection_id: connectionId } });
+    toast("连接已删除", connectionId, "success");
+    resetConnectionForm();
+    await loadAiStatus();
+  } finally { setBusy(button, false); }
 }
 
 function currentAiProblem() {
@@ -516,6 +946,7 @@ function switchAiProblem(problem, { force = false } = {}) {
   state.aiProblemKey = key;
   state.aiConversationId = "";
   state.aiConversationProblemKey = "";
+  state.aiConversationSelection = null;
   state.aiContextHash = null;
   state.aiPatchProposalId = "";
   state.aiPatchProblemKey = "";
@@ -639,13 +1070,20 @@ async function ensureAiConversation() {
   const problemKey = aiProblemKey(problem); const epoch = state.aiEpoch;
   if (state.aiConversationId && state.aiConversationProblemKey === problemKey) return state.aiConversationId;
   let data;
-  try { data = await api("/api/ai/conversations", { body: { problem } }); }
+  try { data = await api("/api/ai/conversations", { body: { problem, ...aiRequestSelection("coaching") } }); }
   catch (error) { if (!aiOperationIsCurrent(problemKey, epoch)) return null; throw error; }
   if (!aiOperationIsCurrent(problemKey, epoch)) return null;
   state.aiConversationId = data.conversation_id;
   state.aiConversationProblemKey = problemKey;
+  state.aiConversationSelection = data.model_ref?.provider_id && data.model_ref?.model
+    ? { model_ref: data.model_ref, reasoning_strength: data.reasoning_strength || "auto" }
+    : aiRequestSelection("coaching");
+  state.aiSelections.coaching = state.aiConversationSelection;
+  renderAiModelPickers(state.aiStatus);
   $("#ai-chat-state").className = "badge good";
-  $("#ai-chat-state").textContent = "已连接";
+  $("#ai-chat-state").textContent = data.model_ref?.provider_id && data.model_ref?.model
+    ? `已固定 ${data.model_ref.provider_id}/${data.resolved_model || data.model_ref.model}`
+    : "已连接";
   const root = $("#ai-chat-messages");
   root.className = (data.messages || []).length ? "ai-chat-messages" : "ai-chat-messages empty-state compact";
   root.innerHTML = (data.messages || []).length ? "" : "当前对话暂无消息。";
@@ -678,7 +1116,7 @@ async function streamAiChat(message, mode, hintLevel) {
   try {
     const response = await postEventStream(
       `/api/ai/conversations/${encodeURIComponent(conversationId)}/messages`,
-      { message, mode, hint_level: hintLevel },
+      { message, mode, hint_level: hintLevel, ...aiRequestSelection("coaching") },
       controller.signal,
     );
     if (!response.ok) {
@@ -694,8 +1132,20 @@ async function streamAiChat(message, mode, hintLevel) {
       }
       const item = parseSseBlock(block); if (!item) return;
       if (item.event === "delta") { assistant.textContent += item.data.content || ""; $("#ai-chat-messages").scrollTop = $("#ai-chat-messages").scrollHeight; }
-      else if (item.event === "done") completed = true;
-      else if (item.event === "error") throw new Error(item.data.message || "DeepSeek 流式请求失败");
+      else if (item.event === "done") {
+        completed = true;
+        const outcome = aiOutcome(item.data);
+        const business = outcome.business_outcome || item.data.status || "complete";
+        if (business === "partial") {
+          assistant.classList.add("interrupted");
+          $("#ai-chat-state").textContent = "部分结果";
+        } else if (business === "unavailable") {
+          assistant.classList.add("interrupted");
+          if (!assistant.textContent.trim()) assistant.textContent = item.data.message || "本次辅导当前不可用，请稍后重试。";
+          $("#ai-chat-state").textContent = "当前不可用";
+        }
+      }
+      else if (item.event === "error") throw new Error(item.data.message || "模型流式请求失败");
     };
     for (;;) {
       const { value, done } = await reader.read();
@@ -704,7 +1154,7 @@ async function streamAiChat(message, mode, hintLevel) {
       for (const block of blocks) consumeBlock(block);
       if (done && buffer.trim()) { consumeBlock(buffer); buffer = ""; }
       if (completed) { await reader.cancel(); break; }
-      if (done) throw new Error("DeepSeek 流式响应在完成事件前中断");
+      if (done) throw new Error("模型流式响应在完成事件前中断");
     }
   } catch (error) {
     assistant.classList.add("interrupted");
@@ -751,8 +1201,13 @@ async function previewAiPatch(button) {
   const problemKey = aiProblemKey(problem); const epoch = state.aiEpoch;
   setBusy(button, true, "生成中…");
   try {
+    const selection = aiRequestSelection("coaching");
+    if (!await ensureSelectionVerified("patch", selection)) return;
     const conversationId = state.aiConversationProblemKey === problemKey ? state.aiConversationId : null;
-    const started = await api("/api/jobs/ai/patches/preview", { body: { problem, instruction, conversation_id: conversationId || null } });
+    const started = await api("/api/jobs/ai/patches/preview", { body: {
+      problem, instruction, conversation_id: conversationId || null,
+      ...selection,
+    } });
     const data = await waitForJob(jobIdOf(started), "正在生成带错误注释的候选源码…");
     if (!aiOperationIsCurrent(problemKey, epoch)) return;
     if (typeof data.candidate_code !== "string" || !data.candidate_code.trim()) throw new Error("服务未返回修改后的 C++ 源码");
@@ -784,8 +1239,10 @@ export {
   loadKnowledgeTargets, registerKnowledgeTarget, removeKnowledgeTarget,
   renderSafeKnowledgeMarkdown, previewKnowledgeSummary, refreshKnowledgeProposal,
   applyKnowledgeProposal, revertKnowledgeProposal, cancelKnowledgeProposal,
-  requestAiRecommendations, loadAiStatus, saveAiCredential, clearAiCredential,
-  saveAiSettings, currentAiProblem, isAbortError, updateAiProblemMode,
+  requestAiRecommendations, loadAiStatus,
+  bindAiPolicyDraftEvents, resetAiPolicyDraft, saveAiPolicy, repriceAiCosts,
+  saveConnection, editConnection, refreshConnection, deleteConnection, resetConnectionForm,
+  currentAiProblem, isAbortError, updateAiProblemMode,
   switchAiProblem, loadAiProblemState, loadProblemContext, saveManualContext,
   restoreAutomaticContext, streamAiChat, clearAiConversation, previewAiPatch,
   runPatchAction,

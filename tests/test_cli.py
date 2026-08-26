@@ -32,6 +32,117 @@ class CliEndToEndTests(unittest.TestCase):
         shutil.copy2(REPO_ROOT / "training/data-structures-30d/plan.json", target / "plan.json")
         shutil.copy2(REPO_ROOT / "training/data-structures-30d/README.md", target / "README.md")
 
+    def test_stage4_cache_commands_and_force_refresh_dispatch(self) -> None:
+        class FakeService:
+            def __init__(self):
+                self.calls = []
+
+            def ai_cache_status(self):
+                self.calls.append(("status", {}))
+                return {"entries": 2, "bytes": 512, "metrics": {"local_exact_hit_rate": 0.5}}
+
+            def ai_cache_clear(self, **values):
+                self.calls.append(("clear", values))
+                return {"removed": 2}
+
+            def ai_cache_prune(self):
+                self.calls.append(("prune", {}))
+                return {"removed": 1}
+
+            def ai_recommendations(self, **values):
+                self.calls.append(("recommendation", values))
+                return {"recommendations": [], "warnings": []}
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+            "tools.acm_agent.cli._service", return_value=(service := FakeService())
+        ):
+            root = Path(temp)
+            for arguments in (
+                ["ai", "cache", "status", "--json"],
+                ["ai", "cache", "clear", "--profile", "recommendation", "--profile", "summary", "--json"],
+                ["ai", "cache", "prune", "--json"],
+                ["next", "--ai", "--force-refresh", "--json"],
+            ):
+                with self.subTest(arguments=arguments):
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        self.assertEqual(main(arguments, root=root), 0)
+                    json.loads(output.getvalue())
+
+        self.assertEqual(service.calls[0], ("status", {}))
+        self.assertEqual(
+            service.calls[1],
+            ("clear", {"profile_ids": ["recommendation", "summary"]}),
+        )
+        self.assertEqual(service.calls[2], ("prune", {}))
+        self.assertTrue(service.calls[3][1]["force_refresh"])
+
+    def test_ask_delivery_mode_dispatch(self) -> None:
+        class FakeService:
+            def __init__(self) -> None:
+                self.values = {}
+
+            def ai_chat(self, problem: str, **values: object) -> dict[str, object]:
+                self.values = {"problem": problem, **values}
+                return {"ok": True, "content": "fixture"}
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+            "tools.acm_agent.cli._service", return_value=(service := FakeService())
+        ):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = main(
+                    ["ask", "CF1A", "hint", "--delivery-mode", "low_latency", "--json"],
+                    root=Path(temp),
+                )
+        self.assertEqual(code, 0)
+        self.assertEqual(service.values["delivery_mode"], "low_latency")
+
+    def test_stage2_provider_credential_and_profile_commands_dispatch_without_secret_echo(self) -> None:
+        class FakeService:
+            def __init__(self):
+                self.calls = []
+
+            def ai_provider_upsert(self, **values):
+                self.calls.append(("provider", values))
+                return {"ok": True, "providers": []}
+
+            def ai_credential_slot(self, **values):
+                self.calls.append(("credential", values))
+                return {"ok": True, "credentials": [{"slot": values["slot"], "detected": True}]}
+
+            def ai_profile_update(self, **values):
+                self.calls.append(("profile", values))
+                return {"ok": True, "profiles": {values["profile_id"]: values}}
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            models = root / "models.json"
+            models.write_text(json.dumps({
+                "relay-model": {"capabilities": {"text_chat": True, "usage": True}}
+            }), encoding="utf-8")
+            service = FakeService()
+            secret = "cli-stage2-secret"
+            output = io.StringIO()
+            with mock.patch("tools.acm_agent.cli._service", return_value=service), mock.patch.dict(
+                "os.environ", {"RELAY_TEST_KEY": secret}
+            ), redirect_stdout(output):
+                self.assertEqual(main([
+                    "ai", "provider", "set", "relay", "--name", "Relay",
+                    "--base-url", "https://relay.example/v1", "--credential-slot", "relay",
+                    "--models-file", str(models), "--json",
+                ], root=root), 0)
+                self.assertEqual(main([
+                    "ai", "credential", "set", "relay", "--provider-id", "relay",
+                    "--from-env", "RELAY_TEST_KEY", "--json",
+                ], root=root), 0)
+                self.assertEqual(main([
+                    "ai", "profile", "set", "recommendation", "--provider-id", "relay",
+                    "--model", "relay-model", "--no-thinking", "--json",
+                ], root=root), 0)
+            self.assertEqual([item[0] for item in service.calls], ["provider", "credential", "profile"])
+            self.assertNotIn(secret, output.getvalue())
+
     def test_human_sync_reports_bounded_progress_on_stderr(self) -> None:
         class FakeService:
             def sync(self, platform="all", *, force=False, _progress_callback=None):

@@ -83,6 +83,7 @@
             <button id="ai-specialization-button" class="button primary" type="button">专项强化</button>
           </form>
         </div>
+        <div class="ai-feature-routing" data-ai-model-picker="recommendation" aria-label="题目推荐模型选择"></div>
         <p class="subtle">“查漏补缺”和“专项强化”会发送“已分类的去重平台 AC 摘要 + 确定性候选”；不会发送账号、handle、UID、submission ID、raw JSON、语言、notes、聊天、源码、本机路径、API Key 或运行 token。</p>
         <div id="recommend-basis" class="basis-banner plan_only">尚未生成推荐</div>
         <div id="recommendations" class="recommend-grid empty-state"><p>同步平台状态或直接生成一组训练。</p></div>
@@ -209,8 +210,8 @@
         </article>
 
         <article class="panel ai-workbench-panel">
-          <div class="panel-heading"><div><p class="eyebrow">DEEPSEEK</p><h2>AI 做题对话</h2></div><span id="ai-chat-state" class="badge neutral">未连接</span></div>
-          <p class="subtle">发送时会将当前题面、源码、attempt 与本次对话提交给你配置的 DeepSeek API。不会发送账号、文件路径或 API Key。</p>
+          <div class="panel-heading"><div><p class="eyebrow">MODEL ASSIST</p><h2>AI 做题对话</h2></div><span id="ai-chat-state" class="badge neutral">未连接</span></div>
+          <p class="subtle">发送时会将当前题面、源码、attempt 与本次对话提交给上方选择的模型。不会发送账号、文件路径或 API Key。</p>
           <div class="ai-context-grid">
             <label>题号<input id="ai-problem" autocomplete="off" placeholder="开始题目后自动填入，也可切换 active session"></label>
             <label>模式<select id="ai-mode"><option value="hint">分级提示</option><option value="explain">解释疑点</option><option value="review">代码诊断</option></select></label>
@@ -219,6 +220,7 @@
           </div>
           <p id="ai-problem-hint" class="subtle hidden" role="status"></p>
           <details class="ai-statement-editor"><summary>题面上下文</summary><textarea id="ai-statement" rows="8" maxlength="131072" placeholder="自动抓取失败时可粘贴题面；保存后人工版本优先。"></textarea><div class="card-actions"><button id="ai-statement-save" class="button secondary" type="button">保存人工题面</button><button id="ai-statement-restore" class="button secondary" type="button">恢复自动题面</button><span id="ai-context-source" class="subtle">尚未读取</span></div></details>
+          <div class="ai-feature-routing" data-ai-model-picker="coaching" aria-label="对话辅导模型选择"></div>
           <div id="ai-chat-messages" class="ai-chat-messages empty-state compact">开始题目后可在这里请求分级提示或代码诊断。</div>
           <form id="ai-chat-form" class="ai-chat-form">
             <textarea name="message" rows="3" maxlength="12000" required placeholder="描述你的思路、卡点或希望检查的代码问题"></textarea>
@@ -236,9 +238,10 @@
             <label>提示等级<select name="hint_level"><option value="0">0 — 无提示</option><option value="1">1 — 反例提问</option><option value="2">2 — 性质提示</option><option value="3">3 — 核心转化 / 伪代码</option><option value="4">4 — 完整代码</option></select></label>
             <label>失败类型<select name="failure"><option value="none">无</option><option value="implementation">实现错误</option><option value="edge_case">边界条件</option><option value="selection">选型错误</option><option value="modeling">建模错误</option><option value="invariant">不变量错误</option><option value="complexity">复杂度错误</option><option value="editorial">看过题解</option></select></label>
             <label class="span-2">简短备注<textarea name="notes" rows="3" maxlength="1000" placeholder="关键错误、反例或下一次复做关注点"></textarea></label>
-            <label class="check span-2 knowledge-toggle"><input id="knowledge-enabled" name="knowledge_enabled" type="checkbox" disabled>结束后使用 DeepSeek 生成 Markdown 总结预览（默认关闭）</label>
-            <p id="knowledge-key-hint" class="subtle span-2">需要先在设置页保存并启用 DeepSeek API Key。</p>
+            <label class="check span-2 knowledge-toggle"><input id="knowledge-enabled" name="knowledge_enabled" type="checkbox" disabled>结束后使用所选模型生成 Markdown 总结预览（默认关闭）</label>
+            <p id="knowledge-key-hint" class="subtle span-2">需要先在设置页添加连接并选择可用模型。</p>
             <div id="knowledge-options" class="knowledge-options span-2 hidden">
+              <div class="ai-feature-routing" data-ai-model-picker="summary" aria-label="Markdown 总结模型选择"></div>
               <div class="knowledge-target-grid">
                 <label>已保存目标<select id="knowledge-target" name="knowledge_target"><option value="">请选择或注册目标文件</option></select></label>
                 <label>Schema 模式<select id="knowledge-schema-mode" name="knowledge_schema_mode"><option value="infer">自动推断</option><option value="stored">使用目标已保存 schema</option><option value="custom">自定义 schema</option><option value="ai">AI 判断</option></select></label>
@@ -252,7 +255,7 @@
                 <div class="card-actions"><button id="knowledge-target-add" class="button secondary" type="button">检查并保存目标</button><button id="knowledge-target-remove" class="button danger" type="button">取消注册</button></div>
                 <label id="knowledge-custom-schema-wrap" class="span-2 hidden">summary-schema-v1<textarea id="knowledge-custom-schema" name="knowledge_custom_schema" rows="7" placeholder='{"version":"summary-schema-v1","name":"自定义总结","category_heading_level":1,"entry_heading_level":2,"toc":"preserve","fields":[{"key":"insight","label":"Insight","required":true,"layout":"bullet","instruction":"记录可复用启发"}]}'></textarea></label>
               </div>
-              <p class="knowledge-outbound warning-text">生成总结会把本题题面、最终源码、冻结标签、复盘信息和未清除的本题对话发送到已配置的 DeepSeek API；若已有条目的 Source 题号完全相同，还会发送该单条旧知识卡用于 AI 合并。不会发送账号、API Key、本机路径或整份知识库。</p>
+              <p class="knowledge-outbound warning-text">生成总结会把本题题面、最终源码、冻结标签、复盘信息和未清除的本题对话发送到所选模型；若已有条目的 Source 题号完全相同，还会发送该单条旧知识卡用于 AI 合并。不会发送账号、API Key、本机路径或整份知识库。</p>
             </div>
             <button class="button primary span-2" type="submit">结束 session</button>
           </form>
@@ -274,6 +277,13 @@
       <section id="review-view" class="view">
         <div class="section-heading"><div><p class="eyebrow">WEEKLY</p><h2>近七天复盘</h2></div><button id="review-button" class="button secondary">刷新周复盘</button></div>
         <div id="review-summary" class="stats-grid"></div>
+        <article class="panel lower-grid ai-cost-review-panel">
+          <div class="panel-heading"><div><p class="eyebrow">AI COST AUDIT</p><h2>模型路由与估算费用</h2></div><button id="ai-cost-reprice-review" class="button secondary" type="button">按当前 DeepSeek 价格重算</button></div>
+          <p class="subtle">费用仅统计 DeepSeek 官方连接；Token 与缓存统计覆盖所有已记录模型。缺失遥测不会按 0 处理，重算只追加 DeepSeek 价格版本，不改历史 Token。</p>
+          <div id="ai-cost-summary" class="stats-grid"></div>
+          <details class="audit-details"><summary>查看按任务与路由汇总</summary><div id="ai-cost-groups" class="governance-table empty-state compact">暂无 AI run</div></details>
+          <details class="audit-details"><summary>查看最近调用</summary><div id="ai-cost-runs" class="governance-table empty-state compact">暂无 AI run</div></details>
+        </article>
         <div class="two-column lower-grid">
           <article class="panel"><div class="panel-heading"><h2>到期复做</h2></div><div id="review-due" class="list empty-state compact">暂无到期题目</div></article>
           <article class="panel"><div class="panel-heading"><h2>薄弱专题</h2></div><div id="weak-topics" class="bar-list empty-state compact">暂无训练数据</div></article>
@@ -336,22 +346,48 @@
             <button id="appearance-reset-button" class="button secondary wide" type="button">恢复默认</button>
           </article>
           <article class="panel ai-settings-panel">
-            <div class="panel-heading"><div><p class="eyebrow">DEEPSEEK BYOK</p><h2>AI 设置</h2></div><span id="ai-key-state" class="badge neutral">未检测</span></div>
-            <p class="subtle">可直接在这里保存并启用。密钥由 Windows DPAPI 按当前登录用户加密，服务重启后自动恢复；明文不会写入 JSON、SQLite、日志或接口响应。</p>
-            <form id="ai-credential-form" class="stack-form credential-form">
-              <label>DeepSeek API Key<input name="api_key" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" maxlength="512" placeholder="输入新 Key；保存后输入框会立即清空"></label>
-              <p id="ai-key-detail" class="credential-detail">正在读取凭据状态…</p>
-              <div class="card-actions"><button class="button primary" type="submit">保存并启用</button><button id="ai-key-clear" class="button danger" type="button">清除已保存 Key</button></div>
+            <div class="panel-heading"><div><p class="eyebrow">MODEL CONNECTIONS</p><h2>AI 模型连接</h2></div><span id="ai-key-state" class="badge neutral">正在读取</span></div>
+            <p class="subtle">只需提供兼容服务的显示名称、HTTPS Base URL 与 API Key。系统会自动读取 <code>/models</code>；密钥由 Windows DPAPI、macOS Keychain 或 Linux Secret Service 保护，接口和页面均不会回显明文。</p>
+            <div id="ai-secure-store-status" class="secure-store-status pending" role="status" aria-live="polite">
+              <div class="secure-store-status-heading"><strong id="ai-secure-store-title">正在检测系统安全存储</strong><span id="ai-secure-store-code" class="secure-store-code hidden"></span></div>
+              <p id="ai-secure-store-message">Dashboard 仍可在安全存储不可用时启动，但不会把 API Key 写入明文或弱加密文件。</p>
+            </div>
+            <details class="environment-credential-help">
+              <summary>临时环境变量回退</summary>
+              <div class="environment-credential-help-body">
+                <p>若系统安全存储暂时不可用，可在启动 Dashboard 的同一终端临时提供内置 DeepSeek 的 API Key：</p>
+                <pre><code>export DEEPSEEK_API_KEY="你的 API Key"
+./start-acm-web.sh</code></pre>
+                <p>环境变量仅对当前 shell 及其子进程生效。此回退不会持久化密钥；修复或解锁系统安全存储后，可继续使用上方表单保存。</p>
+              </div>
+            </details>
+            <form id="ai-connection-form" class="stack-form ai-connection-form">
+              <input name="connection_id" type="hidden">
+              <label>显示名称<input name="display_name" required maxlength="80" placeholder="例如：主力中转站"></label>
+              <label>HTTPS Base URL<input name="base_url" type="url" required inputmode="url" placeholder="https://relay.example.com/v1"></label>
+              <label>API Key<input name="api_key" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" maxlength="2048" placeholder="新建时必填；编辑时留空表示保留"></label>
+              <p class="credential-detail">保存会访问该地址的标准 <code>/models</code>。仅允许 HTTPS，内网地址、跨源重定向和异常响应会被拒绝。</p>
+              <div class="card-actions"><button class="button primary" type="submit">添加连接</button><button id="ai-connection-cancel" class="button secondary hidden" type="button">取消编辑</button></div>
             </form>
-            <form id="ai-settings-form" class="stack-form">
-              <label>推荐模型<select name="recommendation_model"><option value="deepseek-v4-flash">DeepSeek V4 Flash</option><option value="deepseek-v4-pro">DeepSeek V4 Pro</option></select></label>
-              <label>对话模型<select name="coaching_model"><option value="deepseek-v4-flash">DeepSeek V4 Flash</option><option value="deepseek-v4-pro">DeepSeek V4 Pro</option></select></label>
-              <label>Markdown 总结模型<select name="summary_model"><option value="deepseek-v4-flash">DeepSeek V4 Flash</option><option value="deepseek-v4-pro">DeepSeek V4 Pro</option></select></label>
-              <label class="check"><input name="coaching_thinking" type="checkbox">对话和补丁启用 thinking</label>
-              <label>推理强度<select name="reasoning_effort"><option value="high">high</option><option value="max">max</option></select></label>
-              <label class="check"><input name="summary_thinking" type="checkbox">Markdown 总结启用 thinking</label>
-              <label>总结推理强度<select name="summary_reasoning_effort"><option value="high">high</option><option value="max">max</option></select></label>
-              <div class="card-actions"><button class="button primary" type="submit">保存 AI 设置</button><button id="ai-test-button" class="button secondary" type="button">测试连接</button></div>
+            <div id="ai-connection-list" class="ai-connection-list" aria-live="polite"><p class="subtle">正在读取模型连接…</p></div>
+          </article>
+          <article class="panel ai-governance-panel">
+            <div class="panel-heading"><div><p class="eyebrow">ROUTING &amp; COST</p><h2>任务路由与费用治理</h2></div><span id="ai-price-version" class="badge neutral">正在读取</span></div>
+            <p class="subtle">六类任务在发请求前都经过能力门禁；重试、协议修复与模型路由回退共享请求数、总时限和 Token 预算。费用仅统计 DeepSeek 官方连接；Token 与缓存统计覆盖所有已记录模型。</p>
+            <div id="ai-governance-summary" class="stats-grid"></div>
+            <form id="ai-policy-form" class="policy-editor">
+              <fieldset class="policy-hard-limits">
+                <legend>DeepSeek 费用硬限额（人民币，留空表示关闭）</legend>
+                <label>每日上限<input name="daily_cny" type="number" min="0.000001" step="0.000001" inputmode="decimal" placeholder="关闭"></label>
+                <label>每月上限<input name="monthly_cny" type="number" min="0.000001" step="0.000001" inputmode="decimal" placeholder="关闭"></label>
+                <p class="subtle">仅依据可核算的官方 DeepSeek 费用阻断；存在未知费用时后端会 fail closed。</p>
+              </fieldset>
+              <details id="ai-route-policy-details" class="route-policy-details">
+                <summary>查看各项详情</summary>
+                <div id="ai-route-policy-table" class="governance-table empty-state compact">正在读取任务策略…</div>
+              </details>
+              <p id="ai-policy-dirty-state" class="subtle" role="status">策略与已保存版本一致。</p>
+              <div class="card-actions"><button id="ai-policy-save" class="button primary" type="submit" disabled>保存路由与预算</button><button id="ai-policy-reset" class="button secondary" type="button" disabled>放弃未保存修改</button><button id="ai-cost-reprice" class="button secondary" type="button">按当前 DeepSeek 价格重算历史</button></div>
             </form>
           </article>
         </div>
@@ -404,6 +440,8 @@
           </div>
         </fieldset>
         <label>自然语言描述<textarea id="ai-plan-text" rows="6" maxlength="20000" placeholder="例如：第一阶段整理 CF1A、P3374；第二阶段做 P3372，并标记为提高。"></textarea></label>
+        <div class="ai-feature-routing" data-ai-model-picker="plan_organize" aria-label="题单整理模型选择"></div>
+        <div class="ai-feature-routing hidden" data-ai-model-picker="plan_generate" aria-label="题单生成模型选择"></div>
         <div id="ai-plan-generate-controls" class="ai-plan-generate-controls hidden">
           <label>题目数量<input id="ai-plan-task-count" type="number" min="1" max="30" value="12"></label>
           <label class="check"><input id="ai-plan-include-completed" type="checkbox">允许纳入 AC 或 Skip 题目</label>

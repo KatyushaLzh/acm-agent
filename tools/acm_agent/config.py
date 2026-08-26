@@ -5,12 +5,30 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .ai_policy import DEFAULT_MODEL, DEFAULT_REASONING_EFFORT
+from .provider_config import (
+    default_ai_policy,
+    default_cache_policy,
+    default_provider_config,
+    default_credential_slots,
+    default_task_profiles,
+    validate_ai_catalog,
+    validate_ai_policy,
+    validate_cache_policy,
+    validate_coaching_delivery_mode,
+    validate_credential_slots,
+)
 
 
-CONFIG_VERSION = 8
+CONFIG_VERSION = 15
+# Compatibility-only conversion for explicitly configured v14 USD guardrails.
+# DeepSeek usage itself is always priced from the native CNY catalog.
+LEGACY_LIMIT_USD_TO_CNY_RATE = 7.2
+
+_REASONING_STRENGTHS = frozenset({"auto", "off", "low", "medium", "high"})
 
 
 @dataclass(frozen=True)
@@ -83,6 +101,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "summary_thinking": True,
         "reasoning_effort": DEFAULT_REASONING_EFFORT,
         "summary_reasoning_effort": DEFAULT_REASONING_EFFORT,
+        "providers": default_provider_config(),
+        "profiles": default_task_profiles(),
+        "credential_slots": default_credential_slots(),
+        "policy": default_ai_policy(),
+        "cache": default_cache_policy(),
+        "coaching_delivery_mode": "resilient",
     },
 }
 
@@ -91,9 +115,119 @@ def _is_sensitive_ai_key(key: Any) -> bool:
     normalized = "".join(
         character for character in str(key).casefold() if character.isalnum()
     )
-    return normalized in {"apikey", "authorization", "accesstoken", "token", "secret"} or any(
-        marker in normalized for marker in ("apikey", "authorization", "token", "secret")
+    return normalized in {
+        "apikey", "authorization", "accesstoken", "authtoken", "bearertoken",
+        "clientsecret", "secret", "secretkey", "token",
+    } or normalized.endswith(("apikey", "accesstoken", "clientsecret", "secretkey"))
+
+
+def _find_sensitive_key(value: Any, *, path: str = "ai") -> str | None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            current = f"{path}.{key}"
+            if _is_sensitive_ai_key(key):
+                return current
+            nested = _find_sensitive_key(item, path=current)
+            if nested is not None:
+                return nested
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, item in enumerate(value):
+            nested = _find_sensitive_key(item, path=f"{path}[{index}]")
+            if nested is not None:
+                return nested
+    return None
+
+
+def _project_legacy_ai_settings(ai: dict[str, Any]) -> None:
+    profiles = ai.get("profiles")
+    if not isinstance(profiles, dict):
+        return
+    recommendation = profiles.get("recommendation") or {}
+    coaching = profiles.get("coaching") or {}
+    summary = profiles.get("summary") or {}
+
+    def legacy_reasoning(profile: Mapping[str, Any]) -> tuple[bool, str]:
+        strength = str(profile.get("reasoning_strength") or "auto").strip().lower()
+        if strength not in _REASONING_STRENGTHS:
+            strength = "auto"
+        return strength not in {"auto", "off"}, "max" if strength == "high" else "high"
+
+    recommendation_thinking, _ = legacy_reasoning(recommendation)
+    coaching_thinking, coaching_effort = legacy_reasoning(coaching)
+    summary_thinking, summary_effort = legacy_reasoning(summary)
+    ai.update(
+        recommendation_model=recommendation.get("model", DEFAULT_MODEL),
+        recommendation_thinking=recommendation_thinking,
+        coaching_model=coaching.get("model", DEFAULT_MODEL),
+        coaching_thinking=coaching_thinking,
+        reasoning_effort=coaching_effort,
+        summary_model=summary.get("model", DEFAULT_MODEL),
+        summary_thinking=summary_thinking,
+        summary_reasoning_effort=summary_effort,
     )
+
+
+def _upgrade_profile_reasoning(profile: dict[str, Any]) -> None:
+    """Add the v10 authority while retaining fields consumed by v9 callers."""
+
+    raw_strength = profile.get("reasoning_strength")
+    if raw_strength is None:
+        thinking = profile.get("thinking", False)
+        if not isinstance(thinking, bool):
+            raise ValueError("profile thinking must be a boolean")
+        effort = str(profile.get("reasoning_effort") or DEFAULT_REASONING_EFFORT).lower()
+        if effort not in {"high", "max"}:
+            raise ValueError("profile reasoning_effort must be high or max")
+        strength = "off" if not thinking else ("high" if effort == "max" else "medium")
+    else:
+        strength = str(raw_strength).strip().lower()
+        if strength not in _REASONING_STRENGTHS:
+            raise ValueError(
+                "profile reasoning_strength must be auto, off, low, medium, or high"
+            )
+    profile["reasoning_strength"] = strength
+    # Keep a deterministic compatibility projection for old CLI/service paths.
+    profile["thinking"] = strength not in {"auto", "off"}
+    profile["reasoning_effort"] = "max" if strength == "high" else "high"
+
+
+def _upgrade_profiles_reasoning(profiles: Any) -> None:
+    if not isinstance(profiles, dict):
+        return
+    for profile in profiles.values():
+        if isinstance(profile, dict):
+            _upgrade_profile_reasoning(profile)
+
+
+def _migrate_pre_v14_deepseek_auto(ai: dict[str, Any]) -> None:
+    """Preserve the old DeepSeek ``auto`` wire behavior as explicit ``off``."""
+
+    providers = ai.get("providers")
+    if not isinstance(providers, Mapping):
+        return
+
+    def migrate_route(route: Any) -> None:
+        if not isinstance(route, dict):
+            return
+        provider = providers.get(str(route.get("provider_id") or ""))
+        if (
+            isinstance(provider, Mapping)
+            and provider.get("adapter") == "deepseek"
+            and str(route.get("reasoning_strength") or "auto").strip().lower() == "auto"
+        ):
+            route["reasoning_strength"] = "off"
+
+    profiles = ai.get("profiles")
+    if isinstance(profiles, dict):
+        for profile in profiles.values():
+            migrate_route(profile)
+    policy = ai.get("policy")
+    fallbacks = policy.get("fallbacks") if isinstance(policy, dict) else None
+    if isinstance(fallbacks, dict):
+        for routes in fallbacks.values():
+            if isinstance(routes, list):
+                for route in routes:
+                    migrate_route(route)
 
 
 def _merge_defaults(defaults: Any, current: Any) -> Any:
@@ -111,7 +245,7 @@ def _merge_defaults(defaults: Any, current: Any) -> Any:
 
 def _upgrade_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     version = data.get("version")
-    if version not in (1, 2, 3, 4, 5, 6, 7, CONFIG_VERSION):
+    if version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, CONFIG_VERSION):
         raise ValueError(f"Unsupported config version: {version!r}")
     upgraded = _merge_defaults(DEFAULT_CONFIG, data)
     ai = upgraded.get("ai")
@@ -142,6 +276,75 @@ def _upgrade_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             "stress_generation_mode",
         ):
             ai.pop(retired_key, None)
+        if version <= 8 or not isinstance(source_ai.get("profiles"), dict):
+            profiles = default_task_profiles()
+            legacy_model = str(ai.get("recommendation_model") or DEFAULT_MODEL)
+            profiles["recommendation"]["model"] = legacy_model
+            profiles["plan_organize"]["model"] = legacy_model
+            profiles["plan_generate"]["model"] = legacy_model
+            profiles["coaching"].update(
+                model=str(ai.get("coaching_model") or DEFAULT_MODEL),
+                thinking=bool(ai.get("coaching_thinking", True)),
+                reasoning_effort=str(ai.get("reasoning_effort") or DEFAULT_REASONING_EFFORT),
+            )
+            profiles["patch"].update(profiles["coaching"])
+            profiles["summary"].update(
+                model=str(ai.get("summary_model") or DEFAULT_MODEL),
+                thinking=bool(ai.get("summary_thinking", True)),
+                reasoning_effort=str(
+                    ai.get("summary_reasoning_effort") or DEFAULT_REASONING_EFFORT
+                ),
+            )
+            ai["profiles"] = profiles
+        if version <= 9 and isinstance(ai.get("profiles"), dict):
+            source_profiles = (
+                source_ai.get("profiles")
+                if isinstance(source_ai.get("profiles"), dict)
+                else {}
+            )
+            for profile_id, profile in ai["profiles"].items():
+                source_profile = source_profiles.get(profile_id)
+                if (
+                    version <= 8
+                    or not isinstance(source_profile, dict)
+                    or "reasoning_strength" not in source_profile
+                ) and isinstance(profile, dict):
+                    # ``_merge_defaults`` may have injected the v10 default;
+                    # derive from the persisted v9 thinking/effort instead.
+                    profile.pop("reasoning_strength", None)
+        _upgrade_profiles_reasoning(ai.get("profiles"))
+        if version <= 13:
+            _migrate_pre_v14_deepseek_auto(ai)
+        if version <= 14:
+            policy = ai.get("policy")
+            if isinstance(policy, dict):
+                limits = policy.get("hard_limits")
+                if isinstance(limits, dict) and (
+                    "daily_usd" in limits or "monthly_usd" in limits
+                ):
+                    policy["hard_limits"] = {
+                        "daily_cny": (
+                            None if limits.get("daily_usd") is None
+                            else float(limits["daily_usd"]) * LEGACY_LIMIT_USD_TO_CNY_RATE
+                        ),
+                        "monthly_cny": (
+                            None if limits.get("monthly_usd") is None
+                            else float(limits["monthly_usd"]) * LEGACY_LIMIT_USD_TO_CNY_RATE
+                        ),
+                    }
+        providers, profiles = validate_ai_catalog(ai.get("providers"), ai.get("profiles"))
+        _upgrade_profiles_reasoning(profiles)
+        ai["providers"] = providers
+        ai["profiles"] = profiles
+        ai["credential_slots"] = validate_credential_slots(
+            providers, ai.get("credential_slots")
+        )
+        ai["policy"] = validate_ai_policy(ai.get("policy"))
+        ai["cache"] = validate_cache_policy(ai.get("cache"))
+        ai["coaching_delivery_mode"] = validate_coaching_delivery_mode(
+            ai.get("coaching_delivery_mode")
+        )
+        _project_legacy_ai_settings(ai)
         for key in list(ai):
             if _is_sensitive_ai_key(key):
                 del ai[key]
@@ -159,6 +362,9 @@ def load_config(paths: Paths, *, required: bool = True) -> dict[str, Any]:
     data = json.loads(paths.config.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("Configuration root must be a JSON object")
+    sensitive = _find_sensitive_key(data.get("ai"))
+    if sensitive is not None and data.get("version") == CONFIG_VERSION:
+        raise ValueError(f"Sensitive AI credential field is forbidden in config: {sensitive}")
     config, changed = _upgrade_config(data)
     if changed:
         save_config(paths, config)
@@ -166,6 +372,26 @@ def load_config(paths: Paths, *, required: bool = True) -> dict[str, Any]:
 
 
 def save_config(paths: Paths, config: dict[str, Any]) -> None:
+    sensitive = _find_sensitive_key(config.get("ai"))
+    if sensitive is not None:
+        raise ValueError(f"Sensitive AI credential field is forbidden in config: {sensitive}")
+    ai = config.get("ai")
+    if isinstance(ai, dict):
+        _upgrade_profiles_reasoning(ai.get("profiles"))
+        providers, profiles = validate_ai_catalog(ai.get("providers"), ai.get("profiles"))
+        _upgrade_profiles_reasoning(profiles)
+        ai["providers"] = providers
+        ai["profiles"] = profiles
+        ai["credential_slots"] = validate_credential_slots(
+            providers, ai.get("credential_slots")
+        )
+        ai["policy"] = validate_ai_policy(ai.get("policy"))
+        ai["cache"] = validate_cache_policy(ai.get("cache"))
+        ai["coaching_delivery_mode"] = validate_coaching_delivery_mode(
+            ai.get("coaching_delivery_mode")
+        )
+        _project_legacy_ai_settings(ai)
+    config["version"] = CONFIG_VERSION
     paths.ensure()
     payload = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
     fd, temporary = tempfile.mkstemp(

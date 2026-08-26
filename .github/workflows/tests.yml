@@ -25,3 +25,19 @@ jobs:
         run: python -m compileall -q tools tests
       - name: Validate the built-in plan
         run: python -m tools.acm_agent plan check --json
+
+  launcher-and-credentials-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install locked Unix Dashboard dependencies
+        run: python -m pip install --require-hashes --only-binary=:all: --requirement tools/requirements-web-unix.lock
+      - name: Run macOS launcher tests
+        run: python -m unittest discover -s tests -p "test_*launcher.py" -v
+      - name: Test macOS Keychain credential round trip
+        env:
+          ACM_TEST_SYSTEM_KEYRING: "1"
+        run: python -m unittest tests.test_credentials -v

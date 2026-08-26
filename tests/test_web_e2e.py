@@ -128,7 +128,7 @@ class WebEndToEndTest(unittest.TestCase):
         self.assertEqual(enabled["credential_source"], "secure_store")
         self.assertNotIn(secret, json.dumps(enabled))
 
-        encrypted = self.root / ".acm" / "deepseek-key.dpapi"
+        encrypted = self.root / ".acm" / "credentials" / "deepseek.dpapi"
         self.assertTrue(encrypted.is_file())
         self.assertNotIn(secret.encode("utf-8"), encrypted.read_bytes())
         restarted = AcmService(self.root)
@@ -184,6 +184,22 @@ class WebEndToEndTest(unittest.TestCase):
         review = self.request("POST", "/api/review/week", {})
         self.assertEqual(review["sessions"], 1)
         self.assertEqual(self._knowledge_hashes(), self.before)
+
+    def test_stage4_cache_control_endpoints_are_safe_on_empty_workspace(self) -> None:
+        status = self.request("GET", "/api/ai/cache")
+        self.assertIn("entries", status)
+        self.assertIn("exact_hit_rate", status)
+        self.assertIn("provider_avoidance", status)
+
+        pruned = self.request("POST", "/api/ai/cache/prune", {})
+        self.assertGreaterEqual(int(pruned.get("removed", pruned.get("removed_entries", 0))), 0)
+
+        cleared = self.request(
+            "POST",
+            "/api/ai/cache/clear",
+            {"profile_ids": ["recommendation", "plan_organize", "summary"]},
+        )
+        self.assertGreaterEqual(int(cleared.get("removed", cleared.get("removed_entries", 0))), 0)
 
     def test_plan_import_edit_recommend_and_delete(self) -> None:
         self.request(

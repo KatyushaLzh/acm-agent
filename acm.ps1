@@ -7,7 +7,30 @@ param(
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Push-Location $repoRoot
 try {
-    & python -m tools.acm_agent @AcmArgs
+    $pythonExecutable = 'python'
+    $commandName = $null
+    for ($index = 0; $index -lt $AcmArgs.Count; $index++) {
+        if ($AcmArgs[$index] -ieq '--root') {
+            $index++
+            continue
+        }
+        if ($AcmArgs[$index] -ilike '--root=*') {
+            continue
+        }
+        if (-not $AcmArgs[$index].StartsWith('-')) {
+            $commandName = $AcmArgs[$index]
+            break
+        }
+    }
+    if ($commandName -ieq 'web') {
+        . (Join-Path $repoRoot 'tools\acm-python313-windows.ps1')
+        $pythonExecutable = Ensure-AcmPython313
+        if (-not $pythonExecutable) {
+            exit 2
+        }
+    }
+
+    & $pythonExecutable -m tools.acm_agent @AcmArgs
     exit $LASTEXITCODE
 }
 finally {

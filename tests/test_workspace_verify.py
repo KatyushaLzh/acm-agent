@@ -215,7 +215,7 @@ class VerifyTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         verify_problem(root, "CF1A", stress_iterations=iterations)
 
-    def test_each_verify_uses_an_independent_build_directory(self) -> None:
+    def test_each_verify_uses_and_removes_an_independent_build_directory(self) -> None:
         import shutil
 
         if shutil.which("g++") is None:
@@ -237,6 +237,7 @@ class VerifyTests(unittest.TestCase):
                     for path in executables
                 )
             )
+            self.assertTrue(all(not path.parent.exists() for path in executables))
 
     def test_output_limit_is_a_structured_sample_failure(self) -> None:
         import shutil
@@ -248,7 +249,7 @@ class VerifyTests(unittest.TestCase):
             source = root / "2026" / "8" / "3" / "CF1A.cpp"
             source.parent.mkdir(parents=True)
             source.write_text(
-                "#include <iostream>\nint main(){for(int i=0;i<2000000;i++)std::cout.put('x');}\n",
+                "#include <iostream>\nint main(){for(int i=0;i<20000000;i++)std::cout.put('x');}\n",
                 encoding="utf-8",
             )
             cases = root / ".acm" / "cases" / "CF1A"
@@ -261,6 +262,35 @@ class VerifyTests(unittest.TestCase):
             self.assertFalse(result.passed)
             self.assertEqual(result.verification_status, "failed")
             self.assertIn("output limit exceeded", result.cases[0].reason)
+
+    def test_stress_accepts_legal_generator_output_larger_than_one_mib(self) -> None:
+        import shutil
+
+        if shutil.which("g++") is None:
+            self.skipTest("g++ is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            day = root / "2026" / "8" / "3"
+            day.mkdir(parents=True)
+            source_text = (
+                "#include <iostream>\n"
+                "int main(){long long x;std::cin>>x;std::cout<<x<<'\\n';}\n"
+            )
+            (day / "CF1A.cpp").write_text(source_text, encoding="utf-8")
+            (day / "CF1A.bf.cpp").write_text(source_text, encoding="utf-8")
+            (day / "CF1A.gen.cpp").write_text(
+                "#include <iostream>\n"
+                "int main(){for(int i=0;i<2*1024*1024;i++)std::cout.put(' ');"
+                "std::cout<<1<<'\\n';}\n",
+                encoding="utf-8",
+            )
+
+            result = verify_problem(root, "CF1A", stress_iterations=1, seed=42, timeout=5)
+
+            self.assertTrue(result.passed, result.to_dict())
+            self.assertEqual(result.stress, "passed")
+            self.assertEqual(result.stress_iterations, 1)
+            self.assertFalse(Path(result.compile_command[-1]).parent.exists())
 
     def test_timeout_terminates_descendant_processes(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -312,7 +342,6 @@ class VerifyTests(unittest.TestCase):
             self.assertEqual(exact_result.cases[0].reason, "wrong answer")
 
     def test_stress_mismatch_preserves_reproduction_assets(self) -> None:
-        import json
         import shutil
 
         if shutil.which("g++") is None:
@@ -340,14 +369,94 @@ class VerifyTests(unittest.TestCase):
             self.assertEqual(result.stress_iterations, 1)
             self.assertIsNotNone(result.failure_dir)
             failure = Path(result.failure_dir or "")
-            self.assertTrue(_path_is_within(failure, root / ".acm" / "failures"))
-            self.assertEqual((failure / "input.txt").read_text(), "1\n")
-            self.assertEqual((failure / "actual.txt").read_text().strip(), "0")
-            self.assertEqual((failure / "expected.txt").read_text().strip(), "1")
-            metadata = json.loads((failure / "metadata.json").read_text(encoding="utf-8"))
-            self.assertEqual(metadata["seed"], 42)
-            self.assertIn("generator_command", metadata)
-            self.assertEqual(set(metadata["commands"]), {"generator", "solution", "brute_force"})
+            self.assertEqual(failure, day.resolve())
+            self.assertEqual((day / "CF1A.stress.in").read_text(), "1\n")
+            self.assertEqual((day / "CF1A.user.out").read_text().strip(), "0")
+            self.assertEqual((day / "CF1A.reference.out").read_text().strip(), "1")
+            self.assertTrue(any("saved CF1A.stress.in" in warning for warning in result.warnings))
+            self.assertFalse(Path(result.compile_command[-1]).parent.exists())
+
+    def test_stress_runtime_error_publishes_reproduction_beside_source(self) -> None:
+        import json
+        import shutil
+
+        if shutil.which("g++") is None:
+            self.skipTest("g++ is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            day = root / "2026" / "8" / "3"
+            day.mkdir(parents=True)
+            (day / "CF1A.cpp").write_text("int main(){return 7;}\n", encoding="utf-8")
+            (day / "CF1A.bf.cpp").write_text(
+                "#include <iostream>\nint main(){std::cout<<1<<'\\n';}\n",
+                encoding="utf-8",
+            )
+            (day / "CF1A.gen.cpp").write_text(
+                "#include <iostream>\nint main(){std::cout<<1<<'\\n';}\n",
+                encoding="utf-8",
+            )
+
+            result = verify_problem(root, "CF1A", stress_iterations=1, seed=42)
+
+            failure = Path(result.failure_dir or "")
+            self.assertEqual(failure, day.resolve())
+            self.assertEqual((day / "CF1A.stress.in").read_text(), "1\n")
+            self.assertEqual((day / "CF1A.user.out").read_text(), "")
+            self.assertEqual((day / "CF1A.reference.out").read_text(), "1\n")
+            diagnostics = list((root / ".acm" / "failures" / "CF1A").iterdir())
+            self.assertEqual(len(diagnostics), 1)
+            metadata = json.loads(
+                (diagnostics[0] / "metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["reason"], "runtime_error")
+            self.assertTrue(
+                any("detailed diagnostic assets remain" in warning for warning in result.warnings)
+            )
+
+    def test_stress_timeout_publishes_reproduction_beside_source(self) -> None:
+        import json
+        import shutil
+
+        if shutil.which("g++") is None:
+            self.skipTest("g++ is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            day = root / "2026" / "8" / "3"
+            day.mkdir(parents=True)
+            (day / "CF1A.cpp").write_text(
+                "#include <chrono>\n#include <thread>\n"
+                "int main(){std::this_thread::sleep_for(std::chrono::seconds(2));}\n",
+                encoding="utf-8",
+            )
+            (day / "CF1A.bf.cpp").write_text(
+                "#include <iostream>\nint main(){std::cout<<1<<'\\n';}\n",
+                encoding="utf-8",
+            )
+            (day / "CF1A.gen.cpp").write_text(
+                "#include <iostream>\nint main(){std::cout<<1<<'\\n';}\n",
+                encoding="utf-8",
+            )
+
+            result = verify_problem(
+                root,
+                "CF1A",
+                stress_iterations=1,
+                seed=42,
+                timeout=0.2,
+            )
+
+            self.assertEqual(result.stress, "timeout")
+            self.assertEqual(Path(result.failure_dir or ""), day.resolve())
+            self.assertEqual((day / "CF1A.stress.in").read_text(), "1\n")
+            self.assertEqual((day / "CF1A.user.out").read_text(), "")
+            self.assertEqual((day / "CF1A.reference.out").read_text(), "1\n")
+            diagnostics = list((root / ".acm" / "failures" / "CF1A").iterdir())
+            self.assertEqual(len(diagnostics), 1)
+            metadata = json.loads(
+                (diagnostics[0] / "metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["reason"], "timeout")
+            self.assertFalse(Path(result.compile_command[-1]).parent.exists())
 
     def test_stress_accepts_explicit_cpp_sources_with_independent_names(self) -> None:
         import shutil

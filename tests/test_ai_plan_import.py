@@ -45,6 +45,9 @@ class _PlanDeepSeek:
             response,
         )
 
+    def structured(self, messages, **kwargs):
+        return self.chat_json(messages, **kwargs)
+
 
 class AIPlanImportLogicTests(unittest.TestCase):
     def test_extract_mixed_refs_preserves_order_and_deduplicates(self) -> None:
@@ -117,21 +120,17 @@ class AIPlanImportLogicTests(unittest.TestCase):
         keys = ["codeforces:CF1A", "luogu:P3374"]
         valid = {
             "title": "入门",
-            "description": "",
-            "stages": [
+            "groups": [
                 {
                     "topic": "第一阶段",
                     "due_date": None,
-                    "problems": [
-                        {"problem_key": keys[0], "level": "A", "note": ""},
-                        {"problem_key": keys[1], "level": "B", "note": ""},
-                    ],
+                    "problem_keys": keys,
                 }
             ],
         }
         self.assertEqual(validate_organize_ir(valid, allowed_problem_keys=keys)["title"], "入门")
         invalid = json.loads(json.dumps(valid))
-        invalid["stages"][0]["problems"][1]["problem_key"] = keys[0]
+        invalid["groups"][0]["problem_keys"][1] = keys[0]
         with self.assertRaisesRegex(AIPlanImportError, "重复"):
             validate_organize_ir(invalid, allowed_problem_keys=keys)
         invalid = json.loads(json.dumps(valid))
@@ -416,15 +415,11 @@ class AIPlanImportServiceTests(unittest.TestCase):
             [
                 {
                     "title": "混合训练",
-                    "description": "两题",
-                    "stages": [
+                    "groups": [
                         {
                             "topic": "基础",
                             "due_date": None,
-                            "problems": [
-                                {"problem_key": "codeforces:CF1A", "level": "A", "note": ""},
-                                {"problem_key": "luogu:P3374", "level": "B", "note": ""},
-                            ],
+                            "problem_keys": ["codeforces:CF1A", "luogu:P3374"],
                         }
                     ],
                 }
@@ -443,27 +438,68 @@ class AIPlanImportServiceTests(unittest.TestCase):
             self.assertNotIn(secret_text, row["request_summary_json"])
         self.assertEqual(list((self.root / ".acm" / "plans").glob("*.json")), [])
 
-    def test_organize_invalid_ir_uses_single_stage_fallback(self) -> None:
-        client = _PlanDeepSeek(
-            [{
-                "title": "bad",
-                "description": "",
-                "stages": [{
-                    "topic": "x",
-                    "due_date": None,
-                    "problems": [
-                        {"problem_key": "codeforces:CF1A", "level": "B", "note": ""},
-                        {"problem_key": "codeforces:CF1A", "level": "B", "note": ""},
-                    ],
-                }],
-            }]
+    def test_organize_exact_cache_hit_and_force_refresh(self) -> None:
+        response = {
+            "title": "混合训练",
+            "groups": [{
+                "topic": "基础",
+                "due_date": None,
+                "problem_keys": ["codeforces:CF1A", "luogu:P3374"],
+            }],
+        }
+        client = _PlanDeepSeek([response, response])
+        service = self.service(client)
+
+        cold = service.ai_plan_preview(mode="organize", text="CF1A P3374")
+        hit = service.ai_plan_preview(mode="organize", text="CF1A P3374")
+        refreshed = service.ai_plan_preview(
+            mode="organize", text="CF1A P3374", force_refresh=True
         )
+
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(cold["ai"]["local_cache"]["status"], "miss")
+        self.assertEqual(hit["ai"]["local_cache"]["status"], "hit")
+        self.assertEqual(hit["ai"]["usage"], {})
+        self.assertEqual(refreshed["ai"]["local_cache"]["status"], "refresh")
+
+    def test_organize_failed_force_refresh_preserves_old_entry_and_returns_failure(self) -> None:
+        response = {
+            "title": "旧缓存",
+            "groups": [{
+                "topic": "基础",
+                "due_date": None,
+                "problem_keys": ["codeforces:CF1A"],
+            }],
+        }
+        client = _PlanDeepSeek([response, DeepSeekError("network_error", "offline")])
+        service = self.service(client)
+        service.ai_plan_preview(mode="organize", text="CF1A")
+
+        with self.assertRaisesRegex(DeepSeekError, "offline"):
+            service.ai_plan_preview(mode="organize", text="CF1A", force_refresh=True)
+        recovered = service.ai_plan_preview(mode="organize", text="CF1A")
+
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(recovered["plan"]["title"], "旧缓存")
+        self.assertEqual(recovered["ai"]["local_cache"]["status"], "hit")
+
+    def test_organize_invalid_ir_uses_single_stage_fallback(self) -> None:
+        bad = {
+            "title": "bad",
+            "groups": [{
+                "topic": "x",
+                "due_date": None,
+                "problem_keys": ["codeforces:CF1A", "codeforces:CF1A"],
+            }],
+        }
+        client = _PlanDeepSeek([bad, bad])
         service = self.service(client)
         result = service.ai_plan_preview(mode="organize", text="CF1A P3374")
         self.assertEqual(result["plan"]["stages"][0]["topic"], "全部题目")
         self.assertEqual(result["ai"]["fallback"]["code"], "invalid_ai_plan_ir")
+        self.assertEqual(result["ai"]["outcome"]["repair_attempts"], 1)
         with Database(service.paths.database) as db:
-            self.assertEqual(db.query("SELECT status FROM ai_runs")[0][0], "failed")
+            self.assertEqual(db.query("SELECT status FROM ai_runs")[0][0], "complete")
 
     def test_organize_network_error_uses_deterministic_fallback(self) -> None:
         client = _PlanDeepSeek([DeepSeekError("network_error", "offline")])
@@ -473,38 +509,37 @@ class AIPlanImportServiceTests(unittest.TestCase):
         self.assertEqual([task["problem_id"] for task in tasks], ["P3374", "CF1A"])
         self.assertEqual(result["ai"]["fallback"]["code"], "network_error")
 
-    def test_organize_mixed_dates_fail_instead_of_falling_back(self) -> None:
+    def test_organize_mixed_dates_are_cleared_with_warning(self) -> None:
         client = _PlanDeepSeek(
             [{
                 "title": "错误排期",
-                "description": "",
-                "stages": [
+                "groups": [
                     {
                         "topic": "一",
                         "due_date": "2026-08-26",
-                        "problems": [{"problem_key": "codeforces:CF1A", "level": "B", "note": ""}],
+                        "problem_keys": ["codeforces:CF1A"],
                     },
                     {
                         "topic": "二",
                         "due_date": None,
-                        "problems": [{"problem_key": "luogu:P3374", "level": "B", "note": ""}],
+                        "problem_keys": ["luogu:P3374"],
                     },
                 ],
             }]
         )
         service = self.service(client)
-        with self.assertRaisesRegex(AIPlanImportError, "混合填写"):
-            service.ai_plan_preview(mode="organize", text="CF1A P3374")
+        result = service.ai_plan_preview(mode="organize", text="CF1A P3374")
+        self.assertEqual(result["plan"]["schedule_mode"], "progressive")
+        self.assertTrue(any("日期" in item and "清空" in item for item in result["warnings"]))
 
     def test_organize_surfaces_invalid_official_link_as_unresolved(self) -> None:
         client = _PlanDeepSeek(
             [{
                 "title": "单题",
-                "description": "",
-                "stages": [{
+                "groups": [{
                     "topic": "基础",
                     "due_date": None,
-                    "problems": [{"problem_key": "codeforces:CF1A", "level": "B", "note": ""}],
+                    "problem_keys": ["codeforces:CF1A"],
                 }],
             }]
         )
@@ -584,7 +619,7 @@ class AIPlanImportServiceTests(unittest.TestCase):
                 "SELECT status,request_summary_json FROM ai_runs WHERE kind='plan_import'"
             )[0]
         summary = json.loads(row["request_summary_json"])
-        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["status"], "complete")
         self.assertEqual(summary["accepted_count"], 2)
         self.assertEqual(summary["rounds"], 4)
         self.assertTrue(summary["thinking"])
@@ -623,30 +658,30 @@ class AIPlanImportServiceTests(unittest.TestCase):
         result = service.ai_plan_preview(
             mode="generate", text="基础训练", task_count=2
         )
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["ai"]["rounds"], 4)
-        self.assertEqual(result["ai"]["usage"]["total_tokens"], 24)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["ai"]["rounds"], 2)
+        self.assertEqual(result["ai"]["stop_reason"], "validation_failed")
+        self.assertEqual(result["ai"]["accepted_count"], 1)
+        self.assertEqual(result["ai"]["outcome"]["business_outcome"], "partial")
+        self.assertEqual(result["ai"]["outcome"]["repair_attempts"], 1)
         for _messages, kwargs in client.calls:
             self.assertTrue(kwargs["thinking"])
             self.assertEqual(kwargs["reasoning_effort"], "high")
             self.assertEqual(kwargs["json_retries"], 0)
-        second_request = json.loads(client.calls[1][0][-1]["content"].split("\n", 1)[1])
-        self.assertTrue(second_request["previous_output_invalid"])
-        fourth_request = json.loads(client.calls[3][0][-1]["content"].split("\n", 1)[1])
-        self.assertTrue(fourth_request["previous_output_invalid"])
 
     def test_generate_fatal_provider_failure_is_redacted_in_audit_summary(self) -> None:
         client = _PlanDeepSeek([DeepSeekError("network_error", "offline")])
         service = self.service(client)
         target = "不要写入审计的私密目标"
-        with self.assertRaisesRegex(DeepSeekError, "offline"):
-            service.ai_plan_preview(mode="generate", text=target, task_count=2)
+        result = service.ai_plan_preview(mode="generate", text=target, task_count=2)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["ai"]["outcome"]["business_outcome"], "unavailable")
         with Database(service.paths.database) as db:
             row = db.query(
                 "SELECT status,request_summary_json FROM ai_runs WHERE kind='plan_import'"
             )[0]
         summary = json.loads(row["request_summary_json"])
-        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["status"], "complete")
         self.assertEqual(summary["error_code"], "network_error")
         self.assertNotIn(target, row["request_summary_json"])
         self.assertNotIn("text_bytes", summary)

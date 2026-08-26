@@ -33,7 +33,7 @@ from . import __version__
 from .ai_context import PatchConflictError
 from .config import Paths
 from .credentials import CredentialStoreError
-from .deepseek import DeepSeekError
+from .provider import ProviderError
 from .knowledge_io import MarkdownWriteConflict
 from .plan_manager import DuplicatePlanError
 from .service_common import AIConversationConflict
@@ -44,6 +44,7 @@ from .storage_common import (
     ProblemContextConflict,
     TagOverrideRevisionConflict,
 )
+from .workspace import find_solution, parse_problem_ref
 
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -133,6 +134,25 @@ def _default_local_file_picker(kind: str, initial_dir: Path) -> str | None:
             except Exception:
                 pass
     return str(selected) if selected else None
+
+
+def _local_file_picker_initial_dir(
+    root: Path,
+    *,
+    kind: str,
+    problem: object = None,
+) -> Path:
+    """Resolve a problem-scoped picker directory, with a safe root fallback."""
+
+    root = root.resolve()
+    if kind != "cpp" or not isinstance(problem, str) or not problem.strip():
+        return root
+    try:
+        source = find_solution(root, parse_problem_ref(problem.strip())).resolve(strict=True)
+        source.relative_to(root)
+    except (FileNotFoundError, OSError, ValueError):
+        return root
+    return source.parent
 
 
 def _validate_local_file_selection(kind: str, selected: object) -> dict[str, str]:
@@ -403,17 +423,35 @@ def _problem_from_exception(exc: Exception) -> ApiProblem:
         )
     if isinstance(exc, _REVISION_CONFLICT_TYPES):
         return ApiProblem(HTTPStatus.CONFLICT, "revision_conflict", str(exc))
-    if isinstance(exc, DeepSeekError):
-        code = str(getattr(exc, "code", "deepseek_error"))
-        if code in {"missing_api_key", "invalid_model", "invalid_messages", "invalid_reasoning_effort"}:
+    if isinstance(exc, ProviderError):
+        code = str(getattr(exc, "code", "provider_error"))
+        if code in {
+            "missing_api_key", "invalid_model", "invalid_messages", "invalid_reasoning_effort",
+            "invalid_provider", "invalid_profile", "invalid_identifier", "invalid_endpoint",
+            "unsafe_endpoint", "invalid_auth", "invalid_capability", "invalid_credential_slot",
+            "unsupported_capability", "unverified_capability", "stale_capability_evidence",
+            "invalid_model_ref", "model_unavailable", "unsupported_reasoning_strength",
+            "unverified_reasoning_strength",
+            "invalid_policy", "invalid_budget", "invalid_fallback",
+            "budget_exceeded", "cost_limit_exceeded", "cost_limit_unknown",
+        }:
             return ApiProblem(HTTPStatus.BAD_REQUEST, code, str(exc))
+        if code in {"provider_in_use", "credential_origin_mismatch"}:
+            return ApiProblem(HTTPStatus.CONFLICT, code, str(exc))
         if code == "timeout":
             return ApiProblem(HTTPStatus.GATEWAY_TIMEOUT, code, str(exc))
         if code == "rate_limited":
             return ApiProblem(HTTPStatus.SERVICE_UNAVAILABLE, code, str(exc))
         return ApiProblem(HTTPStatus.BAD_GATEWAY, code, str(exc))
     if isinstance(exc, CredentialStoreError):
-        return ApiProblem(HTTPStatus.CONFLICT, "credential_store_error", str(exc))
+        code = str(
+            getattr(exc, "code", "credential_store_error") or "credential_store_error"
+        )
+        if code == "credential_store_unavailable":
+            return ApiProblem(HTTPStatus.SERVICE_UNAVAILABLE, code, str(exc))
+        if code == "credential_store_locked":
+            return ApiProblem(HTTPStatus.CONFLICT, code, str(exc))
+        return ApiProblem(HTTPStatus.CONFLICT, code, str(exc))
     if isinstance(exc, DuplicatePlanError):
         return ApiProblem(HTTPStatus.CONFLICT, "duplicate_plan", str(exc))
     if isinstance(exc, KeyError):
@@ -514,6 +552,17 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
         "/api/problems/context": "problem_context_save",
         "/api/ai/settings": "ai_settings",
         "/api/ai/credential": "ai_credential",
+        "/api/ai/providers": "ai_provider_upsert",
+        "/api/ai/providers/disable": "ai_provider_disable",
+        "/api/ai/connections": "ai_connection_upsert",
+        "/api/ai/connections/refresh": "ai_connection_refresh",
+        "/api/ai/connections/delete": "ai_connection_delete",
+        "/api/ai/profiles": "ai_profile_update",
+        "/api/ai/policy": "ai_policy_update",
+        "/api/ai/costs/reprice": "ai_costs_reprice",
+        "/api/ai/cache/clear": "ai_cache_clear",
+        "/api/ai/cache/prune": "ai_cache_prune",
+        "/api/ai/credentials": "ai_credential_slot",
         "/api/ai/conversations": "ai_conversation_start",
         "/api/knowledge/targets": "knowledge_target_create",
         "/api/knowledge/targets/inspect": "knowledge_target_inspect",
@@ -523,6 +572,8 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
         "/api/jobs/verify": "verify",
         "/api/jobs/plans/tags/preview": "plan_tags_preview",
         "/api/jobs/ai/test": "ai_test",
+        "/api/jobs/ai/providers/test": "ai_provider_test",
+        "/api/jobs/ai/models/verify": "ai_model_verify",
         "/api/jobs/ai/recommendations": "ai_recommendations",
         "/api/jobs/ai/plans/preview": "ai_plan_preview",
         "/api/jobs/problems/context/fetch": "problem_context_fetch",
@@ -549,7 +600,7 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
         route_specs = (
             ("knowledge_proposal", "/api/knowledge/proposals/", ("refresh",)),
             ("knowledge_job", "/api/jobs/knowledge/proposals/", ("apply", "revert")),
-            ("conversation", "/api/ai/conversations/", ("clear", "messages")),
+            ("conversation", "/api/ai/conversations/", ("clear", "switch", "messages")),
         )
         for kind, prefix, actions in route_specs:
             if not path.startswith(prefix):
@@ -621,12 +672,27 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
                         "invalid_request",
                         "kind must be 'cpp' or 'markdown'",
                     )
-                if set(payload) != {"kind"}:
+                allowed_fields = {"kind", "problem"} if kind == "cpp" else {"kind"}
+                if not set(payload).issubset(allowed_fields):
                     raise ApiProblem(
                         HTTPStatus.BAD_REQUEST,
                         "invalid_request",
-                        "File picker only accepts the kind field",
+                        "File picker request contains unsupported fields",
                     )
+                problem = payload.get("problem")
+                if problem is not None and (
+                    not isinstance(problem, str) or len(problem) > 200
+                ):
+                    raise ApiProblem(
+                        HTTPStatus.BAD_REQUEST,
+                        "invalid_request",
+                        "problem must be a string no longer than 200 characters",
+                    )
+                initial_dir = _local_file_picker_initial_dir(
+                    self.server.root,
+                    kind=kind,
+                    problem=problem,
+                )
                 if not self.server.file_dialog_lock.acquire(blocking=False):
                     raise ApiProblem(
                         HTTPStatus.CONFLICT,
@@ -635,7 +701,7 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
                     )
                 try:
                     try:
-                        selected = self.server.file_picker(kind, self.server.root)
+                        selected = self.server.file_picker(kind, initial_dir)
                     except FileDialogUnavailable as exc:
                         raise ApiProblem(
                             HTTPStatus.SERVICE_UNAVAILABLE,
@@ -752,6 +818,14 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
                     with self.server.service_lock:
                         result = self._invoke(
                             "ai_conversation_clear", {"conversation_id": identifier}
+                        )
+                    self._send_success(result)
+                    return
+                if action == "switch":
+                    with self.server.service_lock:
+                        result = self._invoke(
+                            "ai_conversation_switch",
+                            {"conversation_id": identifier, **payload},
                         )
                     self._send_success(result)
                     return
@@ -920,6 +994,36 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/ai/status":
                 with self.server.service_lock:
                     result = self._invoke("ai_status", {})
+                self._send_success(result)
+                return
+            if path == "/api/ai/providers":
+                with self.server.service_lock:
+                    result = self._invoke("ai_providers", {})
+                self._send_success(result)
+                return
+            if path == "/api/ai/connections":
+                with self.server.service_lock:
+                    result = self._invoke("ai_connections", {})
+                self._send_success(result)
+                return
+            if path == "/api/ai/profiles":
+                with self.server.service_lock:
+                    result = self._invoke("ai_profiles", {})
+                self._send_success(result)
+                return
+            if path == "/api/ai/costs":
+                with self.server.service_lock:
+                    result = self._invoke("ai_costs", {})
+                self._send_success(result)
+                return
+            if path == "/api/ai/cache":
+                with self.server.service_lock:
+                    result = self._invoke("ai_cache_status", {})
+                self._send_success(result)
+                return
+            if path == "/api/ai/credentials":
+                with self.server.service_lock:
+                    result = self._invoke("ai_credentials", {})
                 self._send_success(result)
                 return
             if path == "/api/knowledge/templates":
