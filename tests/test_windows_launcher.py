@@ -81,9 +81,13 @@ class WindowsLauncherTests(unittest.TestCase):
     def test_store_alias_is_rejected_and_system_drive_location_is_probed(self) -> None:
         completed = run_powershell(
             helper_script(
+                "$env:SystemDrive = [System.IO.Path]::GetTempPath().TrimEnd([System.IO.Path]::DirectorySeparatorChar)\n"
+                "$script:expectedSystemPython = Join-Path $env:SystemDrive 'Python313\\python.exe'\n"
+                "function Test-Path { param([string] $LiteralPath, [string] $PathType) "
+                "return $LiteralPath -ieq $script:expectedSystemPython }\n"
                 "$alias = Test-AcmStoreAlias 'C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe'\n"
                 "$hasSystemDrive = [bool]((Get-AcmPython313Candidates) | "
-                "Where-Object { $_.FilePath -ieq (Join-Path $env:SystemDrive 'Python313\\python.exe') })\n"
+                "Where-Object { $_.FilePath -ieq $script:expectedSystemPython })\n"
                 "@{ alias = $alias; systemDrive = $hasSystemDrive } | ConvertTo-Json -Compress"
             )
         )

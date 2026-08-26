@@ -352,7 +352,7 @@ class UnixLauncherBehaviorTests(unittest.TestCase):
 
     def test_missing_dependency_lock_falls_back_without_installing(self) -> None:
         (self.root / "tools" / LOCK_SOURCE.name).unlink()
-        base_python = self.fake_bin / "python3"
+        base_python = self.fake_bin / "python3.13"
         _write_executable(
             base_python,
             "#!/bin/sh\ncase \"$*\" in *hashlib*) exit 1 ;; esac\nprintf '%s\\n' \"$0\"\n",

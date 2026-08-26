@@ -4228,7 +4228,6 @@ class ServiceAIMixin:
                     result.content, hint_level=hint_level
                 )
         except ProviderError as exc:
-            self._fail_ai_message(prepared, exc)
             if exc.code in {
                 "missing_api_key", "authentication_error", "permission_denied",
                 "insufficient_balance", "invalid_provider", "invalid_model",
@@ -4243,10 +4242,9 @@ class ServiceAIMixin:
                 apply_ready=False,
                 repair_attempts=repair_attempts,
             )
-            with Database(self.paths.database) as db:
-                db.update_ai_run(
-                    prepared["run_id"], status="complete", outcome=unavailable_outcome
-                )
+            self._fail_ai_message(
+                prepared, exc, terminal_outcome=unavailable_outcome
+            )
             return {
                 "ok": False,
                 "conversation_id": prepared["conversation_id"],
@@ -4260,7 +4258,6 @@ class ServiceAIMixin:
             }
         except ValueError as exc:
             error = ProviderError("invalid_coaching_content", str(exc))
-            self._fail_ai_message(prepared, error)
             unavailable_outcome = build_ai_outcome(
                 provider_outcome="succeeded",
                 artifact_outcome="invalid",
@@ -4268,10 +4265,9 @@ class ServiceAIMixin:
                 apply_ready=False,
                 repair_attempts=repair_attempts,
             )
-            with Database(self.paths.database) as db:
-                db.update_ai_run(
-                    prepared["run_id"], status="complete", outcome=unavailable_outcome
-                )
+            self._fail_ai_message(
+                prepared, error, terminal_outcome=unavailable_outcome
+            )
             return {
                 "ok": False,
                 "conversation_id": prepared["conversation_id"],
@@ -5374,6 +5370,7 @@ class ServiceAIMixin:
         *,
         content: str = "",
         interrupted: bool = False,
+        terminal_outcome: Mapping[str, Any] | None = None,
     ) -> None:
         stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         with Database(self.paths.database) as db:
@@ -5386,9 +5383,18 @@ class ServiceAIMixin:
                 )
                 db.update_ai_run(
                     str(prepared["run_id"]),
-                    status="interrupted" if interrupted else "failed",
+                    status=(
+                        "complete"
+                        if terminal_outcome is not None
+                        else ("interrupted" if interrupted else "failed")
+                    ),
                     usage=error.usage,
                     error=error.as_dict(),
+                    **(
+                        {"outcome": terminal_outcome}
+                        if terminal_outcome is not None
+                        else {}
+                    ),
                     **(
                         self._governance_storage_args(
                             prepared.get("governance_value", error), prepared["route"]
