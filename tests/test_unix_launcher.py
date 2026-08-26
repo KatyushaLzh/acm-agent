@@ -21,102 +21,23 @@ def _write_executable(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
-@unittest.skipUnless(os.name != "nt" and shutil.which("sh"), "requires a POSIX shell")
-class UnixLauncherBehaviorTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp_dir.name)
-        self.fake_bin = self.root / "fake-bin"
-        self.fake_bin.mkdir()
-        (self.root / "tools").mkdir()
-        shutil.copy2(HELPER_SOURCE, self.root / "tools" / HELPER_SOURCE.name)
-        shutil.copy2(LOCK_SOURCE, self.root / "tools" / LOCK_SOURCE.name)
-
-    def tearDown(self) -> None:
-        self.temp_dir.cleanup()
-
-    def _env(self, **updates: str) -> dict[str, str]:
-        env = os.environ.copy()
-        env.update(updates)
-        env["PATH"] = f"{self.fake_bin}{os.pathsep}{env['PATH']}"
-        return env
-
-    def _run_helper(self, input_text: str, **env: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["sh", str(self.root / "tools" / HELPER_SOURCE.name), str(self.root)],
-            input=input_text,
-            text=True,
-            capture_output=True,
-            env=self._env(**env),
-            check=False,
-        )
-
-    def _reject_system_pythons(self) -> None:
-        for name in ("python3.13", "python3", "python"):
-            _write_executable(self.fake_bin / name, "#!/bin/sh\nexit 1\n")
-
-    def _install_fakes(self) -> tuple[Path, Path]:
-        self._reject_system_pythons()
-        download_log = self.root / "downloads.log"
-        uv_log = self.root / "uv.log"
-        _write_executable(
-            self.fake_bin / "curl",
+def _fake_uv_script(version: str = "0.12.5") -> str:
+    return (
+        textwrap.dedent(
             r"""
-            #!/bin/sh
-            output=
-            url=
-            while [ "$#" -gt 0 ]; do
-                case "$1" in
-                    --output) shift; output=$1 ;;
-                    https://*) url=$1 ;;
-                esac
-                shift
-            done
-            printf '%s\n' "$url" >> "$FAKE_DOWNLOAD_LOG"
-            case "$url" in
-                *uv.agentsmirror.com*)
-                    [ "${FAKE_FAIL_UV_MIRROR-0}" = 1 ] && exit 22
-                    printf '%s' domestic > "$output"
-                    ;;
-                *) printf '%s' official > "$output" ;;
-            esac
-            """,
-        )
-        _write_executable(
-            self.fake_bin / "sha256sum",
-            r"""
-            #!/bin/sh
-            if [ "${FAKE_BAD_DOMESTIC_HASH-0}" = 1 ] && [ "$(cat "$1")" = domestic ]; then
-                printf '%064d  %s\n' 0 "$1"
-            else
-                printf '%s  %s\n' "$FAKE_UV_HASH" "$1"
-            fi
-            """,
-        )
-        _write_executable(
-            self.fake_bin / "tar",
-            r"""
-            #!/bin/sh
-            destination=
-            while [ "$#" -gt 0 ]; do
-                case "$1" in
-                    -C) shift; destination=$1 ;;
-                esac
-                shift
-            done
-            uv_dir=$destination/uv-$FAKE_UV_TARGET
-            mkdir -p "$uv_dir"
-            cat > "$uv_dir/uv" <<'UVEOF'
             #!/bin/sh
             printf '%s\n' "$*" >> "$FAKE_UV_LOG"
             if [ "$1" = "--version" ]; then
-                printf '%s\n' 'uv 0.12.5'
+                printf '%s\n' 'uv __UV_VERSION__'
                 exit 0
             fi
             if [ "$1" = python ] && [ "$2" = install ]; then
                 case "$*" in
                     *registry.npmmirror.com*)
                         [ "${FAKE_FAIL_PYTHON_MIRROR-0}" = 1 ] && exit 1
+                        ;;
+                    *github.com/astral-sh/python-build-standalone*)
+                        [ "${FAKE_FAIL_PYTHON_OFFICIAL-0}" = 1 ] && exit 1
                         ;;
                 esac
                 python_dir=$UV_PYTHON_INSTALL_DIR/cpython-3.13.15-test/bin
@@ -150,11 +71,138 @@ class UnixLauncherBehaviorTests(unittest.TestCase):
                 exit "${FAKE_FAIL_WEB_SYNC-0}"
             fi
             exit 1
-            UVEOF
+            """
+        ).lstrip().replace("__UV_VERSION__", version)
+    )
+
+
+@unittest.skipUnless(os.name != "nt" and shutil.which("sh"), "requires a POSIX shell")
+class UnixLauncherBehaviorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.fake_bin = self.root / "fake-bin"
+        self.fake_bin.mkdir()
+        (self.root / "tools").mkdir()
+        shutil.copy2(HELPER_SOURCE, self.root / "tools" / HELPER_SOURCE.name)
+        shutil.copy2(LOCK_SOURCE, self.root / "tools" / LOCK_SOURCE.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _env(self, **updates: str) -> dict[str, str]:
+        env = os.environ.copy()
+        env.update(updates)
+        env["PATH"] = f"{self.fake_bin}{os.pathsep}{env['PATH']}"
+        if hasattr(self, "fake_uv_payload"):
+            env["FAKE_UV_PAYLOAD"] = str(self.fake_uv_payload)
+        return env
+
+    def _run_helper(self, input_text: str, **env: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["sh", str(self.root / "tools" / HELPER_SOURCE.name), str(self.root)],
+            input=input_text,
+            text=True,
+            capture_output=True,
+            env=self._env(**env),
+            check=False,
+        )
+
+    def _reject_system_pythons(self) -> None:
+        for name in ("python3.13", "python3", "python"):
+            _write_executable(self.fake_bin / name, "#!/bin/sh\nexit 1\n")
+
+    def _install_fakes(self, *, global_uv_version: str | None = "0.11.0") -> tuple[Path, Path]:
+        self._reject_system_pythons()
+        download_log = self.root / "downloads.log"
+        uv_log = self.root / "uv.log"
+        self.fake_uv_payload = self.root / "fake-uv-payload"
+        _write_executable(self.fake_uv_payload, _fake_uv_script())
+        if global_uv_version is not None:
+            _write_executable(
+                self.fake_bin / "uv",
+                r"""
+                #!/bin/sh
+                printf 'global:%s\n' "$*" >> "$FAKE_UV_LOG"
+                if [ "$1" = "--version" ]; then
+                    printf 'uv %s\n' "${FAKE_GLOBAL_UV_VERSION-0.11.0}"
+                    exit 0
+                fi
+                if [ "${FAKE_GLOBAL_UV_VERSION-0.11.0}" = 0.12.5 ]; then
+                    exec "$FAKE_UV_PAYLOAD" "$@"
+                fi
+                exit 97
+                """,
+            )
+        _write_executable(
+            self.fake_bin / "curl",
+            r"""
+            #!/bin/sh
+            output=
+            url=
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --output) shift; output=$1 ;;
+                    https://*) url=$1 ;;
+                esac
+                shift
+            done
+            printf '%s\n' "$url" >> "$FAKE_DOWNLOAD_LOG"
+            case "$url" in
+                *uv.agentsmirror.com*)
+                    [ "${FAKE_FAIL_UV_MIRROR-0}" = 1 ] && exit 22
+                    printf '%s' domestic > "$output"
+                    ;;
+                *github.com/astral-sh/uv*)
+                    [ "${FAKE_FAIL_UV_OFFICIAL-0}" = 1 ] && exit 22
+                    printf '%s' official > "$output"
+                    ;;
+                *) exit 22 ;;
+            esac
+            """,
+        )
+        _write_executable(
+            self.fake_bin / "sha256sum",
+            r"""
+            #!/bin/sh
+            if [ "${FAKE_BAD_DOMESTIC_HASH-0}" = 1 ] && [ "$(cat "$1")" = domestic ]; then
+                printf '%064d  %s\n' 0 "$1"
+            else
+                printf '%s  %s\n' "$FAKE_UV_HASH" "$1"
+            fi
+            """,
+        )
+        _write_executable(
+            self.fake_bin / "tar",
+            r"""
+            #!/bin/sh
+            destination=
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    -C) shift; destination=$1 ;;
+                esac
+                shift
+            done
+            uv_dir=$destination/uv-$FAKE_UV_TARGET
+            mkdir -p "$uv_dir"
+            cp "$FAKE_UV_PAYLOAD" "$uv_dir/uv"
             chmod 755 "$uv_dir/uv"
             """,
         )
         return download_log, uv_log
+
+    def _linux_bootstrap_env(self, download_log: Path, uv_log: Path, **updates: str) -> dict[str, str]:
+        env = {
+            "ACM_BOOTSTRAP_UNAME_S": "Linux",
+            "ACM_BOOTSTRAP_UNAME_M": "x86_64",
+            "ACM_BOOTSTRAP_LIBC": "gnu",
+            "FAKE_UV_TARGET": "x86_64-unknown-linux-gnu",
+            "FAKE_UV_HASH": "68a509da24b06b4223a1c0175fb5eb5bc79342b76cbeff0cfe51ac3f5b17b6b2",
+            "FAKE_DOWNLOAD_LOG": str(download_log),
+            "FAKE_UV_LOG": str(uv_log),
+        }
+        env.update(updates)
+        return env
 
     def test_prefers_exact_final_python_and_warns_without_tkinter(self) -> None:
         download_log, uv_log = self._install_fakes()
@@ -294,6 +342,118 @@ class UnixLauncherBehaviorTests(unittest.TestCase):
         uv_calls = uv_log.read_text(encoding="utf-8")
         self.assertIn("registry.npmmirror.com/-/binary/python-build-standalone", uv_calls)
         self.assertIn("github.com/astral-sh/python-build-standalone/releases/download", uv_calls)
+
+    def test_matching_project_uv_is_reused_before_global_uv_without_download(self) -> None:
+        download_log, uv_log = self._install_fakes()
+        project_uv = self.root / ".acm/runtime/bootstrap/uv-0.12.5-x86_64-unknown-linux-gnu"
+        project_uv.parent.mkdir(parents=True)
+        shutil.copy2(self.fake_uv_payload, project_uv)
+        project_uv.chmod(0o755)
+
+        result = self._run_helper("y\n", **self._linux_bootstrap_env(download_log, uv_log))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(download_log.exists())
+        self.assertNotIn("global:", uv_log.read_text(encoding="utf-8"))
+        self.assertEqual(project_uv.read_bytes(), self.fake_uv_payload.read_bytes())
+
+    def test_matching_global_uv_is_reused_without_project_install_or_path_changes(self) -> None:
+        download_log, uv_log = self._install_fakes()
+        original_path = os.environ.get("PATH", "")
+
+        result = self._run_helper(
+            "y\n",
+            **self._linux_bootstrap_env(
+                download_log,
+                uv_log,
+                FAKE_GLOBAL_UV_VERSION="0.12.5",
+            ),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(download_log.exists())
+        self.assertIn("Reusing global uv 0.12.5", result.stderr)
+        uv_calls = uv_log.read_text(encoding="utf-8")
+        self.assertIn("global:--version", uv_calls)
+        self.assertIn("global:python install 3.13.15", uv_calls)
+        self.assertFalse(
+            (self.root / ".acm/runtime/bootstrap/uv-0.12.5-x86_64-unknown-linux-gnu").exists()
+        )
+        self.assertEqual(os.environ.get("PATH", ""), original_path)
+
+    def test_mismatched_global_uv_is_only_probed_then_project_uv_is_downloaded(self) -> None:
+        download_log, uv_log = self._install_fakes()
+        global_uv = self.fake_bin / "uv"
+        original_global_uv = global_uv.read_bytes()
+
+        result = self._run_helper("y\n", **self._linux_bootstrap_env(download_log, uv_log))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Ignoring global uv", result.stderr)
+        self.assertEqual(global_uv.read_bytes(), original_global_uv)
+        uv_calls = uv_log.read_text(encoding="utf-8")
+        self.assertIn("global:--version", uv_calls)
+        self.assertNotIn("global:python", uv_calls)
+        self.assertIn("uv.agentsmirror.com", download_log.read_text(encoding="utf-8"))
+
+    def test_damaged_or_mismatched_project_uv_is_the_only_file_replaced(self) -> None:
+        download_log, uv_log = self._install_fakes()
+        bootstrap_dir = self.root / ".acm/runtime/bootstrap"
+        project_uv = bootstrap_dir / "uv-0.12.5-x86_64-unknown-linux-gnu"
+        sentinel = bootstrap_dir / "keep-me"
+
+        for mode in ("wrong-version", "not-executable"):
+            with self.subTest(mode=mode):
+                shutil.rmtree(self.root / ".acm", ignore_errors=True)
+                bootstrap_dir.mkdir(parents=True)
+                sentinel.write_text("unchanged", encoding="utf-8")
+                if mode == "wrong-version":
+                    _write_executable(project_uv, "#!/bin/sh\nprintf '%s\\n' 'uv 0.11.0'\n")
+                else:
+                    project_uv.write_text("damaged", encoding="utf-8")
+                    project_uv.chmod(0o644)
+                download_log.write_text("", encoding="utf-8")
+                uv_log.write_text("", encoding="utf-8")
+
+                result = self._run_helper(
+                    "y\n",
+                    **self._linux_bootstrap_env(
+                        download_log,
+                        uv_log,
+                        FAKE_GLOBAL_UV_VERSION="0.12.5",
+                    ),
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Replacing the damaged or mismatched project-local uv", result.stderr)
+                self.assertEqual(project_uv.read_bytes(), self.fake_uv_payload.read_bytes())
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
+                self.assertNotIn("global:", uv_log.read_text(encoding="utf-8"))
+
+    def test_both_uv_sources_failing_aborts_without_using_mismatched_global_uv(self) -> None:
+        download_log, uv_log = self._install_fakes()
+
+        result = self._run_helper(
+            "y\n",
+            **self._linux_bootstrap_env(
+                download_log,
+                uv_log,
+                FAKE_FAIL_UV_MIRROR="1",
+                FAKE_FAIL_UV_OFFICIAL="1",
+            ),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Both uv sources failed", result.stderr)
+        downloads = download_log.read_text(encoding="utf-8")
+        self.assertIn("uv.agentsmirror.com", downloads)
+        self.assertIn("github.com/astral-sh/uv", downloads)
+        uv_calls = uv_log.read_text(encoding="utf-8")
+        self.assertEqual(uv_calls.strip(), "global:--version")
+        self.assertNotIn("python install", uv_calls)
+        self.assertFalse(
+            (self.root / ".acm/runtime/bootstrap/uv-0.12.5-x86_64-unknown-linux-gnu").exists()
+        )
 
     def test_ready_environment_is_reused_without_uv_or_network(self) -> None:
         download_log, uv_log = self._install_fakes()

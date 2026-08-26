@@ -211,6 +211,21 @@ download_verified_uv() {
     fi
 }
 
+probe_uv() {
+    candidate=$1
+    [ -x "$candidate" ] || return 1
+    reported_version=$("$candidate" --version 2>/dev/null) || return 1
+    case "$reported_version" in
+        *'
+'*) return 1 ;;
+    esac
+    uv_name=${reported_version%% *}
+    uv_remainder=${reported_version#* }
+    [ "$uv_remainder" != "$reported_version" ] || return 1
+    uv_number=${uv_remainder%% *}
+    [ "$uv_name" = uv ] && [ "$uv_number" = "$UV_VERSION" ]
+}
+
 sha256_file() {
     file=$1
     if command -v sha256sum >/dev/null 2>&1; then
@@ -230,8 +245,29 @@ obtain_uv() {
     mkdir -p "$BOOTSTRAP_DIR" "$PYTHON_DIR" "$CACHE_DIR"
     UV_BIN=$BOOTSTRAP_DIR/uv-$UV_VERSION-$UV_TARGET
 
-    if [ -x "$UV_BIN" ] && [ "$("$UV_BIN" --version 2>/dev/null || true)" = "uv $UV_VERSION" ]; then
-        return 0
+    if [ -e "$UV_BIN" ] || [ -L "$UV_BIN" ]; then
+        if probe_uv "$UV_BIN"; then
+            return 0
+        fi
+        if [ -d "$UV_BIN" ]; then
+            printf 'The project-local uv path is a directory and cannot be repaired safely: %s\n' "$UV_BIN" >&2
+            return 1
+        fi
+        printf 'Replacing the damaged or mismatched project-local uv bootstrap: %s\n' "$UV_BIN" >&2
+        if ! rm -f "$UV_BIN"; then
+            printf '%s\n' 'Failed to remove the unusable project-local uv bootstrap.' >&2
+            return 1
+        fi
+    else
+        global_uv=$(command -v uv 2>/dev/null || true)
+        if [ -n "$global_uv" ] && [ -x "$global_uv" ]; then
+            if probe_uv "$global_uv"; then
+                UV_BIN=$global_uv
+                printf 'Reusing global uv %s without changing PATH or the global installation.\n' "$UV_VERSION" >&2
+                return 0
+            fi
+            printf 'Ignoring global uv because it is not the required version %s; it will not be upgraded or removed.\n' "$UV_VERSION" >&2
+        fi
     fi
 
     TEMP_DIR=$(mktemp -d "$BOOTSTRAP_DIR/.uv-$UV_VERSION-$UV_TARGET.XXXXXXXX") || {
@@ -262,7 +298,7 @@ obtain_uv() {
     fi
     chmod 755 "$extracted_uv"
     mv -f "$extracted_uv" "$UV_BIN"
-    if [ "$("$UV_BIN" --version 2>/dev/null || true)" != "uv $UV_VERSION" ]; then
+    if ! probe_uv "$UV_BIN"; then
         rm -f "$UV_BIN"
         printf '%s\n' 'The installed uv bootstrap failed its version check.' >&2
         return 1

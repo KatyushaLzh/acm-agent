@@ -46,7 +46,7 @@ chmod +x acm.sh start-acm-web.sh
 四个 Web 入口（`start-acm-web.cmd`、`.\acm.ps1 web`、`./start-acm-web.sh`、`./acm.sh web`）都会先严格检查正式版 Python 3.13.x；只有 3.12、3.14 或其他版本时仍视为缺失。缺失时会循环询问是否安装：输入 `y` 继续联网安装，输入 `n`、标准输入结束或不可交互时安全退出，不会启动 Web。
 
 - Windows 固定安装 Python 3.13.15 到当前用户，不替换系统 Python、无需管理员权限；安装包优先从华为云镜像下载，失败后回退至 python.org，并在执行前校验官方 SHA-256。
-- Linux（glibc/musl，x86_64/ARM64）和 macOS（Intel/Apple Silicon）使用经校验的固定版 uv，在仓库 `.acm/runtime` 内安装托管的 Python 3.13.15；运行时优先使用 npmmirror，失败后回退官方源。该流程不调用 `sudo`、不修改 shell profile、PATH 或系统 Python。FreeBSD、OpenBSD、Solaris 等其他 Unix 暂不支持自动安装。
+- Linux（glibc/musl，x86_64/ARM64）和 macOS（Intel/Apple Silicon）使用固定版 uv 安装托管的 Python 3.13.15。项目内 `.acm/runtime/bootstrap` 已有可执行的目标 uv 时优先复用；项目文件损坏或版本不符时只替换该文件并重新下载校验。项目文件不存在时，全局 uv 恰好匹配固定版本才会复用；未安装或版本不同则下载固定版到项目目录，不升级、不卸载全局 uv，也不修改 PATH。uv 国内镜像下载或 SHA-256 校验失败时回退 GitHub，两个源都失败便终止 Python 安装，绝不使用不匹配的全局版本。Python 运行时优先使用 npmmirror，失败后回退官方源。该流程不调用 `sudo`、不修改 shell profile、PATH 或系统 Python。FreeBSD、OpenBSD、Solaris 等其他 Unix 暂不支持自动安装。
 
 已有任意正式版 Python 3.13.x 时会直接复用。自动安装完成后还会检查 `sqlite3`、`ssl` 等 Web 所需标准库；`tkinter` 缺失不阻止核心 Dashboard 启动，但原生文件选择器及相关操作会提示不可用。
 
