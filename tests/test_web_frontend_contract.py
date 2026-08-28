@@ -31,6 +31,12 @@ class WebFrontendConcurrencyContractTests(unittest.TestCase):
         self.assertIn("if (done && buffer.trim())", self.ai)
         self.assertIn("return completed", self.ai)
 
+    def test_ai_stream_completion_flag_survives_try_scope(self) -> None:
+        body = self.ai.split("async function streamAiChat", 1)[1].split(
+            "async function clearAiConversation", 1
+        )[0]
+        self.assertLess(body.index("let completed = false;"), body.index("try {"))
+
     def test_plan_selection_drops_stale_responses(self) -> None:
         self.assertIn("planSelectionEpoch", self.core)
         self.assertIn("planSelectionController", self.core)

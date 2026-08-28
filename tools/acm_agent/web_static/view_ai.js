@@ -1113,6 +1113,7 @@ async function streamAiChat(message, mode, hintLevel) {
   problemInput.disabled = true;
   appendAiMessage("user", message);
   const assistant = appendAiMessage("assistant", "");
+  let completed = false;
   try {
     const response = await postEventStream(
       `/api/ai/conversations/${encodeURIComponent(conversationId)}/messages`,
@@ -1124,7 +1125,7 @@ async function streamAiChat(message, mode, hintLevel) {
       try { const payload = await response.json(); detail = payload.error?.message || payload.error || detail; } catch {}
       assistant.remove(); throw new Error(String(detail));
     }
-    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let completed = false;
+    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = "";
     const consumeBlock = block => {
       if (!aiOperationIsCurrent(problemKey, epoch) || state.aiStreamController !== controller) {
         controller.abort();
