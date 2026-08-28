@@ -602,7 +602,7 @@ class AIPlanImportServiceTests(unittest.TestCase):
             self.assertIs(kwargs["thinking"], True)
             self.assertEqual(kwargs["reasoning_effort"], "high")
             self.assertEqual(kwargs["json_retries"], 0)
-            self.assertEqual(kwargs["max_tokens"], 24000)
+            self.assertEqual(kwargs["max_tokens"], 32000)
         first_request = json.loads(client.calls[0][0][-1]["content"].split("\n", 1)[1])
         self.assertEqual(
             set(first_request),

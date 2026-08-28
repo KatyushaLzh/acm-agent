@@ -100,7 +100,7 @@ class SummaryReliabilityTests(unittest.TestCase):
         self.assertEqual(result["ai"]["outcome"]["repair_attempts"], 1)
         self.assertTrue(result["proposal"]["can_apply"])
         self.assertEqual(len(provider.calls), 2)
-        self.assertTrue(all(call["max_tokens"] == 6_000 for call in provider.calls))
+        self.assertTrue(all(call["max_tokens"] == 8_192 for call in provider.calls))
         self.assertEqual(self.cache_entries(), 1)
         with Database(self.root / ".acm" / "state.db") as db:
             run = db.ai_run(str(result["proposal"]["ai_run_id"]))

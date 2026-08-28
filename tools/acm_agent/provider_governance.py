@@ -82,6 +82,22 @@ def _structured_repair_messages(
     return repaired
 
 
+def _require_complete_structured_result(result: AIJsonResult) -> AIJsonResult:
+    if str(result.finish_reason or "").strip().lower() != "length":
+        return result
+    raise ProviderError(
+        "response_incomplete",
+        "Structured response reached the maximum output token budget",
+        retryable=False,
+        usage=result.usage,
+        finish_reason="length",
+        model=result.resolved_model,
+        requested_model=result.requested_model,
+        response_id=result.response_id,
+        protocol_details=result.provider_metadata,
+    )
+
+
 class GovernedProviderClient:
     """ProviderPort proxy sharing one budget across retries, rounds and fallback legs."""
 
@@ -485,12 +501,14 @@ class GovernedProviderClient:
             **options, "json_schema": json_schema, "schema_name": schema_name
         }
         try:
-            return self._invoke(
-                "structured",
-                messages,
-                invoke_options,
-                purpose=purpose,
-                validation_code=validation_code,
+            return _require_complete_structured_result(
+                self._invoke(
+                    "structured",
+                    messages,
+                    invoke_options,
+                    purpose=purpose,
+                    validation_code=validation_code,
+                )
             )
         except ProviderError as initial_error:
             repair_code = (
@@ -502,14 +520,16 @@ class GovernedProviderClient:
                 raise
             initial_usage = normalize_usage(initial_error.usage)
             try:
-                repaired = self._invoke(
-                    "structured",
-                    _structured_repair_messages(
-                        messages, validation_code=repair_code
-                    ),
-                    invoke_options,
-                    purpose="validation_repair",
-                    validation_code=repair_code,
+                repaired = _require_complete_structured_result(
+                    self._invoke(
+                        "structured",
+                        _structured_repair_messages(
+                            messages, validation_code=repair_code
+                        ),
+                        invoke_options,
+                        purpose="validation_repair",
+                        validation_code=repair_code,
+                    )
                 )
             except ProviderError as repair_error:
                 combined = dict(initial_usage)

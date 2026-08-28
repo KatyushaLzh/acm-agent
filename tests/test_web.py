@@ -1615,15 +1615,17 @@ class JobManagerTest(unittest.TestCase):
             self.assertIn("const button = event.currentTarget", block, selector)
             self.assertNotIn("setBusy(event.currentTarget, false)", block, selector)
 
-    def test_ai_math_renders_assistant_messages_only_after_streaming(self) -> None:
+    def test_ai_messages_use_safe_markdown_rendering_during_streaming(self) -> None:
         self.assertIn("function renderAssistantMath(node)", self.script)
         self.assertIn('node?.classList.contains("assistant")', self.script)
         self.assertIn("window.renderMathInElement(node", self.script)
         self.assertIn("throwOnError: false", self.script)
         self.assertIn("trust: false", self.script)
-        self.assertIn('if (role === "assistant") renderAssistantMath(node)', self.script)
-        self.assertIn("assistant.textContent += item.data.content", self.script)
-        self.assertIn("finally {\n    renderAssistantMath(assistant);", self.script)
+        self.assertIn('if (role === "assistant") renderSafeKnowledgeMarkdown(node, content)', self.script)
+        self.assertIn('let assistantMarkdown = ""', self.script)
+        self.assertIn("assistantMarkdown += item.data.content", self.script)
+        self.assertIn("renderSafeKnowledgeMarkdown(assistant, assistantMarkdown)", self.script)
+        self.assertNotIn("assistant.textContent += item.data.content", self.script)
 
     def test_simplified_task_editor_only_exposes_problem_name_and_tags(self) -> None:
         self.assertNotIn('data-task-field="level"', self.script)

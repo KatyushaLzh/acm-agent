@@ -112,6 +112,38 @@ class ConfigTests(unittest.TestCase):
             )
             self.assertEqual(load_config(paths), loaded)
 
+    def test_v15_untouched_token_defaults_increase_but_custom_values_survive(self):
+        old_defaults = {
+            "recommendation": (2_400, 240_000),
+            "plan_organize": (12_000, 120_000),
+            "plan_generate": (24_000, 300_000),
+            "coaching": (4_096, 150_000),
+            "patch": (8_192, 200_000),
+            "summary": (6_000, 180_000),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = Paths.for_root(Path(temporary))
+            paths.ensure()
+            old = json.loads(json.dumps(DEFAULT_CONFIG))
+            old["version"] = 15
+            for profile_id, (output_tokens, total_tokens) in old_defaults.items():
+                budget = old["ai"]["policy"]["budgets"][profile_id]
+                budget["max_output_tokens"] = output_tokens
+                budget["max_total_tokens"] = total_tokens
+            old["ai"]["policy"]["budgets"]["summary"]["max_output_tokens"] = 7_777
+            paths.config.write_text(json.dumps(old), encoding="utf-8")
+
+            loaded = load_config(paths)
+            budgets = loaded["ai"]["policy"]["budgets"]
+
+            self.assertEqual(loaded["version"], CONFIG_VERSION)
+            self.assertEqual(budgets["recommendation"]["max_output_tokens"], 4_096)
+            self.assertEqual(budgets["recommendation"]["max_total_tokens"], 300_000)
+            self.assertEqual(budgets["coaching"]["max_output_tokens"], 8_192)
+            self.assertEqual(budgets["coaching"]["max_total_tokens"], 200_000)
+            self.assertEqual(budgets["summary"]["max_output_tokens"], 7_777)
+            self.assertEqual(budgets["summary"]["max_total_tokens"], 240_000)
+
     def test_config_import_does_not_load_provider_transport(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         completed = subprocess.run(
@@ -190,7 +222,7 @@ class ConfigTests(unittest.TestCase):
 
                 config = load_config(paths)
 
-                self.assertEqual(CONFIG_VERSION, 15)
+                self.assertEqual(CONFIG_VERSION, 16)
                 self.assertEqual(config["version"], CONFIG_VERSION)
                 for retired_key in (
                     "validation_model",

@@ -51,7 +51,7 @@ _DEEPSEEK_MODEL_IDS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
 
 _DEFAULT_TASK_BUDGETS: dict[str, dict[str, int | float]] = {
     "recommendation": {
-        "max_output_tokens": 2_400,
+        "max_output_tokens": 4_096,
         "request_timeout_seconds": 120.0,
         "max_retries": 1,
         "max_validation_repairs": 1,
@@ -61,47 +61,47 @@ _DEFAULT_TASK_BUDGETS: dict[str, dict[str, int | float]] = {
         # Live OpenAI-compatible usage is currently about 88k tokens for a
         # mature workspace.  Keep enough headroom for one governed retry or
         # validation repair without rejecting an already-paid response.
-        "max_total_tokens": 240_000,
+        "max_total_tokens": 300_000,
     },
     "plan_organize": {
-        "max_output_tokens": 12_000,
+        "max_output_tokens": 16_000,
         "request_timeout_seconds": 120.0,
         "max_retries": 1,
         "max_validation_repairs": 1,
         "max_requests": 3,
-        "max_total_tokens": 120_000,
+        "max_total_tokens": 160_000,
     },
     "plan_generate": {
-        "max_output_tokens": 24_000,
+        "max_output_tokens": 32_000,
         "request_timeout_seconds": 300.0,
         "max_retries": 1,
         "max_validation_repairs": 1,
         "max_requests": 6,
-        "max_total_tokens": 300_000,
+        "max_total_tokens": 400_000,
     },
     "coaching": {
-        "max_output_tokens": 4_096,
-        "request_timeout_seconds": 120.0,
-        "max_retries": 1,
-        "max_validation_repairs": 1,
-        "max_requests": 3,
-        "max_total_tokens": 150_000,
-    },
-    "patch": {
         "max_output_tokens": 8_192,
-        "request_timeout_seconds": 240.0,
+        "request_timeout_seconds": 120.0,
         "max_retries": 1,
         "max_validation_repairs": 1,
         "max_requests": 3,
         "max_total_tokens": 200_000,
     },
+    "patch": {
+        "max_output_tokens": 12_000,
+        "request_timeout_seconds": 240.0,
+        "max_retries": 1,
+        "max_validation_repairs": 1,
+        "max_requests": 3,
+        "max_total_tokens": 260_000,
+    },
     "summary": {
-        "max_output_tokens": 6_000,
+        "max_output_tokens": 8_192,
         "request_timeout_seconds": 180.0,
         "max_retries": 1,
         "max_validation_repairs": 1,
         "max_requests": 3,
-        "max_total_tokens": 180_000,
+        "max_total_tokens": 240_000,
     },
 }
 

@@ -18,6 +18,7 @@ from tools.acm_agent.provider import (
     AIJsonResult,
     AIResult,
     AIStreamEvent,
+    OUTPUT_TOKEN_LIMIT_MESSAGE,
     ProviderConfigurationError,
     ProviderError,
     ProviderHealth,
@@ -172,12 +173,12 @@ class Stage3PolicyTests(unittest.TestCase):
         budgets = default_ai_policy()["budgets"]
 
         expected = {
-            "recommendation": (1, 120.0, 2_400, 240_000, 3),
-            "plan_organize": (1, 120.0, 12_000, 120_000, 3),
-            "plan_generate": (1, 300.0, 24_000, 300_000, 6),
-            "coaching": (1, 120.0, 4_096, 150_000, 3),
-            "patch": (1, 240.0, 8_192, 200_000, 3),
-            "summary": (1, 180.0, 6_000, 180_000, 3),
+            "recommendation": (1, 120.0, 4_096, 300_000, 3),
+            "plan_organize": (1, 120.0, 16_000, 160_000, 3),
+            "plan_generate": (1, 300.0, 32_000, 400_000, 6),
+            "coaching": (1, 120.0, 8_192, 200_000, 3),
+            "patch": (1, 240.0, 12_000, 260_000, 3),
+            "summary": (1, 180.0, 8_192, 240_000, 3),
         }
         for profile_id, values in expected.items():
             budget = budgets[profile_id]
@@ -317,6 +318,35 @@ class Stage3GovernorTests(unittest.TestCase):
                     ).structured([], json_schema={"type": "object"}, schema_name="result")
                 self.assertEqual(captured.exception.code, error.code)
                 self.assertEqual(client.request_attempts, 1)
+
+    def test_structured_success_with_length_finish_is_repaired_or_rejected(self):
+        config = _ai_config(max_requests=2, max_retries=0)
+        config["policy"]["fallbacks"]["recommendation"] = []
+        route = ProviderRegistry(config).route("recommendation")
+        truncated = replace(_structured_result(route.model), finish_reason="length")
+        client = _CapturingStructuredClient([
+            truncated, _structured_result(route.model),
+        ])
+
+        result = GovernedProviderClient(
+            [route], lambda _route, _timeout: client
+        ).structured([], json_schema={"type": "object"}, schema_name="result")
+
+        self.assertTrue(result.data["ok"])
+        self.assertEqual(client.request_attempts, 2)
+        self.assertIn(
+            "validation_code=response_incomplete",
+            client.structured_calls[1][0][-1]["content"],
+        )
+
+        always_truncated = _CapturingStructuredClient([truncated, truncated])
+        with self.assertRaises(ProviderError) as captured:
+            GovernedProviderClient(
+                [route], lambda _route, _timeout: always_truncated
+            ).structured([], json_schema={"type": "object"}, schema_name="result")
+        self.assertEqual(captured.exception.code, "response_incomplete")
+        self.assertEqual(captured.exception.finish_reason, "length")
+        self.assertEqual(str(captured.exception), OUTPUT_TOKEN_LIMIT_MESSAGE)
 
     def test_transport_retry_exhaustion_blocks_semantic_repair_and_preserves_usage(self):
         config = _ai_config(max_requests=2, max_retries=1)

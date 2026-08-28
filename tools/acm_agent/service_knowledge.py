@@ -717,7 +717,7 @@ class ServiceKnowledgeMixin:
         generation = {
             "thinking": thinking,
             "reasoning_effort": effort,
-            "max_tokens": 3000,
+            "max_tokens": int(route.budget["max_output_tokens"]),
             "temperature": 0.2,
         }
         response_json_schema = self._summary_response_json_schema(
@@ -891,7 +891,7 @@ class ServiceKnowledgeMixin:
                     model=selected_model,
                     thinking=thinking,
                     reasoning_effort=effort,
-                    max_tokens=6000,
+                    max_tokens=int(route.budget["max_output_tokens"]),
                     temperature=0.2,
                 )
                 merge_usage(total_usage, result.usage)
@@ -936,7 +936,7 @@ class ServiceKnowledgeMixin:
                     model=selected_model,
                     thinking=thinking,
                     reasoning_effort=effort,
-                    max_tokens=6000,
+                    max_tokens=int(route.budget["max_output_tokens"]),
                     temperature=0.2,
                 )
                 merge_usage(total_usage, result.usage)

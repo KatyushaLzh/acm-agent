@@ -277,6 +277,13 @@ label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weig
 .ai-chat-message.user { background: var(--surface-2); margin-left: 12%; }
 .ai-chat-message.assistant { background: var(--surface); border: 1px solid var(--line); margin-right: 8%; }
 .ai-chat-message.interrupted { border-color: var(--warning); }
+.ai-chat-message.assistant > :first-child { margin-top: 0; }
+.ai-chat-message.assistant > :last-child { margin-bottom: 0; }
+.ai-chat-message.assistant pre { max-width: 100%; overflow: auto; padding: 10px 12px; border-radius: 8px; background: var(--surface-2); }
+.ai-chat-message.assistant code { font-family: var(--mono); }
+.ai-chat-message.assistant blockquote { margin: 10px 0; padding-left: 12px; border-left: 3px solid var(--accent); color: var(--muted); }
+.ai-chat-message.assistant blockquote p { margin: 4px 0; }
+.markdown-math-block { max-width: 100%; overflow-x: auto; }
 .ai-chat-message.assistant .katex-display { max-width: 100%; overflow-x: auto; overflow-y: hidden; padding: 2px 0; }
 .ai-chat-message.assistant .katex-display > .katex { white-space: nowrap; }
 .ai-chat-form { display: grid; gap: 12px; }

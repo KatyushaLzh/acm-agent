@@ -13,6 +13,7 @@ import {
 } from "./ai_model_controls.js";
 
 const POLICY_PROFILES = ["recommendation", "plan_organize", "plan_generate", "coaching", "patch", "summary"];
+const OUTPUT_TOKEN_LIMIT_MESSAGE = "输出达到 Token 上限，结果不可用。请在设置中提高对应任务的最大输出 Token。";
 let savedAiPolicy = null;
 let aiPolicyDirty = false;
 
@@ -144,16 +145,70 @@ function renderSafeKnowledgeMarkdown(container, markdown) {
   container.replaceChildren();
   const lines = String(markdown || "").replace(/\r\n?/g, "\n").split("\n");
   let list = null;
+  let listTag = null;
+  let quote = null;
   let fence = null;
   let codeLines = [];
+  let mathFence = null;
+  let mathLines = [];
+  const appendInlineMarkdown = (parent, value) => {
+    const source = String(value || "");
+    const tokens = /(`+)(.+?)\1|(\$\$.*?\$\$|\$[^$\n]+?\$|\\\(.*?\\\)|\\\[.*?\\\])|\[([^\]]+)\]\(([^)]+)\)|(\*\*|__)(.+?)\6|~~(.+?)~~|\*([^*\n]+)\*|_([^_\n]+)_/g;
+    let offset = 0;
+    for (const match of source.matchAll(tokens)) {
+      if (match.index > offset) parent.appendChild(document.createTextNode(source.slice(offset, match.index)));
+      let node;
+      if (match[1]) {
+        node = document.createElement("code");
+        node.textContent = match[2];
+      } else if (match[3]) {
+        node = document.createTextNode(match[3]);
+      } else if (match[4]) {
+        try {
+          const url = new URL(match[5], window.location.href);
+          if (!["http:", "https:"].includes(url.protocol)) throw new Error("unsafe markdown link");
+          node = document.createElement("a");
+          node.href = url.href;
+          node.target = "_blank";
+          node.rel = "noopener noreferrer";
+        } catch {
+          node = document.createElement("span");
+        }
+        node.textContent = match[4];
+      } else if (match[6]) {
+        node = document.createElement("strong");
+        node.textContent = match[7];
+      } else if (match[8]) {
+        node = document.createElement("del");
+        node.textContent = match[8];
+      } else {
+        node = document.createElement("em");
+        node.textContent = match[9] || match[10];
+      }
+      parent.appendChild(node);
+      offset = match.index + match[0].length;
+    }
+    if (offset < source.length) parent.appendChild(document.createTextNode(source.slice(offset)));
+  };
   const appendTextNode = (tag, text, className = "") => {
     const node = document.createElement(tag);
     if (className) node.className = className;
-    node.textContent = text;
+    appendInlineMarkdown(node, text);
     container.appendChild(node);
     return node;
   };
-  const closeList = () => { list = null; };
+  const closeList = () => { list = null; listTag = null; };
+  const closeQuote = () => { quote = null; };
+  const closeMath = () => {
+    if (mathFence === null) return;
+    const node = document.createElement("div");
+    node.className = "markdown-math-block";
+    const closing = mathFence === "\\[" ? "\\]" : "$$";
+    node.textContent = `${mathFence}\n${mathLines.join("\n")}\n${closing}`;
+    container.appendChild(node);
+    mathFence = null;
+    mathLines = [];
+  };
   const closeFence = () => {
     if (fence === null) return;
     const pre = document.createElement("pre");
@@ -165,37 +220,73 @@ function renderSafeKnowledgeMarkdown(container, markdown) {
     codeLines = [];
   };
   for (const line of lines) {
+    const trimmed = line.trim();
+    if (mathFence !== null) {
+      const closing = mathFence === "\\[" ? "\\]" : "$$";
+      if (trimmed === closing) closeMath();
+      else mathLines.push(line);
+      continue;
+    }
     const fenceMatch = line.match(/^\s*(```|~~~)/);
     if (fenceMatch) {
       closeList();
+      closeQuote();
       if (fence === null) fence = fenceMatch[1][0];
       else if (fence === fenceMatch[1][0]) closeFence();
       else codeLines.push(line);
       continue;
     }
     if (fence !== null) { codeLines.push(line); continue; }
+    if (trimmed === "\\[" || trimmed === "$$") {
+      closeList();
+      closeQuote();
+      mathFence = trimmed;
+      mathLines = [];
+      continue;
+    }
     const heading = line.match(/^(#{1,6})\s+(.+)$/);
     if (heading) {
       closeList();
+      closeQuote();
       appendTextNode(`h${heading[1].length}`, heading[2]);
       continue;
     }
     const bullet = line.match(/^\s*[-*+]\s+(.+)$/);
-    if (bullet) {
-      if (!list) {
-        list = document.createElement("ul");
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (bullet || ordered) {
+      closeQuote();
+      const requestedTag = ordered ? "ol" : "ul";
+      if (!list || listTag !== requestedTag) {
+        closeList();
+        list = document.createElement(requestedTag);
+        listTag = requestedTag;
         container.appendChild(list);
       }
       const item = document.createElement("li");
-      item.textContent = bullet[1];
+      appendInlineMarkdown(item, (bullet || ordered)[1]);
       list.appendChild(item);
       continue;
     }
+    const blockquote = line.match(/^\s*>\s?(.*)$/);
+    if (blockquote) {
+      closeList();
+      if (!quote) {
+        quote = document.createElement("blockquote");
+        container.appendChild(quote);
+      }
+      const paragraph = document.createElement("p");
+      appendInlineMarkdown(paragraph, blockquote[1]);
+      quote.appendChild(paragraph);
+      continue;
+    }
     closeList();
+    closeQuote();
     if (!line.trim()) continue;
     appendTextNode("p", line);
   }
   closeFence();
+  // While streaming, keep an unfinished display-math source out of the DOM.
+  // The next accumulated delta will render it atomically once the delimiter closes.
   renderAssistantMath(container);
 }
 
@@ -1057,9 +1148,9 @@ function appendAiMessage(role, content = "", status = "complete") {
   if (root.classList.contains("empty-state")) { root.className = "ai-chat-messages"; root.innerHTML = ""; }
   const node = document.createElement("div");
   node.className = `ai-chat-message ${role}${status === "interrupted" ? " interrupted" : ""}`;
-  node.textContent = content;
+  if (role === "assistant") renderSafeKnowledgeMarkdown(node, content);
+  else node.textContent = content;
   root.append(node); root.scrollTop = root.scrollHeight;
-  if (role === "assistant") renderAssistantMath(node);
   return node;
 }
 
@@ -1113,6 +1204,7 @@ async function streamAiChat(message, mode, hintLevel) {
   problemInput.disabled = true;
   appendAiMessage("user", message);
   const assistant = appendAiMessage("assistant", "");
+  let assistantMarkdown = "";
   let completed = false;
   try {
     const response = await postEventStream(
@@ -1132,18 +1224,38 @@ async function streamAiChat(message, mode, hintLevel) {
         return;
       }
       const item = parseSseBlock(block); if (!item) return;
-      if (item.event === "delta") { assistant.textContent += item.data.content || ""; $("#ai-chat-messages").scrollTop = $("#ai-chat-messages").scrollHeight; }
+      if (item.event === "delta") {
+        assistantMarkdown += item.data.content || "";
+        renderSafeKnowledgeMarkdown(assistant, assistantMarkdown);
+        $("#ai-chat-messages").scrollTop = $("#ai-chat-messages").scrollHeight;
+      }
       else if (item.event === "done") {
         completed = true;
         const outcome = aiOutcome(item.data);
-        const business = outcome.business_outcome || item.data.status || "complete";
+        const finishReason = String(item.data.finish_reason || "").toLowerCase();
+        const truncated = finishReason === "length";
+        const reportedBusiness = outcome.business_outcome || item.data.status || "complete";
+        const business = truncated && reportedBusiness === "complete" ? "partial" : reportedBusiness;
         if (business === "partial") {
           assistant.classList.add("interrupted");
-          $("#ai-chat-state").textContent = "部分结果";
+          $("#ai-chat-state").className = "badge warn";
+          $("#ai-chat-state").textContent = truncated ? "部分结果 · Token 上限" : "部分结果";
+          if (truncated) toast(
+            "回答达到 Token 上限",
+            item.data.message || "已保留部分结果；请在“设置 → 任务路由与费用治理”中提高“AI 辅导”的“最大输出 Token”。",
+            "error",
+          );
         } else if (business === "unavailable") {
           assistant.classList.add("interrupted");
-          if (!assistant.textContent.trim()) assistant.textContent = item.data.message || "本次辅导当前不可用，请稍后重试。";
+          const unavailableMessage = item.data.message
+            || asObject(item.data.error).message
+            || (truncated ? OUTPUT_TOKEN_LIMIT_MESSAGE : "本次辅导当前不可用，请稍后重试。");
+          if (!assistantMarkdown.trim()) {
+            assistantMarkdown = unavailableMessage;
+            renderSafeKnowledgeMarkdown(assistant, assistantMarkdown);
+          }
           $("#ai-chat-state").textContent = "当前不可用";
+          if (truncated) toast("输出达到 Token 上限", unavailableMessage, "error");
         }
       }
       else if (item.event === "error") throw new Error(item.data.message || "模型流式请求失败");
@@ -1162,7 +1274,6 @@ async function streamAiChat(message, mode, hintLevel) {
     if (isAbortError(error)) return false;
     throw error;
   } finally {
-    renderAssistantMath(assistant);
     if (state.aiStreamController === controller) {
       state.aiStreamController = null;
       problemInput.disabled = false;
@@ -1211,7 +1322,9 @@ async function previewAiPatch(button) {
     } });
     const data = await waitForJob(jobIdOf(started), "正在生成带错误注释的候选源码…");
     if (!aiOperationIsCurrent(problemKey, epoch)) return;
-    if (typeof data.candidate_code !== "string" || !data.candidate_code.trim()) throw new Error("服务未返回修改后的 C++ 源码");
+    if (typeof data.candidate_code !== "string" || !data.candidate_code.trim()) {
+      throw new Error(data.error?.message || "服务未返回修改后的 C++ 源码");
+    }
     state.aiPatchProposalId = data.proposal_id;
     state.aiPatchProblemKey = problemKey;
     renderCppSource($("#ai-patch-code"), data.candidate_code);

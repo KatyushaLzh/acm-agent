@@ -37,6 +37,58 @@ class WebFrontendConcurrencyContractTests(unittest.TestCase):
         )[0]
         self.assertLess(body.index("let completed = false;"), body.index("try {"))
 
+    def test_ai_stream_length_finish_is_visible_and_points_to_token_settings(self) -> None:
+        body = self.ai.split("async function streamAiChat", 1)[1].split(
+            "async function clearAiConversation", 1
+        )[0]
+        for marker in (
+            'finishReason === "length"',
+            "部分结果 · Token 上限",
+            "回答达到 Token 上限",
+            "设置 → 任务路由与费用治理",
+            "最大输出 Token",
+        ):
+            self.assertIn(marker, body)
+        self.assertIn(
+            "输出达到 Token 上限，结果不可用。请在设置中提高对应任务的最大输出 Token。",
+            self.ai,
+        )
+        self.assertIn('truncated && reportedBusiness === "complete"', body)
+        self.assertIn("asObject(item.data.error).message", body)
+        self.assertIn('data.error?.message || "服务未返回修改后的 C++ 源码"', self.ai)
+        self.assertIn("Array.isArray(result.errors) ? result.errors[0] : result.error", self.plan_ai_import)
+
+    def test_ai_assistant_messages_share_safe_markdown_preview_renderer(self) -> None:
+        append_body = self.ai.split("function appendAiMessage", 1)[1].split(
+            "async function ensureAiConversation", 1
+        )[0]
+        stream_body = self.ai.split("async function streamAiChat", 1)[1].split(
+            "async function clearAiConversation", 1
+        )[0]
+        self.assertIn('if (role === "assistant") renderSafeKnowledgeMarkdown(node, content)', append_body)
+        self.assertIn("else node.textContent = content", append_body)
+        self.assertIn('let assistantMarkdown = ""', stream_body)
+        self.assertIn("assistantMarkdown += item.data.content", stream_body)
+        self.assertIn("renderSafeKnowledgeMarkdown(assistant, assistantMarkdown)", stream_body)
+        self.assertNotIn("assistant.textContent +=", stream_body)
+        renderer = self.ai.split("function renderSafeKnowledgeMarkdown", 1)[1].split(
+            "function knowledgeWarningItems", 1
+        )[0]
+        self.assertIn("appendInlineMarkdown", renderer)
+        self.assertIn('document.createElement("strong")', renderer)
+        self.assertIn('document.createElement("code")', renderer)
+        self.assertIn('["http:", "https:"]', renderer)
+        self.assertNotIn("container.innerHTML", renderer)
+        self.assertIn('trimmed === "\\\\[" || trimmed === "$$"', renderer)
+        self.assertIn('mathFence === "\\\\[" ? "\\\\]" : "$$"', renderer)
+        self.assertIn('document.createElement("blockquote")', renderer)
+        self.assertIn('const requestedTag = ordered ? "ol" : "ul"', renderer)
+        self.assertIn("renderSafeKnowledgeMarkdown(preview, markdown)", self.ai)
+        self.assertIn(
+            'renderSafeKnowledgeMarkdown($("#knowledge-rendered-preview"), $("#knowledge-markdown-editor").value)',
+            self.events_ai,
+        )
+
     def test_plan_selection_drops_stale_responses(self) -> None:
         self.assertIn("planSelectionEpoch", self.core)
         self.assertIn("planSelectionController", self.core)

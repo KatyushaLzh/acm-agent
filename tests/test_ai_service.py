@@ -20,7 +20,7 @@ from tools.acm_agent.ai_context import (
     expected_patch_backup_path,
 )
 from tools.acm_agent.deepseek import ChatResult, JsonChatResult, StreamEvent
-from tools.acm_agent.provider import ProviderError
+from tools.acm_agent.provider import OUTPUT_TOKEN_LIMIT_MESSAGE, ProviderError
 from tools.acm_agent.credentials import DeepSeekCredentialStore
 from tools.acm_agent.config import load_config, save_config
 from tools.acm_agent.service import AcmService
@@ -155,13 +155,6 @@ class AiServiceTests(unittest.TestCase):
         target.mkdir(parents=True)
         shutil.copy2(REPO_ROOT / "training/data-structures-30d/plan.json", target / "plan.json")
         shutil.copy2(REPO_ROOT / "training/data-structures-30d/README.md", target / "README.md")
-        plan_document = json.loads((target / "plan.json").read_text(encoding="utf-8"))
-        for task in plan_document["stages"][0]["tasks"][:3]:
-            task["tags"] = ["segment tree"]
-        (target / "plan.json").write_text(
-            json.dumps(plan_document, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
         self.client = FakeDeepSeek()
         self.verify_calls = []
 
@@ -223,7 +216,7 @@ class AiServiceTests(unittest.TestCase):
         self.assertNotIn("private note", sent)
         self.assertNotIn(str(self.root), sent)
         self.assertNotIn("#include", sent)
-        self.assertEqual(self.client.calls[-1][2]["max_tokens"], 2_400)
+        self.assertEqual(self.client.calls[-1][2]["max_tokens"], 4_096)
 
     def test_cache_clear_allows_safe_profile_disabled_by_current_policy(self):
         config = load_config(self.service.paths)
@@ -252,7 +245,7 @@ class AiServiceTests(unittest.TestCase):
         sent = json.dumps(self.client.calls[-1][1], ensure_ascii=False)
         self.assertIn(CHINESE_EXPLANATION_RULE, sent)
         self.assertIn("代码、算法名和复杂度表达无需翻译", sent)
-        self.assertEqual(self.client.calls[-1][2]["max_tokens"], 4_096)
+        self.assertEqual(self.client.calls[-1][2]["max_tokens"], 8_192)
         loaded = self.service.ai_conversation(conversation["conversation_id"])
         self.assertEqual(loaded["messages"][-1]["content"], "第一段第二段")
         self.assertEqual(loaded["messages"][-1]["status"], "complete")
@@ -266,6 +259,176 @@ class AiServiceTests(unittest.TestCase):
         self.assertEqual(closed["close"]["hint_level"], 2)
         loaded = self.service.ai_conversation(conversation["conversation_id"])
         self.assertEqual(loaded["conversation"]["status"], "closed")
+
+    def test_chat_length_finish_is_persisted_as_partial_with_budget_guidance(self):
+        self.service.start("CF1A")
+        conversation_id = self.service.ai_conversation_start("CF1A")["conversation_id"]
+
+        def truncated_chat(messages, **kwargs):
+            self.client.calls.append(("chat", messages, kwargs))
+            return ChatResult(
+                "先检查边界条件，但这里还没有说完",
+                "length",
+                {"completion_tokens": 8_192, "total_tokens": 8_500},
+                kwargs["model"],
+            )
+
+        self.client.chat = truncated_chat
+        result = self.service.ai_chat(
+            "CF1A",
+            conversation_id=conversation_id,
+            message="给我一个反例问题",
+            mode="hint",
+            hint_level=1,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["finish_reason"], "length")
+        self.assertIn("最大输出 Token", result["message"])
+        self.assertEqual(result["ai"]["outcome"]["artifact_outcome"], "partial")
+        self.assertEqual(result["ai"]["outcome"]["business_outcome"], "partial")
+        with Database(self.service.paths.database) as db:
+            message = db.ai_message(result["message_id"])
+            run = db.ai_run(result["ai_run_id"])
+        self.assertEqual(message["status"], "interrupted")
+        self.assertEqual(run["status"], "complete")
+        self.assertEqual(run["finish_reason"], "length")
+        self.assertEqual(run["business_outcome"], "partial")
+
+    def test_low_latency_length_finish_emits_partial_done_event(self):
+        self.service.start("CF1A")
+        conversation_id = self.service.ai_conversation_start("CF1A")["conversation_id"]
+
+        def truncated_stream(messages, **kwargs):
+            self.client.calls.append(("stream", messages, kwargs))
+            yield StreamEvent("delta", content="只生成了前半段")
+            yield StreamEvent(
+                "done",
+                finish_reason="length",
+                usage={"completion_tokens": 8_192, "total_tokens": 8_500},
+            )
+
+        self.client.stream_chat = truncated_stream
+        events = list(self.service.ai_chat_stream(
+            conversation_id,
+            message="给我一个反例问题",
+            mode="hint",
+            hint_level=1,
+            delivery_mode="low_latency",
+        ))
+
+        done = events[-1]
+        self.assertEqual(done["event"], "done")
+        self.assertEqual(done["data"]["status"], "partial")
+        self.assertEqual(done["data"]["finish_reason"], "length")
+        self.assertIn("最大输出 Token", done["data"]["message"])
+        self.assertEqual(done["data"]["outcome"]["business_outcome"], "partial")
+        loaded = self.service.ai_conversation(conversation_id)
+        self.assertEqual(loaded["messages"][-1]["status"], "interrupted")
+
+    def test_resilient_length_finish_emits_partial_done_event(self):
+        self.service.start("CF1A")
+        conversation_id = self.service.ai_conversation_start("CF1A")["conversation_id"]
+
+        def truncated_chat(messages, **kwargs):
+            self.client.calls.append(("chat", messages, kwargs))
+            return ChatResult(
+                "缓冲完成后仍只得到前半段",
+                "length",
+                {"completion_tokens": 8_192, "total_tokens": 8_500},
+                kwargs["model"],
+            )
+
+        self.client.chat = truncated_chat
+        events = list(self.service.ai_chat_stream(
+            conversation_id,
+            message="给我一个反例问题",
+            mode="hint",
+            hint_level=1,
+            delivery_mode="resilient",
+        ))
+
+        self.assertEqual([event["event"] for event in events], ["meta", "delta", "usage", "done"])
+        self.assertEqual(events[-1]["data"]["status"], "partial")
+        self.assertEqual(events[-1]["data"]["finish_reason"], "length")
+        self.assertIn("最大输出 Token", events[-1]["data"]["message"])
+
+    def test_empty_length_finish_is_unavailable_with_unified_message(self):
+        self.service.start("CF1A")
+        conversation_id = self.service.ai_conversation_start("CF1A")["conversation_id"]
+
+        def truncated_chat(messages, **kwargs):
+            self.client.calls.append(("chat", messages, kwargs))
+            return ChatResult(
+                "",
+                "length",
+                {"completion_tokens": 8_192, "total_tokens": 8_500},
+                kwargs["model"],
+            )
+
+        self.client.chat = truncated_chat
+        result = self.service.ai_chat(
+            "CF1A",
+            conversation_id=conversation_id,
+            message="给我关键性质",
+            mode="hint",
+            hint_level=1,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["finish_reason"], "length")
+        self.assertEqual(result["message"], OUTPUT_TOKEN_LIMIT_MESSAGE)
+        with Database(self.service.paths.database) as db:
+            run = db.ai_run(result["ai_run_id"])
+        self.assertEqual(run["finish_reason"], "length")
+        self.assertEqual(json.loads(run["error_json"])["message"], OUTPUT_TOKEN_LIMIT_MESSAGE)
+
+    def test_empty_low_latency_length_finish_emits_unavailable_message(self):
+        self.service.start("CF1A")
+        conversation_id = self.service.ai_conversation_start("CF1A")["conversation_id"]
+
+        def truncated_stream(messages, **kwargs):
+            self.client.calls.append(("stream", messages, kwargs))
+            yield StreamEvent(
+                "done",
+                finish_reason="length",
+                usage={"completion_tokens": 8_192, "total_tokens": 8_500},
+            )
+
+        self.client.stream_chat = truncated_stream
+        events = list(self.service.ai_chat_stream(
+            conversation_id,
+            message="给我关键性质",
+            mode="hint",
+            hint_level=1,
+            delivery_mode="low_latency",
+        ))
+
+        done = events[-1]
+        self.assertEqual(done["event"], "done")
+        self.assertEqual(done["data"]["status"], "unavailable")
+        self.assertEqual(done["data"]["finish_reason"], "length")
+        self.assertEqual(done["data"]["message"], OUTPUT_TOKEN_LIMIT_MESSAGE)
+        self.assertEqual(done["data"]["error"]["message"], OUTPUT_TOKEN_LIMIT_MESSAGE)
+
+    def test_saved_coaching_output_budget_reaches_provider_call(self):
+        config = load_config(self.service.paths)
+        config["ai"]["policy"]["budgets"]["coaching"]["max_output_tokens"] = 12_345
+        save_config(self.service.paths, config)
+        self.service.start("CF1A")
+        conversation_id = self.service.ai_conversation_start("CF1A")["conversation_id"]
+
+        list(self.service.ai_chat_stream(
+            conversation_id,
+            message="给我关键性质",
+            mode="hint",
+            hint_level=2,
+            delivery_mode="resilient",
+        ))
+
+        self.assertEqual(self.client.calls[-1][2]["max_tokens"], 12_345)
 
     def test_coaching_keeps_stable_prefix_across_hint_levels(self):
         self.service.start("CF1A")
@@ -485,6 +648,41 @@ class AiServiceTests(unittest.TestCase):
         self.assertEqual(follower_run["status"], "complete")
         self.assertEqual(follower_run["provider_outcome"], "not_called")
 
+    def test_coalesced_empty_length_failure_keeps_unified_message(self):
+        self.service.start("CF1A")
+        conversation_id = self.service.ai_conversation_start("CF1A")["conversation_id"]
+        provider_started = threading.Event()
+        release = threading.Event()
+        provider_calls = 0
+
+        def truncated_chat(messages, **kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            provider_started.set()
+            self.assertTrue(release.wait(5))
+            return ChatResult("", "length", {"total_tokens": 8_500}, kwargs["model"])
+
+        self.client.chat = truncated_chat
+        request = {
+            "message": "只给一个反例问题",
+            "mode": "hint",
+            "hint_level": 1,
+            "conversation_id": conversation_id,
+        }
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            leader_future = executor.submit(self.service.ai_chat, "CF1A", **request)
+            self.assertTrue(provider_started.wait(5))
+            follower_future = executor.submit(self.service.ai_chat, "CF1A", **request)
+            time.sleep(0.05)
+            release.set()
+            leader = leader_future.result(timeout=5)
+            follower = follower_future.result(timeout=5)
+
+        self.assertEqual(provider_calls, 1)
+        self.assertEqual(leader["message"], OUTPUT_TOKEN_LIMIT_MESSAGE)
+        self.assertEqual(follower["message"], OUTPUT_TOKEN_LIMIT_MESSAGE)
+        self.assertEqual(follower["status"], "unavailable")
+
     def test_patch_preview_apply_verify_failure_and_revert(self):
         started = self.service.start("CF1A")
         source = Path(started["source"])
@@ -496,7 +694,7 @@ class AiServiceTests(unittest.TestCase):
         self.assertIn("代码、算法名和复杂度表达无需翻译", sent)
         self.assertIn("每个实质修复点附近加入简短的中文 C++ 注释", sent)
         self.assertIn("原代码哪里错误以及该修改为何正确", sent)
-        self.assertEqual(self.client.calls[-1][2]["max_tokens"], 8_192)
+        self.assertEqual(self.client.calls[-1][2]["max_tokens"], 12_000)
         self.assertIn("proposal_id", preview)
         self.assertEqual(preview["candidate_code"], self.client.patch_code)
         self.assertIn("// 原代码错误", preview["candidate_code"])
@@ -528,6 +726,32 @@ class AiServiceTests(unittest.TestCase):
             )[0]
             self.assertEqual(assistant["status"], "error")
             self.assertEqual(run["status"], "complete")
+
+    def test_truncated_patch_is_unavailable_with_unified_message(self):
+        self.service.start("CF1A")
+
+        def truncated_patch(messages, **kwargs):
+            self.client.calls.append(("structured", messages, kwargs))
+            data = {
+                "diagnosis": "尚未完成",
+                "replacement_code": self.client.patch_code,
+            }
+            return JsonChatResult(
+                json.dumps(data, ensure_ascii=False),
+                "length",
+                {"completion_tokens": 12_000, "total_tokens": 12_500},
+                kwargs["model"],
+                data,
+            )
+
+        self.client.structured = truncated_patch
+        result = self.service.ai_patch_preview("CF1A", instruction="修复")
+
+        self.assertFalse(result["ok"])
+        self.assertIsNone(result["proposal_id"])
+        self.assertEqual(result["error"]["message"], OUTPUT_TOKEN_LIMIT_MESSAGE)
+        self.assertEqual(result["error"]["finish_reason"], "length")
+        self.assertEqual(result["ai"]["outcome"]["business_outcome"], "unavailable")
 
     def test_patch_apply_db_failure_restores_source_and_preview_state(self):
         started = self.service.start("CF1A")

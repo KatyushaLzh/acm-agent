@@ -11,6 +11,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence, TypedDict
 
 
+OUTPUT_TOKEN_LIMIT_MESSAGE = (
+    "输出达到 Token 上限，结果不可用。请在设置中提高对应任务的最大输出 Token。"
+)
+
+
 class AIUsage(TypedDict, total=False):
     """Canonical usage keys; adapters may retain additional safe scalar fields."""
 
@@ -108,7 +113,13 @@ class ProviderError(RuntimeError):
         response_id: str | None = None,
         protocol_details: Mapping[str, Any] | None = None,
     ) -> None:
-        super().__init__(message)
+        normalized_finish_reason = str(finish_reason or "").strip().lower()
+        safe_message = (
+            OUTPUT_TOKEN_LIMIT_MESSAGE
+            if normalized_finish_reason == "length"
+            else message
+        )
+        super().__init__(safe_message)
         self.code = str(code)
         self.status = status
         self.retryable = bool(retryable)
@@ -234,6 +245,7 @@ __all__ = [
     "AIToolResult",
     "AIUsage",
     "CapabilityProfile",
+    "OUTPUT_TOKEN_LIMIT_MESSAGE",
     "ProviderError",
     "ProviderConfigurationError",
     "ProviderHealth",

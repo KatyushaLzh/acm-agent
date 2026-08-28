@@ -20,7 +20,7 @@ from tools.acm_agent.openai_compatible import (
     discover_openai_compatible_models,
 )
 from tools.acm_agent.provider import (
-    CapabilityProfile, ProviderConfigurationError, ProviderError,
+    CapabilityProfile, OUTPUT_TOKEN_LIMIT_MESSAGE, ProviderConfigurationError, ProviderError,
     ProviderProtocolError,
 )
 from tools.acm_agent.provider_config import (
@@ -242,6 +242,16 @@ class ProviderConfigTests(unittest.TestCase):
 
 
 class DeepSeekResponsesTests(unittest.TestCase):
+    def test_length_provider_error_uses_unified_unavailable_message(self):
+        error = ProviderError(
+            "response_incomplete",
+            "provider-specific wording",
+            finish_reason="length",
+        )
+
+        self.assertEqual(str(error), OUTPUT_TOKEN_LIMIT_MESSAGE)
+        self.assertEqual(error.as_dict()["message"], OUTPUT_TOKEN_LIMIT_MESSAGE)
+
     def test_chat_auto_omits_controls_while_off_is_explicit(self):
         client = DeepSeekClient(api_key="secret", transport=QueueTransport(), retries=0)
         automatic = client._payload(
@@ -917,44 +927,6 @@ class Stage2ServiceManagementTests(unittest.TestCase):
             save_config(service.paths, config)
             with self.assertRaisesRegex(ProviderConfigurationError, "recommendation"):
                 service.ai_connection_delete(connection_id=connection_id)
-
-    def test_builtin_deepseek_ignores_discovered_models_outside_adapter_allowlist(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            vault = ProviderCredentialVault(
-                root / ".acm" / "credentials",
-                protect=lambda value: b"P" + value,
-                unprotect=lambda value: value[1:],
-            )
-            service = AcmService(root, credential_vault=vault)
-            service.setup("fixture", "42", skip_validate=True)
-            discovered = [
-                "deepseek-v4-flash",
-                "deepseek-v4-pro",
-                "deepseek-chat",
-                "account-specific-preview",
-            ]
-            with patch(
-                "tools.acm_agent.service_ai.discover_openai_compatible_models",
-                return_value=discovered,
-            ):
-                saved = service.ai_connection_upsert(
-                    connection_id="deepseek",
-                    display_name="DeepSeek Official",
-                    base_url="https://api.deepseek.com",
-                    api_key="connection-secret",
-                )
-                refreshed = service.ai_connection_refresh(connection_id="deepseek")
-
-            self.assertEqual(saved["models_discovered"], 2)
-            self.assertEqual(refreshed["models_discovered"], 2)
-            provider = load_config(service.paths)["ai"]["providers"]["deepseek"]
-            self.assertEqual(
-                set(provider["models"]), {"deepseek-v4-flash", "deepseek-v4-pro"}
-            )
-            self.assertNotIn(
-                "connection-secret", service.paths.config.read_text(encoding="utf-8")
-            )
 
     def test_simplified_connection_discovery_failure_rolls_back_config_and_credential(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -62,7 +62,11 @@ from .ai_context import (
 from .config import DEFAULT_CONFIG, load_config, save_config
 from .credentials import CredentialStoreError
 from .openai_compatible import discover_openai_compatible_models
-from .provider import ProviderConfigurationError, ProviderError
+from .provider import (
+    OUTPUT_TOKEN_LIMIT_MESSAGE,
+    ProviderConfigurationError,
+    ProviderError,
+)
 from .provider_config import (
     TASK_PROFILE_IDS,
     endpoint_origin,
@@ -716,6 +720,45 @@ def _validate_coaching_content(content: str, *, hint_level: int) -> str:
     return text
 
 
+TOKEN_BUDGET_WARNING = (
+    "回答达到最大输出 Token，内容可能不完整。请在“设置 → 任务路由与费用治理”中"
+    "提高“AI 辅导”的“最大输出 Token”。"
+)
+
+
+def _max_output_tokens(route: Any) -> int:
+    return int(route.budget["max_output_tokens"])
+
+
+def _output_was_truncated(finish_reason: Any) -> bool:
+    return str(finish_reason or "").strip().lower() == "length"
+
+
+def _raise_for_empty_token_limited_output(
+    content: Any,
+    *,
+    finish_reason: Any,
+    usage: Mapping[str, Any] | None = None,
+    model: str | None = None,
+    requested_model: str | None = None,
+    response_id: str | None = None,
+    protocol_details: Mapping[str, Any] | None = None,
+) -> None:
+    if not _output_was_truncated(finish_reason) or str(content or "").strip():
+        return
+    raise ProviderError(
+        "response_incomplete",
+        OUTPUT_TOKEN_LIMIT_MESSAGE,
+        retryable=False,
+        usage=usage,
+        finish_reason="length",
+        model=model,
+        requested_model=requested_model,
+        response_id=response_id,
+        protocol_details=protocol_details,
+    )
+
+
 def _validate_patch_payload(
     value: Any, *, original_source: str
 ) -> tuple[str, str, str]:
@@ -1189,23 +1232,6 @@ class ServiceAIMixin:
             catalog[str(model)] = definition
         return catalog
 
-    @staticmethod
-    def _usable_discovered_models(
-        provider_id: str, discovered: Sequence[str]
-    ) -> list[str]:
-        """Keep model discovery inside the selected adapter's trust boundary."""
-
-        models = list(discovered)
-        if provider_id != "deepseek":
-            return models
-        supported = [model for model in models if model in ALLOWED_MODELS]
-        if not supported:
-            raise ProviderConfigurationError(
-                "model_discovery_failed",
-                "the official DeepSeek endpoint returned no supported models",
-            )
-        return supported
-
     def ai_connection_upsert(
         self,
         *,
@@ -1281,7 +1307,6 @@ class ServiceAIMixin:
             discovered = discover_openai_compatible_models(
                 base_url=normalized_base, api_key=staged.credential.secret
             )
-            discovered = self._usable_discovered_models(selected_id, discovered)
             old_models = (
                 dict(current.get("models") or {}) if isinstance(current, Mapping) else {}
             )
@@ -1359,7 +1384,6 @@ class ServiceAIMixin:
         discovered = discover_openai_compatible_models(
             base_url=str(provider["base_url"]), api_key=secret
         )
-        discovered = self._usable_discovered_models(selected, discovered)
         updated = dict(provider)
         updated["models"] = self._discovered_model_catalog(
             dict(provider.get("models") or {}), discovered, preserve_evidence=True
@@ -2175,7 +2199,7 @@ class ServiceAIMixin:
             generation = {
                 "thinking": route.thinking,
                 "reasoning_effort": route.reasoning_effort,
-                "max_tokens": 12000,
+                "max_tokens": _max_output_tokens(route),
                 "temperature": 0.1,
                 "transport_api": "structured",
                 "response_schema_hash": canonical_hash(ORGANIZE_RESPONSE_SCHEMA),
@@ -2274,7 +2298,7 @@ class ServiceAIMixin:
                         model=selected_model,
                         thinking=route.thinking,
                         reasoning_effort=route.reasoning_effort,
-                        max_tokens=12000,
+                        max_tokens=_max_output_tokens(route),
                         temperature=0.1,
                     )
                     repair_attempts = _observed_repair_attempts(result, repair_attempts)
@@ -2297,7 +2321,7 @@ class ServiceAIMixin:
                             model=selected_model,
                             thinking=route.thinking,
                             reasoning_effort=route.reasoning_effort,
-                            max_tokens=12000,
+                            max_tokens=_max_output_tokens(route),
                             temperature=0.1,
                         )
                         ir = validate_organize_ir(result.data, allowed_problem_keys=keys)
@@ -2506,7 +2530,7 @@ class ServiceAIMixin:
                             thinking=route.thinking,
                             reasoning_effort=route.reasoning_effort,
                             json_retries=0,
-                            max_tokens=24000,
+                            max_tokens=_max_output_tokens(route),
                             temperature=0.1,
                         )
                         validation_repairs = _observed_repair_attempts(
@@ -3027,7 +3051,7 @@ class ServiceAIMixin:
         generation = {
             "thinking": route.thinking,
             "reasoning_effort": route.reasoning_effort,
-            "max_tokens": 1800,
+            "max_tokens": _max_output_tokens(route),
             "temperature": 0.2,
             "transport_api": "structured",
             "response_schema_hash": canonical_hash(RECOMMENDATION_RESPONSE_SCHEMA),
@@ -3130,7 +3154,7 @@ class ServiceAIMixin:
                     model=selected_model,
                     thinking=route.thinking,
                     reasoning_effort=route.reasoning_effort,
-                    max_tokens=2400,
+                    max_tokens=_max_output_tokens(route),
                     temperature=0.2,
                 )
             )
@@ -3164,7 +3188,7 @@ class ServiceAIMixin:
                     model=selected_model,
                     thinking=route.thinking,
                     reasoning_effort=route.reasoning_effort,
-                    max_tokens=2400,
+                    max_tokens=_max_output_tokens(route),
                     temperature=0.2,
                 )
                 output, details, focus_topics = _validate_recommendation_payload(
@@ -4122,6 +4146,10 @@ class ServiceAIMixin:
                     "usage": usage,
                     "ai_run_id": follower_run_id,
                     "finish_reason": run["finish_reason"],
+                    "message": (
+                        TOKEN_BUDGET_WARNING
+                        if _output_was_truncated(run["finish_reason"]) else None
+                    ),
                     "local_cache": {
                         "status": "coalesced",
                         "key": flight.cache_key,
@@ -4158,6 +4186,14 @@ class ServiceAIMixin:
                     "usage": {},
                     "ai_run_id": follower_run_id,
                     "finish_reason": run["finish_reason"],
+                    "message": (
+                        (
+                            TOKEN_BUDGET_WARNING
+                            if content else OUTPUT_TOKEN_LIMIT_MESSAGE
+                        )
+                        if _output_was_truncated(run["finish_reason"])
+                        else None
+                    ),
                     "local_cache": {
                         "status": "coalesced",
                         "key": flight.cache_key,
@@ -4220,8 +4256,17 @@ class ServiceAIMixin:
                 model=prepared["model"],
                 thinking=prepared["thinking"],
                 reasoning_effort=prepared["effort"],
-                max_tokens=4096,
+                max_tokens=_max_output_tokens(prepared["route"]),
                 temperature=0.2,
+            )
+            _raise_for_empty_token_limited_output(
+                result.content,
+                finish_reason=result.finish_reason,
+                usage=result.usage,
+                model=result.model or None,
+                requested_model=result.requested_model,
+                response_id=result.response_id,
+                protocol_details=result.provider_metadata,
             )
             try:
                 content = _validate_coaching_content(
@@ -4240,8 +4285,17 @@ class ServiceAIMixin:
                     model=prepared["model"],
                     thinking=prepared["thinking"],
                     reasoning_effort=prepared["effort"],
-                    max_tokens=4096,
+                    max_tokens=_max_output_tokens(prepared["route"]),
                     temperature=0.2,
+                )
+                _raise_for_empty_token_limited_output(
+                    result.content,
+                    finish_reason=result.finish_reason,
+                    usage=result.usage,
+                    model=result.model or None,
+                    requested_model=result.requested_model,
+                    response_id=result.response_id,
+                    protocol_details=result.provider_metadata,
                 )
                 content = _validate_coaching_content(
                     result.content, hint_level=hint_level
@@ -4270,6 +4324,8 @@ class ServiceAIMixin:
                 "message_id": prepared["assistant_message_id"],
                 "content": "",
                 "status": "unavailable",
+                "finish_reason": exc.finish_reason,
+                "message": str(exc),
                 "model": prepared["model"],
                 "usage": dict(exc.usage or {}),
                 "ai_run_id": prepared["run_id"],
@@ -4300,10 +4356,14 @@ class ServiceAIMixin:
                     "outcome": unavailable_outcome
                 },
             }
-        complete_outcome = build_ai_outcome(
+        truncated = _output_was_truncated(result.finish_reason)
+        terminal_outcome = build_ai_outcome(
             provider_outcome="succeeded",
-            artifact_outcome="repaired" if repair_attempts else "valid",
-            business_outcome="complete",
+            artifact_outcome=(
+                "partial" if truncated
+                else ("repaired" if repair_attempts else "valid")
+            ),
+            business_outcome="partial" if truncated else "complete",
             apply_ready=False,
             repair_attempts=repair_attempts,
         )
@@ -4316,7 +4376,7 @@ class ServiceAIMixin:
                 db.update_ai_message(
                     prepared["assistant_message_id"],
                     content=content,
-                    status="complete",
+                    status="interrupted" if truncated else "complete",
                     model=prepared["model"],
                     usage=result.usage,
                     completed_at=stamp,
@@ -4328,21 +4388,23 @@ class ServiceAIMixin:
                     usage=result.usage,
                     resolved_model=result.model or None,
                     resolved_reasoning_strength=prepared["route"].reasoning_strength,
-                    outcome=complete_outcome,
+                    outcome=terminal_outcome,
                     **self._governance_storage_args(result, prepared["route"]),
                     completed_at=stamp,
                 )
         return {
-            "ok": True,
+            "ok": not truncated,
             "conversation_id": prepared["conversation_id"],
             "message_id": prepared["assistant_message_id"],
             "content": content,
-            "status": "complete",
+            "status": "partial" if truncated else "complete",
+            "finish_reason": result.finish_reason,
+            "message": TOKEN_BUDGET_WARNING if truncated else None,
             "model": prepared["model"],
             "usage": result.usage,
             "ai_run_id": prepared["run_id"],
             "ai": {
-                "outcome": complete_outcome
+                "outcome": terminal_outcome
             },
         }
 
@@ -4446,6 +4508,7 @@ class ServiceAIMixin:
                     "data": {
                         "status": replay["status"],
                         "finish_reason": replay.get("finish_reason"),
+                        "message": replay.get("message"),
                         "outcome": replay["ai"]["outcome"],
                     },
                 }
@@ -4488,8 +4551,17 @@ class ServiceAIMixin:
                         model=prepared["model"],
                         thinking=prepared["thinking"],
                         reasoning_effort=prepared["effort"],
-                        max_tokens=4096,
+                        max_tokens=_max_output_tokens(prepared["route"]),
                         temperature=0.2,
+                    )
+                    _raise_for_empty_token_limited_output(
+                        result.content,
+                        finish_reason=result.finish_reason,
+                        usage=result.usage,
+                        model=result.model or None,
+                        requested_model=result.requested_model,
+                        response_id=result.response_id,
+                        protocol_details=result.provider_metadata,
                     )
                     try:
                         content = _validate_coaching_content(
@@ -4508,8 +4580,17 @@ class ServiceAIMixin:
                             model=prepared["model"],
                             thinking=prepared["thinking"],
                             reasoning_effort=prepared["effort"],
-                            max_tokens=4096,
+                            max_tokens=_max_output_tokens(prepared["route"]),
                             temperature=0.2,
+                        )
+                        _raise_for_empty_token_limited_output(
+                            result.content,
+                            finish_reason=result.finish_reason,
+                            usage=result.usage,
+                            model=result.model or None,
+                            requested_model=result.requested_model,
+                            response_id=result.response_id,
+                            protocol_details=result.provider_metadata,
                         )
                         content = _validate_coaching_content(
                             result.content, hint_level=hint_level
@@ -4526,7 +4607,7 @@ class ServiceAIMixin:
                         model=prepared["model"],
                         thinking=prepared["thinking"],
                         reasoning_effort=prepared["effort"],
-                        max_tokens=4096,
+                        max_tokens=_max_output_tokens(prepared["route"]),
                         temperature=0.2,
                     ):
                         if event.kind == "delta":
@@ -4542,11 +4623,22 @@ class ServiceAIMixin:
                             usage = dict(event.usage or usage)
                             finish_reason = event.finish_reason
                             resolved_model = event.model or resolved_model
+                    _raise_for_empty_token_limited_output(
+                        content,
+                        finish_reason=finish_reason,
+                        usage=usage,
+                        model=resolved_model,
+                        requested_model=prepared["model"],
+                    )
                     content = _validate_coaching_content(content, hint_level=hint_level)
-                complete_outcome = build_ai_outcome(
+                truncated = _output_was_truncated(finish_reason)
+                terminal_outcome = build_ai_outcome(
                     provider_outcome="succeeded",
-                    artifact_outcome="repaired" if repair_attempts else "valid",
-                    business_outcome="complete",
+                    artifact_outcome=(
+                        "partial" if truncated
+                        else ("repaired" if repair_attempts else "valid")
+                    ),
+                    business_outcome="partial" if truncated else "complete",
                     apply_ready=False,
                     repair_attempts=repair_attempts,
                 )
@@ -4560,7 +4652,7 @@ class ServiceAIMixin:
                         db.update_ai_message(
                             prepared["assistant_message_id"],
                             content=content,
-                            status="complete",
+                            status="interrupted" if truncated else "complete",
                             model=prepared["model"],
                             usage=usage,
                             completed_at=stamp,
@@ -4572,7 +4664,7 @@ class ServiceAIMixin:
                             usage=usage,
                             resolved_model=resolved_model,
                             resolved_reasoning_strength=prepared["route"].reasoning_strength,
-                            outcome=complete_outcome,
+                            outcome=terminal_outcome,
                             **self._governance_storage_snapshot_args(
                                 governed_client.governance_snapshot,
                                 prepared["route"],
@@ -4584,14 +4676,17 @@ class ServiceAIMixin:
                 yield publish({
                     "event": "done",
                     "data": {
-                        "status": "complete",
+                        "status": "partial" if truncated else "complete",
                         "finish_reason": finish_reason,
-                        "outcome": complete_outcome,
+                        "message": TOKEN_BUDGET_WARNING if truncated else None,
+                        "outcome": terminal_outcome,
                     },
                 })
             except GeneratorExit:
                 raise
             except ProviderError as exc:
+                terminal_finish_reason = exc.finish_reason or finish_reason
+                truncated_failure = _output_was_truncated(terminal_finish_reason)
                 self._fail_ai_message(prepared, exc, content=content, interrupted=bool(content))
                 completed = True
                 terminal_outcome = build_ai_outcome(
@@ -4609,6 +4704,12 @@ class ServiceAIMixin:
                     "event": "done",
                     "data": {
                         "status": "partial" if content else "unavailable",
+                        "finish_reason": terminal_finish_reason,
+                        "message": (
+                            TOKEN_BUDGET_WARNING
+                            if content and truncated_failure
+                            else str(exc)
+                        ),
                         "error": exc.as_dict(),
                         "outcome": terminal_outcome,
                     },
@@ -4773,7 +4874,7 @@ class ServiceAIMixin:
                     model=selected_model,
                     thinking=route.thinking,
                     reasoning_effort=effort,
-                    max_tokens=8192,
+                    max_tokens=_max_output_tokens(route),
                     temperature=0.1,
                 )
                 merge_usage(total_usage, result.usage)
@@ -4810,7 +4911,7 @@ class ServiceAIMixin:
                     model=selected_model,
                     thinking=route.thinking,
                     reasoning_effort=effort,
-                    max_tokens=8192,
+                    max_tokens=_max_output_tokens(route),
                     temperature=0.1,
                 )
                 merge_usage(total_usage, result.usage)
@@ -4906,6 +5007,7 @@ class ServiceAIMixin:
                 "model": selected_model,
                 "usage": total_usage,
                 "ai_run_id": run_id,
+                "error": error.as_dict(),
                 "ai": {
                     "outcome": terminal_outcome
                 },
@@ -5274,7 +5376,7 @@ class ServiceAIMixin:
                 "generation": {
                     "thinking": thinking,
                     "reasoning_effort": effort,
-                    "max_tokens": 2400,
+                    "max_tokens": _max_output_tokens(route),
                     "temperature": 0.2,
                 },
                 "messages": messages,
@@ -5408,6 +5510,7 @@ class ServiceAIMixin:
                         else ("interrupted" if interrupted else "failed")
                     ),
                     usage=error.usage,
+                    finish_reason=error.finish_reason,
                     error=error.as_dict(),
                     **(
                         {"outcome": terminal_outcome}

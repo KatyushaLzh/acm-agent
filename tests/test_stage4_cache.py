@@ -108,7 +108,7 @@ class Stage4ConfigTests(unittest.TestCase):
             )
 
     def test_v12_defaults_are_exact_only_and_bounded(self) -> None:
-        self.assertEqual(CONFIG_VERSION, 15)
+        self.assertEqual(CONFIG_VERSION, 16)
         cache = DEFAULT_CONFIG["ai"]["cache"]
         self.assertEqual(
             cache["exact_profiles"],

@@ -210,7 +210,10 @@ async function generateAiPlan(button) {
     }) : started;
     if (!result || state.aiPlanImportEpoch !== epoch || controller.signal.aborted) return;
     const plan = previewPlan(result);
-    if (!plan) throw new Error("AI 任务没有返回可编辑的题单草稿");
+    if (!plan) {
+      const error = Array.isArray(result.errors) ? result.errors[0] : result.error;
+      throw new Error(displayMessage(error) || "AI 任务没有返回可编辑的题单草稿");
+    }
     state.aiPlanDraft = deepClone(plan);
     state.aiPlanPreview = result;
     state.aiPlanMetadata = {

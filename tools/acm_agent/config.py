@@ -23,10 +23,19 @@ from .provider_config import (
 )
 
 
-CONFIG_VERSION = 15
+CONFIG_VERSION = 16
 # Compatibility-only conversion for explicitly configured v14 USD guardrails.
 # DeepSeek usage itself is always priced from the native CNY catalog.
 LEGACY_LIMIT_USD_TO_CNY_RATE = 7.2
+
+_V15_DEFAULT_TOKEN_BUDGETS: dict[str, dict[str, int]] = {
+    "recommendation": {"max_output_tokens": 2_400, "max_total_tokens": 240_000},
+    "plan_organize": {"max_output_tokens": 12_000, "max_total_tokens": 120_000},
+    "plan_generate": {"max_output_tokens": 24_000, "max_total_tokens": 300_000},
+    "coaching": {"max_output_tokens": 4_096, "max_total_tokens": 150_000},
+    "patch": {"max_output_tokens": 8_192, "max_total_tokens": 200_000},
+    "summary": {"max_output_tokens": 6_000, "max_total_tokens": 180_000},
+}
 
 _REASONING_STRENGTHS = frozenset({"auto", "off", "low", "medium", "high"})
 
@@ -243,9 +252,33 @@ def _merge_defaults(defaults: Any, current: Any) -> Any:
     return merged
 
 
+def _upgrade_v15_default_token_budgets(
+    ai: dict[str, Any], source_ai: Mapping[str, Any]
+) -> None:
+    """Raise untouched v15 token defaults without overwriting user tuning."""
+
+    policy = ai.get("policy")
+    source_policy = source_ai.get("policy")
+    if not isinstance(policy, dict) or not isinstance(source_policy, Mapping):
+        return
+    budgets = policy.get("budgets")
+    source_budgets = source_policy.get("budgets")
+    if not isinstance(budgets, dict) or not isinstance(source_budgets, Mapping):
+        return
+    new_budgets = default_ai_policy()["budgets"]
+    for profile_id, old_values in _V15_DEFAULT_TOKEN_BUDGETS.items():
+        budget = budgets.get(profile_id)
+        source_budget = source_budgets.get(profile_id)
+        if not isinstance(budget, dict) or not isinstance(source_budget, Mapping):
+            continue
+        for field, old_value in old_values.items():
+            if source_budget.get(field) == old_value:
+                budget[field] = new_budgets[profile_id][field]
+
+
 def _upgrade_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     version = data.get("version")
-    if version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, CONFIG_VERSION):
+    if version not in tuple(range(1, CONFIG_VERSION + 1)):
         raise ValueError(f"Unsupported config version: {version!r}")
     upgraded = _merge_defaults(DEFAULT_CONFIG, data)
     ai = upgraded.get("ai")
@@ -332,6 +365,8 @@ def _upgrade_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
                             else float(limits["monthly_usd"]) * LEGACY_LIMIT_USD_TO_CNY_RATE
                         ),
                     }
+        if version <= 15:
+            _upgrade_v15_default_token_budgets(ai, source_ai)
         providers, profiles = validate_ai_catalog(ai.get("providers"), ai.get("profiles"))
         _upgrade_profiles_reasoning(profiles)
         ai["providers"] = providers
