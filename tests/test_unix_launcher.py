@@ -11,6 +11,7 @@ import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HELPER_SOURCE = REPO_ROOT / "tools" / "ensure-python313.sh"
+SECRET_SERVICE_HELPER_SOURCE = REPO_ROOT / "tools" / "ensure-linux-secret-service.sh"
 LOCK_SOURCE = REPO_ROOT / "tools" / "requirements-web-unix.lock"
 ACM_SOURCE = REPO_ROOT / "acm.sh"
 START_SOURCE = REPO_ROOT / "start-acm-web.sh"
@@ -62,6 +63,9 @@ def _fake_uv_script(version: str = "0.12.5") -> str:
                 mkdir -p "$environment_dir/bin"
                 cat > "$environment_dir/bin/python" <<'PYEOF'
             #!/bin/sh
+            case "$*" in
+                *hashlib*) printf '%064d\n' 1; exit 0 ;;
+            esac
             exit "${FAKE_WEB_VALIDATE_STATUS-0}"
             PYEOF
                 chmod 755 "$environment_dir/bin/python"
@@ -109,7 +113,7 @@ class UnixLauncherBehaviorTests(unittest.TestCase):
         )
 
     def _reject_system_pythons(self) -> None:
-        for name in ("python3.13", "python3", "python"):
+        for name in ("python3.14", "python3.13", "python3.12", "python3.11", "python3.10", "python3", "python"):
             _write_executable(self.fake_bin / name, "#!/bin/sh\nexit 1\n")
 
     def _install_fakes(self, *, global_uv_version: str | None = "0.11.0") -> tuple[Path, Path]:
@@ -204,12 +208,11 @@ class UnixLauncherBehaviorTests(unittest.TestCase):
         env.update(updates)
         return env
 
-    def test_prefers_exact_final_python_and_warns_without_tkinter(self) -> None:
+    def test_accepts_final_python_310_or_newer_and_warns_without_tkinter(self) -> None:
         download_log, uv_log = self._install_fakes()
         probe_log = self.root / "probe.log"
-        _write_executable(self.fake_bin / "python3.13", "#!/bin/sh\nexit 1\n")
         _write_executable(
-            self.fake_bin / "python3",
+            self.fake_bin / "python3.10",
             r"""
             #!/bin/sh
             printf '%s\n' "$*" >> "$FAKE_PROBE_LOG"
@@ -220,8 +223,6 @@ class UnixLauncherBehaviorTests(unittest.TestCase):
             printf '%s\n' "$0"
             """,
         )
-        _write_executable(self.fake_bin / "python", "#!/bin/sh\nexit 1\n")
-
         result = self._run_helper(
             "",
             ACM_BOOTSTRAP_UNAME_S="Linux",
@@ -239,6 +240,8 @@ class UnixLauncherBehaviorTests(unittest.TestCase):
         self.assertIn("native file picker operations will be unavailable", result.stderr)
         probe = probe_log.read_text(encoding="utf-8")
         self.assertIn("releaselevel", probe)
+        self.assertIn("sys.version_info[:2] < (3, 10)", probe)
+        self.assertIn("sys.implementation.cache_tag", probe)
         self.assertIn("import sqlite3", probe)
         self.assertIn("import ssl", probe)
         uv_calls = uv_log.read_text(encoding="utf-8")
@@ -543,11 +546,129 @@ class UnixLauncherContractTests(unittest.TestCase):
         self.assertIn('--root) ACM_EXPECT_ROOT=1', source)
         self.assertIn('--root=*)', source)
         self.assertIn('if [ "$ACM_COMMAND" = "web" ]', source)
+        self.assertIn('ensure-linux-secret-service.sh', source)
         self.assertIn('exec python3 -m tools.acm_agent "$@"', source)
 
     def test_double_click_script_delegates_to_canonical_unix_entrypoint(self) -> None:
         source = START_SOURCE.read_text(encoding="utf-8")
         self.assertIn('exec sh "$REPO_ROOT/acm.sh" web', source)
+
+
+@unittest.skipUnless(os.name != "nt" and shutil.which("sh"), "requires a POSIX shell")
+class LinuxSecretServiceLauncherTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.fake_bin = self.root / "fake-bin"
+        self.fake_bin.mkdir()
+        self.helper = self.root / SECRET_SERVICE_HELPER_SOURCE.name
+        shutil.copy2(SECRET_SERVICE_HELPER_SOURCE, self.helper)
+        self.os_release = self.root / "os-release"
+        self.os_release.write_text('ID=ubuntu\n', encoding="utf-8")
+        self.probe_count = self.root / "probe-count"
+        self.sudo_log = self.root / "sudo.log"
+        _write_executable(
+            self.fake_bin / "python",
+            r"""
+            #!/bin/sh
+            count=$(cat "$FAKE_PROBE_COUNT" 2>/dev/null || printf 0)
+            count=$((count + 1))
+            printf '%s\n' "$count" > "$FAKE_PROBE_COUNT"
+            if [ "$count" -eq 1 ]; then
+                exit "${FAKE_FIRST_PROBE_STATUS-1}"
+            fi
+            exit "${FAKE_SECOND_PROBE_STATUS-1}"
+            """,
+        )
+        _write_executable(self.fake_bin / "apt-get", "#!/bin/sh\nexit 0\n")
+        _write_executable(
+            self.fake_bin / "sudo",
+            r"""
+            #!/bin/sh
+            printf '%s\n' "$*" >> "$FAKE_SUDO_LOG"
+            exit "${FAKE_SUDO_STATUS-0}"
+            """,
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _run(self, input_text: str, **updates: str) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env.update({
+            "PATH": f"{self.fake_bin}{os.pathsep}{env['PATH']}",
+            "ACM_SECRET_SERVICE_OS_RELEASE_FILE": str(self.os_release),
+            "FAKE_PROBE_COUNT": str(self.probe_count),
+            "FAKE_SUDO_LOG": str(self.sudo_log),
+        })
+        env.update(updates)
+        return subprocess.run(
+            ["sh", str(self.helper), str(self.fake_bin / "python"), str(self.root)],
+            input=input_text,
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+    def test_available_service_never_prompts_or_invokes_sudo(self) -> None:
+        result = self._run("", FAKE_FIRST_PROBE_STATUS="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.sudo_log.exists())
+        self.assertNotIn("执行安装", result.stderr)
+
+    def test_confirmed_install_is_exact_and_success_requires_reprobe(self) -> None:
+        result = self._run(
+            "y\n", FAKE_FIRST_PROBE_STATUS="1", FAKE_SECOND_PROBE_STATUS="0"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.sudo_log.read_text(encoding="utf-8").strip(),
+            "apt-get install --no-install-recommends gnome-keyring seahorse",
+        )
+        self.assertEqual(self.probe_count.read_text(encoding="utf-8").strip(), "2")
+        self.assertIn("已通过 D-Bus 与无敏感数据 keyring 探测", result.stderr)
+        self.assertNotIn("apt-get update", result.stderr)
+
+    def test_failed_reprobe_requires_unlock_and_keeps_dashboard_path_successful(self) -> None:
+        result = self._run(
+            "y\n", FAKE_FIRST_PROBE_STATUS="1", FAKE_SECOND_PROBE_STATUS="1"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("需启动/解锁用户钥匙环", result.stderr)
+        self.assertIn("libsecret-tools", result.stderr)
+        command = self.sudo_log.read_text(encoding="utf-8")
+        self.assertNotIn("libsecret-tools", command)
+        self.assertIn("seahorse", command)
+
+    def test_failed_install_does_not_update_or_block_dashboard(self) -> None:
+        result = self._run(
+            "y\n", FAKE_FIRST_PROBE_STATUS="1", FAKE_SUDO_STATUS="1"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("安装命令失败", result.stderr)
+        command = self.sudo_log.read_text(encoding="utf-8")
+        self.assertEqual(
+            command.strip(),
+            "apt-get install --no-install-recommends gnome-keyring seahorse",
+        )
+        self.assertNotIn("update", command)
+
+    def test_decline_eof_and_non_debian_never_invoke_sudo(self) -> None:
+        for label, input_text in (("decline", "n\n"), ("eof", ""), ("non-debian", "y\n")):
+            with self.subTest(label=label):
+                self.probe_count.unlink(missing_ok=True)
+                self.sudo_log.unlink(missing_ok=True)
+                self.os_release.write_text(
+                    'ID=fedora\n' if label == "non-debian" else 'ID=debian\n',
+                    encoding="utf-8",
+                )
+                result = self._run(input_text)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(self.sudo_log.exists())
+                if label == "non-debian":
+                    self.assertFalse(self.probe_count.exists())
+                    self.assertNotIn("Secret Service 不可用", result.stderr)
 
 
 class UnixWebDependencyLockTests(unittest.TestCase):

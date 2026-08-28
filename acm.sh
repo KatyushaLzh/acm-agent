@@ -21,6 +21,7 @@ done
 
 if [ "$ACM_COMMAND" = "web" ]; then
     ACM_PYTHON=$(sh "$REPO_ROOT/tools/ensure-python313.sh" "$REPO_ROOT") || exit $?
+    sh "$REPO_ROOT/tools/ensure-linux-secret-service.sh" "$ACM_PYTHON" "$REPO_ROOT"
     exec "$ACM_PYTHON" -m tools.acm_agent "$@"
 fi
 

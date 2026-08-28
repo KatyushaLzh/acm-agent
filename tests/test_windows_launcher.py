@@ -63,14 +63,14 @@ class WindowsLauncherTests(unittest.TestCase):
             self.assertIn("mirrors.huaweicloud.com", item["Urls"][0])
             self.assertIn("www.python.org", item["Urls"][1])
 
-    def test_probe_accepts_exact_final_python_313_and_core_libraries(self) -> None:
-        if sys.version_info[:2] != (3, 13) or sys.version_info.releaselevel != "final":
-            self.skipTest("This assertion requires the repository's Python 3.13 test runtime")
+    def test_probe_accepts_final_python_310_or_newer_and_core_libraries(self) -> None:
+        if sys.version_info[:2] < (3, 10) or sys.version_info.releaselevel != "final":
+            self.skipTest("This assertion requires a final Python 3.10+ test runtime")
         executable = str(Path(sys.executable)).replace("'", "''")
         completed = run_powershell(
             helper_script(
                 f"$candidate = [pscustomobject]@{{ FilePath = '{executable}'; PrefixArgs = @() }}\n"
-                "$result = Test-AcmPython313Candidate $candidate\n"
+                "$result = Test-AcmPythonCandidate $candidate\n"
                 "$result | ConvertTo-Json -Compress"
             )
         )
@@ -78,15 +78,32 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertEqual(Path(result["Path"]).resolve(), Path(sys.executable).resolve())
         self.assertIsInstance(result["Tkinter"], bool)
 
+    def test_compatible_python_skips_the_313_install_fallback(self) -> None:
+        if sys.version_info[:2] < (3, 10) or sys.version_info.releaselevel != "final":
+            self.skipTest("This assertion requires a final Python 3.10+ test runtime")
+        executable = str(Path(sys.executable)).replace("'", "''")
+        completed = run_powershell(
+            helper_script(
+                f"$candidate = [pscustomobject]@{{ FilePath = '{executable}'; PrefixArgs = @() }}\n"
+                "$script:installs = 0\n"
+                "$result = Ensure-AcmPython -Candidates @($candidate) "
+                "-InstallAction { $script:installs++; return $true }\n"
+                "@{ result = $result; installs = $script:installs } | ConvertTo-Json -Compress"
+            )
+        )
+        result = parse_last_json(completed)
+        self.assertEqual(Path(result["result"]).resolve(), Path(sys.executable).resolve())
+        self.assertEqual(result["installs"], 0)
+
     def test_store_alias_is_rejected_and_system_drive_location_is_probed(self) -> None:
         completed = run_powershell(
             helper_script(
                 "$env:SystemDrive = [System.IO.Path]::GetTempPath().TrimEnd([System.IO.Path]::DirectorySeparatorChar)\n"
-                "$script:expectedSystemPython = Join-Path $env:SystemDrive 'Python313\\python.exe'\n"
+                "$script:expectedSystemPython = Join-Path $env:SystemDrive 'Python310\\python.exe'\n"
                 "function Test-Path { param([string] $LiteralPath, [string] $PathType) "
                 "return $LiteralPath -ieq $script:expectedSystemPython }\n"
                 "$alias = Test-AcmStoreAlias 'C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe'\n"
-                "$hasSystemDrive = [bool]((Get-AcmPython313Candidates) | "
+                "$hasSystemDrive = [bool]((Get-AcmPythonCandidates) | "
                 "Where-Object { $_.FilePath -ieq $script:expectedSystemPython })\n"
                 "@{ alias = $alias; systemDrive = $hasSystemDrive } | ConvertTo-Json -Compress"
             )
@@ -99,7 +116,7 @@ class WindowsLauncherTests(unittest.TestCase):
                 "$script:answers = [System.Collections.Generic.Queue[string]]::new()\n"
                 "$script:answers.Enqueue('maybe'); $script:answers.Enqueue('N')\n"
                 "$script:installs = 0\n"
-                "$result = Ensure-AcmPython313 -Candidates @() "
+                "$result = Ensure-AcmPython -Candidates @() "
                 "-ReadAnswer { param($prompt) $script:answers.Dequeue() } "
                 "-InstallAction { $script:installs++; return $true }\n"
                 "@{ result = $result; installs = $script:installs; remaining = $script:answers.Count } "
@@ -115,7 +132,7 @@ class WindowsLauncherTests(unittest.TestCase):
     def test_prompt_treats_eof_as_safe_exit(self) -> None:
         completed = run_powershell(
             helper_script(
-                "$result = Ensure-AcmPython313 -Candidates @() -ReadAnswer { param($prompt) return $null }\n"
+                "$result = Ensure-AcmPython -Candidates @() -ReadAnswer { param($prompt) return $null }\n"
                 "@{ result = $result } | ConvertTo-Json -Compress"
             )
         )
@@ -186,8 +203,14 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertIn("if ($commandName -ieq 'web')", wrapper)
         self.assertLess(
             wrapper.index("if ($commandName -ieq 'web')"),
-            wrapper.index("Ensure-AcmPython313"),
+            wrapper.index("Ensure-AcmPython"),
         )
+
+    def test_candidate_discovery_covers_supported_minor_versions(self) -> None:
+        helper = HELPER.read_text(encoding="utf-8")
+        for command in ("python3.14", "python3.13", "python3.12", "python3.11", "python3.10"):
+            self.assertIn(command, helper)
+        self.assertIn("@('-3', '-3.14', '-3.13', '-3.12', '-3.11', '-3.10')", helper)
 
     def test_cmd_launcher_delegates_to_the_canonical_web_command(self) -> None:
         launcher = (ROOT / "start-acm-web.cmd").read_text(encoding="utf-8")

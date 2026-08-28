@@ -1,8 +1,8 @@
 # ACM Agent
 
-Python 3.13 标准库驱动的本地训练系统。网页是主要入口，CLI 保留为自动化和无浏览器环境的兼容层。SQLite 是状态事实源；已有 `YYYY/M/D/*.cpp` 只会导入为 `local_only`，不会据此推断 AC。
+兼容 Python 3.10 及以上正式版的本地训练系统。网页是主要入口，CLI 保留为自动化和无浏览器环境的兼容层。SQLite 是状态事实源；已有 `YYYY/M/D/*.cpp` 只会导入为 `local_only`，不会据此推断 AC。
 
-当前发布版本：`6.0.0`。
+当前发布版本：`6.1.0`。
 
 ## 打开本地网页
 
@@ -60,7 +60,7 @@ $env:DEEPSEEK_API_KEY = "你的密钥"
 .\acm.ps1 next --ai --ai-mode specialization --count 3
 ```
 
-网页可随时替换或清除系统安全凭据。若同时存在安全存储凭据和环境变量，安全存储凭据优先；清除后仍可回退到环境变量。Linux 若提示 Secret Service 不可用，请在当前桌面会话中确认 D-Bus 与系统密钥环已经运行并解锁；程序不会调用 `sudo`、启动 daemon 或代替用户解锁。
+网页可随时替换或清除系统安全凭据。若同时存在安全存储凭据和环境变量，安全存储凭据优先；清除后仍可回退到环境变量。Linux 若提示 Secret Service 不可用，请在当前桌面会话中确认 D-Bus 与系统密钥环已经运行并解锁。Debian/Ubuntu 且存在 `apt-get` 时，Web 启动器会询问是否执行 `sudo apt-get install --no-install-recommends gnome-keyring seahorse`；它不会执行 `apt update`、代输密码、启动 daemon 或代替用户解锁。安装后会重新探测 D-Bus 和一次无敏感数据的 keyring 可用性；失败时明确提示“需启动/解锁用户钥匙环”，核心 Dashboard 仍继续运行且凭据持久化保持 fail-closed。`libsecret-tools` 仅作为可选诊断工具，不自动安装。
 
 内置 DeepSeek 路由的推荐和对话默认使用 `deepseek-v4-flash`，可分别改为 `deepseek-v4-pro`；通过 live conformance 的托管 OpenAI-compatible 连接也可为六个任务 profile 独立选模。`gap_fill`（查漏补缺）从不同 AC 题数较少的知识板块选择，`specialization`（专项强化）从不同 AC 题数较多的知识板块选择。两者始终先由确定性引擎生成合规候选，保留当前题数、训练模式、来源模式和题单过滤；网络、鉴权、余额、限流、非法 JSON 或越权题号会优先触发同模式的 hybrid/确定性回退。只有完整本地业务校验通过时回退结果才可用，否则返回结构化 `unavailable`，不会把空或越界集合伪装成成功。
 

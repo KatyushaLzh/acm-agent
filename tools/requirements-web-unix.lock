@@ -1,4 +1,4 @@
-# Generated for the supported CPython 3.13 Unix targets. Keep every package
+# Generated for supported Unix Dashboard targets. Keep every package
 # pinned and every installable wheel hash-verified; the launcher also enforces
 # --only-binary=:all: so source distributions are never executed.
 cffi==2.1.1 ; sys_platform == 'linux' \

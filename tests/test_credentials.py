@@ -281,6 +281,20 @@ class SystemKeyringCredentialVaultTests(unittest.TestCase):
             self.assertEqual(unsupported.backend_name, "unavailable")
             self.assertFalse(unsupported.secure_store_status()["available"])
 
+    def test_linux_factory_requires_a_non_sensitive_read_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            backend = FakeKeyring()
+            backend.fail_get = RuntimeError("Secret Service fixture unavailable")
+            vault = create_platform_credential_vault(
+                Path(temporary) / ".acm",
+                platform_name="linux",
+                keyring_backend=backend,
+            )
+            status = vault.secure_store_status()
+            self.assertEqual(status["backend"], "unavailable")
+            self.assertFalse(status["available"])
+            self.assertEqual(status["error_code"], "credential_store_unavailable")
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux Secret Service check")
     def test_linux_without_dbus_is_safely_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.dict(

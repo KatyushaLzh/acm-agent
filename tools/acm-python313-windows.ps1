@@ -7,31 +7,42 @@ function Test-AcmStoreAlias {
     return $normalized -match '(?i)\\Microsoft\\WindowsApps\\'
 }
 
-function Get-AcmPython313Candidates {
+function Get-AcmPythonCandidates {
     $candidates = [System.Collections.Generic.List[object]]::new()
     $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
-    foreach ($commandName in @('py', 'python3.13', 'python')) {
+    foreach ($commandName in @('py', 'python3.14', 'python3.13', 'python3.12', 'python3.11', 'python3.10', 'python3', 'python')) {
         $command = Get-Command $commandName -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $command) {
             continue
         }
         $path = if ($command.Source) { $command.Source } else { $command.Path }
-        if (-not $path -or (Test-AcmStoreAlias $path) -or -not $seen.Add("$path|$commandName")) {
+        if (-not $path -or (Test-AcmStoreAlias $path)) {
             continue
         }
-        $prefix = if ($commandName -eq 'py') { @('-3.13') } else { @() }
-        $candidates.Add([pscustomobject]@{ FilePath = $path; PrefixArgs = $prefix })
+        if ($commandName -eq 'py') {
+            foreach ($selector in @('-3', '-3.14', '-3.13', '-3.12', '-3.11', '-3.10')) {
+                if ($seen.Add("$path|$selector")) {
+                    $candidates.Add([pscustomobject]@{ FilePath = $path; PrefixArgs = @($selector) })
+                }
+            }
+        }
+        elseif ($seen.Add("$path|python")) {
+            $candidates.Add([pscustomobject]@{ FilePath = $path; PrefixArgs = @() })
+        }
     }
 
-    $standardPaths = @(
-        $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe' }),
-        $(if ($env:SystemDrive) { Join-Path $env:SystemDrive 'Python313\python.exe' }),
-        $(if ($env:ProgramW6432) { Join-Path $env:ProgramW6432 'Python313\python.exe' }),
-        $(if ($env:ProgramFiles) { Join-Path $env:ProgramFiles 'Python313\python.exe' }),
-        $(if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} 'Python313-32\python.exe' }),
-        $(if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} 'Python313\python.exe' })
-    ) | Where-Object { $_ }
+    $standardPaths = [System.Collections.Generic.List[string]]::new()
+    foreach ($minor in 14..10) {
+        if ($env:LOCALAPPDATA) { $standardPaths.Add((Join-Path $env:LOCALAPPDATA "Programs\Python\Python3$minor\python.exe")) }
+        if ($env:SystemDrive) { $standardPaths.Add((Join-Path $env:SystemDrive "Python3$minor\python.exe")) }
+        if ($env:ProgramW6432) { $standardPaths.Add((Join-Path $env:ProgramW6432 "Python3$minor\python.exe")) }
+        if ($env:ProgramFiles) { $standardPaths.Add((Join-Path $env:ProgramFiles "Python3$minor\python.exe")) }
+        if (${env:ProgramFiles(x86)}) {
+            $standardPaths.Add((Join-Path ${env:ProgramFiles(x86)} "Python3$minor-32\python.exe"))
+            $standardPaths.Add((Join-Path ${env:ProgramFiles(x86)} "Python3$minor\python.exe"))
+        }
+    }
 
     foreach ($path in $standardPaths) {
         if ((Test-Path -LiteralPath $path -PathType Leaf) -and -not (Test-AcmStoreAlias $path) -and $seen.Add("$path|python")) {
@@ -41,7 +52,7 @@ function Get-AcmPython313Candidates {
     return $candidates.ToArray()
 }
 
-function Test-AcmPython313Candidate {
+function Test-AcmPythonCandidate {
     param([Parameter(Mandatory = $true)] $Candidate)
 
     $probe = @'
@@ -56,7 +67,7 @@ try:
 except Exception:
     tkinter_ok = False
 
-if sys.version_info[:2] != (3, 13) or sys.version_info.releaselevel != 'final':
+if sys.version_info[:2] < (3, 10) or sys.version_info.releaselevel != 'final':
     raise SystemExit(13)
 
 print(json.dumps({'executable': sys.executable, 'tkinter': tkinter_ok}))
@@ -85,17 +96,17 @@ print(json.dumps({'executable': sys.executable, 'tkinter': tkinter_ok}))
     }
 }
 
-function Find-AcmPython313 {
+function Find-AcmPython {
     param([object[]] $Candidates)
 
     if (-not $PSBoundParameters.ContainsKey('Candidates')) {
-        $Candidates = Get-AcmPython313Candidates
+        $Candidates = Get-AcmPythonCandidates
     }
     foreach ($candidate in $Candidates) {
-        $result = Test-AcmPython313Candidate $candidate
+        $result = Test-AcmPythonCandidate $candidate
         if ($result) {
             if (-not $result.Tkinter) {
-                Write-Warning 'Python 3.13 is usable, but tkinter is unavailable. The native file picker will be unavailable.'
+                Write-Warning 'Python 3.10+ is usable, but tkinter is unavailable. The native file picker will be unavailable.'
             }
             return $result.Path
         }
@@ -253,7 +264,7 @@ function Install-AcmPython313 {
     }
 }
 
-function Ensure-AcmPython313 {
+function Ensure-AcmPython {
     param(
         [object[]] $Candidates,
         [scriptblock] $ReadAnswer,
@@ -264,7 +275,7 @@ function Ensure-AcmPython313 {
     if ($PSBoundParameters.ContainsKey('Candidates')) {
         $candidateArguments.Candidates = $Candidates
     }
-    $pythonPath = Find-AcmPython313 @candidateArguments
+    $pythonPath = Find-AcmPython @candidateArguments
     if ($pythonPath) {
         return $pythonPath
     }
@@ -274,14 +285,14 @@ function Ensure-AcmPython313 {
     }
     :prompt while ($true) {
         try {
-            $answer = & $ReadAnswer 'Python 3.13 is required to start the ACM dashboard. Install Python 3.13.15 now? [y/n]'
+            $answer = & $ReadAnswer 'Python 3.10 or newer is required to start the ACM dashboard. Install Python 3.13.15 now? [y/n]'
         }
         catch {
-            Write-Host 'No interactive input is available. Install Python 3.13 manually, then retry.'
+            Write-Host 'No interactive input is available. Install Python 3.10 or newer manually, then retry.'
             return $null
         }
         if ($null -eq $answer) {
-            Write-Host 'No interactive input is available. Install Python 3.13 manually, then retry.'
+            Write-Host 'No interactive input is available. Install Python 3.10 or newer manually, then retry.'
             return $null
         }
         switch (([string]$answer).Trim().ToLowerInvariant()) {
@@ -302,9 +313,9 @@ function Ensure-AcmPython313 {
         return $null
     }
 
-    $pythonPath = Find-AcmPython313 @candidateArguments
+    $pythonPath = Find-AcmPython @candidateArguments
     if (-not $pythonPath) {
-        Write-Error 'Python 3.13 installation completed, but version or core-library verification failed.'
+        Write-Error 'Python 3.13.15 installation completed, but the Python 3.10+ or core-library verification failed.'
         return $null
     }
     return $pythonPath

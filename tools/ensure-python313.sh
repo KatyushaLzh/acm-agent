@@ -49,7 +49,7 @@ import sqlite3
 import ssl
 import sys
 
-if sys.version_info[:2] != (3, 13) or sys.version_info.releaselevel != "final":
+if sys.version_info[:2] < (3, 10) or sys.version_info.releaselevel != "final":
     raise SystemExit(1)
 print(os.path.realpath(sys.executable))
 ' 2>/dev/null
@@ -70,9 +70,9 @@ probe_command() {
     probe_python "$candidate"
 }
 
-find_python313() {
+find_compatible_python() {
     SELECTED_PYTHON=
-    for command_name in python3.13 python3 python; do
+    for command_name in python3.14 python3.13 python3.12 python3.11 python3.10 python3 python; do
         if probe_command "$command_name"; then
             return 0
         fi
@@ -95,11 +95,11 @@ warn_tkinter_if_missing() {
 }
 
 prompt_install() {
-    printf '%s\n' 'Python 3.13 is required to start the ACM Dashboard, but no usable final 3.13.x interpreter was found.' >&2
+    printf '%s\n' 'Python 3.10 or newer is required to start the ACM Dashboard, but no usable final interpreter was found.' >&2
     while :; do
         printf '%s' 'Download and install project-local Python 3.13.15 now? [y/n] ' >&2
         if ! IFS= read -r answer; then
-            printf '\n%s\n' 'No input received. Web startup cancelled; install Python 3.13 manually or rerun in an interactive terminal.' >&2
+            printf '\n%s\n' 'No input received. Web startup cancelled; install Python 3.10 or newer manually or rerun in an interactive terminal.' >&2
             return 1
         fi
         case "$answer" in
@@ -337,21 +337,27 @@ install_python313() {
         return 1
     }
     if ! probe_python "$managed_python"; then
-        printf '%s\n' 'Installed Python failed the 3.13 final-version or core ssl/sqlite3 checks.' >&2
+        printf '%s\n' 'Installed Python failed the Python 3.10+ final-version or core ssl/sqlite3 checks.' >&2
         return 1
     fi
 }
 
-web_lock_digest() {
+python_lock_digest() {
+    python_executable=$1
     [ -f "$WEB_LOCK_FILE" ] || return 1
-    "$SELECTED_PYTHON" -c '
+    "$python_executable" -c '
 import hashlib
 import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
-print(hashlib.sha256(path.read_bytes()).hexdigest())
+runtime_tag = sys.implementation.cache_tag.encode("ascii")
+print(hashlib.sha256(path.read_bytes() + b"\0" + runtime_tag).hexdigest())
 ' "$WEB_LOCK_FILE" 2>/dev/null
+}
+
+web_lock_digest() {
+    python_lock_digest "$SELECTED_PYTHON"
 }
 
 validate_web_environment() {
@@ -360,13 +366,14 @@ validate_web_environment() {
     [ -x "$environment_python" ] || return 1
     [ -f "$environment_dir/.acm-web-ready" ] || return 1
     [ "$(cat "$environment_dir/.acm-web-ready" 2>/dev/null || true)" = "$WEB_LOCK_DIGEST" ] || return 1
+    [ "$(python_lock_digest "$environment_python" || true)" = "$WEB_LOCK_DIGEST" ] || return 1
     "$environment_python" -c '
 import importlib.metadata
 import sqlite3
 import ssl
 import sys
 
-if sys.version_info[:2] != (3, 13) or sys.version_info.releaselevel != "final":
+if sys.version_info[:2] < (3, 10) or sys.version_info.releaselevel != "final":
     raise SystemExit(1)
 
 expected = {
@@ -522,7 +529,7 @@ select_web_python() {
     sync_web_environment
 }
 
-if ! find_python313; then
+if ! find_compatible_python; then
     prompt_install || exit 1
     install_python313 || exit 1
 fi

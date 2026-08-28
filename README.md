@@ -2,9 +2,9 @@
 
 一个 local-first 的 ACM/ICPC 训练控制台。它把 Codeforces、洛谷公开做题状态、训练题单、可解释推荐、C++ 验证、复盘与可选 AI 辅助统一到本地 SQLite 中。
 
-核心服务基于 Python 3.13 标准库实现，无需 npm 或外部数据库；Linux/macOS Dashboard 的系统凭据存储依赖由启动器隔离管理，网页只监听 `127.0.0.1`。
+核心服务兼容 Python 3.10 及以上正式版，无需 npm 或外部数据库；Linux/macOS Dashboard 的系统凭据存储依赖由启动器隔离管理，网页只监听 `127.0.0.1`。
 
-当前发布版本：`6.0.0`。
+当前发布版本：`6.1.0`。
 
 > 下文截图使用隔离的演示工作区，不包含个人账号、真实提交记录、源码路径、API Key 或运行令牌；五个主界面的截图分别放在对应功能介绍处。
 
@@ -21,7 +21,7 @@
 
 ## 环境要求
 
-- Python 3.13
+- Python 3.10 或以上正式版
 - 现代浏览器
 - 可选：支持 C++17 的 `g++`，仅在编译和验证时需要
 - 在线同步或 AI 功能所需的网络连接
@@ -43,14 +43,14 @@ chmod +x acm.sh start-acm-web.sh
 ./start-acm-web.sh
 ```
 
-四个 Web 入口（`start-acm-web.cmd`、`.\acm.ps1 web`、`./start-acm-web.sh`、`./acm.sh web`）都会先严格检查正式版 Python 3.13.x；只有 3.12、3.14 或其他版本时仍视为缺失。缺失时会循环询问是否安装：输入 `y` 继续联网安装，输入 `n`、标准输入结束或不可交互时安全退出，不会启动 Web。
+四个 Web 入口（`start-acm-web.cmd`、`.\acm.ps1 web`、`./start-acm-web.sh`、`./acm.sh web`）都会先检查可用的 Python 正式版，并直接复用任意 Python 3.10 或以上环境。只有不存在合格环境时才循环询问是否安装：输入 `y` 联网安装固定的 Python 3.13.15，输入 `n`、标准输入结束或不可交互时安全退出，不会启动 Web。
 
 - Windows 固定安装 Python 3.13.15 到当前用户，不替换系统 Python、无需管理员权限；安装包优先从华为云镜像下载，失败后回退至 python.org，并在执行前校验官方 SHA-256。
 - Linux（glibc/musl，x86_64/ARM64）和 macOS（Intel/Apple Silicon）使用固定版 uv 安装托管的 Python 3.13.15。项目内 `.acm/runtime/bootstrap` 已有可执行的目标 uv 时优先复用；项目文件损坏或版本不符时只替换该文件并重新下载校验。项目文件不存在时，全局 uv 恰好匹配固定版本才会复用；未安装或版本不同则下载固定版到项目目录，不升级、不卸载全局 uv，也不修改 PATH。uv 国内镜像下载或 SHA-256 校验失败时回退 GitHub，两个源都失败便终止 Python 安装，绝不使用不匹配的全局版本。Python 运行时优先使用 npmmirror，失败后回退官方源。该流程不调用 `sudo`、不修改 shell profile、PATH 或系统 Python。FreeBSD、OpenBSD、Solaris 等其他 Unix 暂不支持自动安装。
 
-已有任意正式版 Python 3.13.x 时会直接复用。自动安装完成后还会检查 `sqlite3`、`ssl` 等 Web 所需标准库；`tkinter` 缺失不阻止核心 Dashboard 启动，但原生文件选择器及相关操作会提示不可用。
+已有任意正式版 Python 3.10 或以上环境时会直接复用。自动安装完成后还会检查 `sqlite3`、`ssl` 等 Web 所需标准库；`tkinter` 缺失不阻止核心 Dashboard 启动，但原生文件选择器及相关操作会提示不可用。
 
-Linux/macOS 的 Web 入口会用固定且带 SHA-256 的 lock，在 `.acm/runtime/web-envs` 创建项目隔离环境并安装系统凭据存储依赖。ready 环境会按 lock 摘要和精确包版本离线复用；不会调用 `sudo`、写入系统 site-packages 或修改 PATH/shell profile。依赖下载、哈希或版本校验失败时，启动器会告警并用基础 Python 继续启动核心 Dashboard，此时 Unix 安全存储不可用并在下次启动重试。普通 `./acm.sh` CLI 命令继续直接使用系统 `python3`，不会触发这些依赖。
+Linux/macOS 的 Web 入口会用固定且带 SHA-256 的 lock，在 `.acm/runtime/web-envs` 创建项目隔离环境并安装 Python 侧的系统凭据存储依赖。ready 环境会按解释器 ABI、lock 摘要和精确包版本离线复用；不会写入系统 site-packages 或修改 PATH/shell profile。依赖下载、哈希或版本校验失败时，启动器会告警并用基础 Python 继续启动核心 Dashboard，此时 Unix 安全存储不可用并在下次启动重试。仅在 Debian/Ubuntu、存在 `apt-get` 且 Secret Service 探测失败时，启动器会询问是否原样执行 `sudo apt-get install --no-install-recommends gnome-keyring seahorse`；拒绝、EOF、安装失败或安装后复探测失败都不阻止核心 Dashboard，也不会改变凭据持久化的 fail-closed 行为。普通 `./acm.sh` CLI 命令继续直接使用系统 `python3`，不会触发这些依赖。
 
 服务默认在 `127.0.0.1:8765`–`8775` 中选择可用端口并自动打开浏览器。首次使用时填写 Codeforces handle、洛谷数字 UID 和可选的目标 CF rating；验证后立即进入主界面，常驻同步卡会显示平台、阶段、完成计数和已用时间。洛谷公开 AC 会先变为可用，完整目录与标签继续在后台补齐；刷新或重新打开页面仍可恢复进度。新鲜全局目录会复用，洛谷分页与标签抓取采用保守的有界并发和失败退避；公开题面没有标签时记为 `tagless`，不误报为 partial。离线保存不会验证账号或同步平台状态。
 
@@ -150,7 +150,7 @@ AI 预览不会创建题单文件或题单数据库记录，但会保留必要�
 
 ![ai-model](docs/screenshots/ai-model.png)
 
-AI 功能只在用户显式点击或执行 AI 命令时调用。Dashboard 可直接保存 DeepSeek 或 OpenAI-compatible 中转站 API Key：Windows 使用当前用户作用域的 DPAPI，macOS 使用系统 Keychain，Linux 使用 Freedesktop Secret Service。密钥只会在受认证的 loopback 凭据请求体中短暂传递；不会写入 JSON 配置、SQLite、日志、浏览器存储、后台 job 或 API 响应。系统安全存储缺失或锁定时拒绝持久化，仍可临时使用进程环境变量，绝不退化为明文落盘。
+AI 功能只在用户显式点击或执行 AI 命令时调用。Dashboard 可直接保存 DeepSeek 或 OpenAI-compatible 中转站 API Key：Windows 使用当前用户作用域的 DPAPI，macOS 使用系统 Keychain，Linux 使用 Freedesktop Secret Service。密钥只会在受认证的 loopback 凭据请求体中短暂传递；不会写入 JSON 配置、SQLite、日志、浏览器存储、后台 job 或 API 响应。系统安全存储缺失或锁定时拒绝持久化，仍可临时使用进程环境变量，绝不退化为明文落盘。Debian/Ubuntu 的 Web 启动器只在探测失败且用户确认后调用交互式 `sudo` 安装 `gnome-keyring` 与图形管理器 `seahorse`；不执行 `apt update`、不代输密码、不启动或解锁服务。安装后会重新探测 D-Bus 服务并执行一次不包含敏感数据的 keyring 可用性检查；若仍失败，会明确提示“需启动/解锁用户钥匙环”。`libsecret-tools` 仅作为可选诊断工具，不自动安装。
 
 内置 DeepSeek 连接支持 `deepseek-v4-flash` 与 `deepseek-v4-pro`；托管 OpenAI-compatible 连接只能使用已发现且通过能力验证的模型。推理强度中的“Provider 默认”不会下发 thinking/reasoning 控制字段，“关闭”才会显式关闭推理；推荐、对话、补丁、题单与 Markdown 总结按各自 profile 运行，provider reasoning 内容不展示也不保存。
 
@@ -244,7 +244,7 @@ python -m compileall -q tools tests
 python -m tools.acm_agent plan check --json
 ```
 
-测试使用固定脱敏夹具，不依赖实时平台。GitHub Actions 在 Python 3.13 的 Windows 与 Ubuntu 环境运行完整检查，并在 macOS 上定向验证 Unix 启动器。
+测试使用固定脱敏夹具，不依赖实时平台。GitHub Actions 在 Python 3.10 与 3.13 的 Windows、Ubuntu 环境运行完整检查，并在 macOS 上定向验证 Unix 启动器。
 
 ## 平台说明
 

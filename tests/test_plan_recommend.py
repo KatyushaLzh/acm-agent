@@ -46,11 +46,12 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(result.stats["required_tasks"], 91)
         self.assertEqual(result.stats["required_by_platform"], {"codeforces": 50, "luogu": 41})
 
-    def test_flattened_contest_tasks_keep_unlock_date(self):
+    def test_flattened_contest_tasks_have_no_fixed_dates(self):
         records = plan_task_records(load_plan(PLAN))
         d14 = [row for row in records if row["day"] == 14]
         self.assertEqual(len(d14), 4)
-        self.assertTrue(all(row["unlock_at"] == "2026-08-09" for row in d14))
+        self.assertTrue(all(row["unlock_at"] is None for row in d14))
+        self.assertTrue(all(row["due_date"] is None for row in d14))
 
     def test_check_detects_readme_drift(self):
         text = README.read_text(encoding="utf-8-sig").replace("problem/P3374", "problem/P3375", 1)

@@ -24,7 +24,7 @@ try {
     }
     if ($commandName -ieq 'web') {
         . (Join-Path $repoRoot 'tools\acm-python313-windows.ps1')
-        $pythonExecutable = Ensure-AcmPython313
+        $pythonExecutable = Ensure-AcmPython
         if (-not $pythonExecutable) {
             exit 2
         }
