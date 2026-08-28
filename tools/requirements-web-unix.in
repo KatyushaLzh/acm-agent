@@ -1,0 +1,17 @@
+# Source constraints for the Unix Dashboard credential-store environment.
+# Regenerate requirements-web-unix.lock with the pinned project uv:
+# uv pip compile tools/requirements-web-unix.in \
+#   --output-file tools/requirements-web-unix.lock \
+#   --universal --python-version 3.10 --generate-hashes \
+#   --only-binary=:all: --no-annotate --no-header --no-config --upgrade
+
+cffi==2.1.1 ; sys_platform == 'linux' and platform_python_implementation != 'PyPy'
+cryptography==49.0.0 ; sys_platform == 'linux'
+jaraco-classes==3.4.0
+jaraco-context==6.1.2
+jaraco-functools==4.6.0
+jeepney==0.9.0 ; sys_platform == 'linux'
+keyring==25.7.0 ; sys_platform != 'win32'
+more-itertools==11.1.0
+pycparser==3.0 ; sys_platform == 'linux' and platform_python_implementation != 'PyPy'
+secretstorage==3.5.0 ; sys_platform == 'linux'

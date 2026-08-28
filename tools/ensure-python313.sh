@@ -368,6 +368,7 @@ validate_web_environment() {
     [ "$(cat "$environment_dir/.acm-web-ready" 2>/dev/null || true)" = "$WEB_LOCK_DIGEST" ] || return 1
     [ "$(python_lock_digest "$environment_python" || true)" = "$WEB_LOCK_DIGEST" ] || return 1
     "$environment_python" -c '
+import importlib
 import importlib.metadata
 import sqlite3
 import ssl
@@ -385,15 +386,27 @@ expected = {
 }
 if sys.platform == "linux":
     expected.update({
-        "cffi": "2.1.1",
         "cryptography": "49.0.0",
         "jeepney": "0.9.0",
-        "pycparser": "3.0",
         "secretstorage": "3.5.0",
     })
+    if sys.implementation.name != "pypy":
+        expected.update({
+            "cffi": "2.1.1",
+            "pycparser": "3.0",
+        })
 for distribution, version in expected.items():
     if importlib.metadata.version(distribution) != version:
         raise SystemExit(1)
+
+# Metadata alone does not prove that conditional transitive dependencies are
+# complete for this interpreter. Import the approved backend without touching
+# D-Bus or reading credentials so Python 3.10/3.11 marker gaps fail closed.
+importlib.import_module("keyring")
+if sys.platform == "linux":
+    importlib.import_module("cryptography")
+    importlib.import_module("secretstorage")
+    importlib.import_module("keyring.backends.SecretService")
 ' >/dev/null 2>&1
 }
 
@@ -478,7 +491,7 @@ sync_web_environment() {
     if ! UV_CACHE_DIR=$CACHE_DIR UV_NO_CONFIG=1 UV_HTTP_TIMEOUT=30 UV_HTTP_RETRIES=2 \
         "$UV_BIN" pip sync "$WEB_LOCK_FILE" \
         --python "$WEB_TEMP_DIR/bin/python" --require-hashes --only-binary=:all: \
-        --no-python-downloads --no-config; then
+        --strict --no-python-downloads --no-config; then
         printf '%s\n' 'Warning: pinned Web dependencies could not be downloaded or verified; starting the core Dashboard without secure Unix credential storage. The launcher will retry next time.' >&2
         release_install_lock
         return 1

@@ -11,6 +11,15 @@
 - 题单编辑必须使用事务和 `expected_revision` 冲突保护。
 - 不提交真实账号、UID、cookie、token、平台快照、源码答案或 `.acm/`。
 
+Unix Dashboard 安全存储依赖以 `tools/requirements-web-unix.in` 为可审阅源，使用项目固定的 uv 0.12.5 生成跨平台锁。更新依赖后必须重新生成并保留完整条件依赖与 distribution hashes：
+
+```bash
+uv pip compile tools/requirements-web-unix.in \
+  --output-file tools/requirements-web-unix.lock \
+  --universal --python-version 3.10 --generate-hashes \
+  --only-binary=:all: --no-annotate --no-header --no-config --upgrade
+```
+
 ## 提交前检查
 
 ```bash

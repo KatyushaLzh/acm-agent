@@ -47,6 +47,7 @@ chmod +x acm.sh start-acm-web.sh
 
 - Windows 固定安装 Python 3.13.15 到当前用户，不替换系统 Python、无需管理员权限；安装包优先从华为云镜像下载，失败后回退至 python.org，并在执行前校验官方 SHA-256。
 - Linux（glibc/musl，x86_64/ARM64）和 macOS（Intel/Apple Silicon）使用固定版 uv 安装托管的 Python 3.13.15。项目内 `.acm/runtime/bootstrap` 已有可执行的目标 uv 时优先复用；项目文件损坏或版本不符时只替换该文件并重新下载校验。项目文件不存在时，全局 uv 恰好匹配固定版本才会复用；未安装或版本不同则下载固定版到项目目录，不升级、不卸载全局 uv，也不修改 PATH。uv 国内镜像下载或 SHA-256 校验失败时回退 GitHub，两个源都失败便终止 Python 安装，绝不使用不匹配的全局版本。Python 运行时优先使用 npmmirror，失败后回退官方源。该流程不调用 `sudo`、不修改 shell profile、PATH 或系统 Python。FreeBSD、OpenBSD、Solaris 等其他 Unix 暂不支持自动安装。
+- Unix Dashboard 的系统安全存储依赖由 `requirements-web-unix.in` 以 Python 3.10 为下界做 universal resolution，再生成完整、固定版本且带哈希的锁；启动器仍强制 `--require-hashes --only-binary=:all:`，并在标记环境可复用前实际导入对应 keyring 后端，避免某个 Python ABI 或条件传递依赖被锁文件遗漏。
 
 已有任意正式版 Python 3.10 或以上环境时会直接复用。自动安装完成后还会检查 `sqlite3`、`ssl` 等 Web 所需标准库；`tkinter` 缺失不阻止核心 Dashboard 启动，但原生文件选择器及相关操作会提示不可用。
 
