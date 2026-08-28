@@ -515,6 +515,7 @@ class UnixLauncherBehaviorTests(unittest.TestCase):
 
     def test_missing_dependency_lock_falls_back_without_installing(self) -> None:
         (self.root / "tools" / LOCK_SOURCE.name).unlink()
+        self._reject_system_pythons()
         base_python = self.fake_bin / "python3.13"
         _write_executable(
             base_python,
