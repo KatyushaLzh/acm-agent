@@ -12,7 +12,7 @@ AI cost audits expose `provider_route_fallbacks` and `business_fallbacks` separa
 - `attempted`: a platform non-AC submission or local session exists.
 - `skipped`: the user explicitly marked the problem as mastered without implementation; this is reversible and is not AC.
 - `accepted`: platform AC or explicit local `close --result ac`.
-- `review_due`: an overlay used for scheduled closed-book review.
+- `review_due`: a due-date overlay sourced from the independent mutable `review_queue`; future queue items remain visible but only due accepted items enter review recommendations.
 
 Never downgrade accepted state after a failed or partial sync.
 
@@ -32,6 +32,8 @@ Status precedence is `accepted > skipped > attempted > local_only > not_started 
 - Canonical API/CLI result values: `AC`, `WA`, `TLE`, `RE`, `MLE`, `ABANDONED`. Service input is normalized to uppercase, but Agents should emit these canonical values.
 - Hint levels: `0` independent, `1` counterexample question, `2` property hint, `3` transformation or pseudocode, `4` full solution/code.
 - Failure modes: `none`, `modeling`, `invariant`, `implementation`, `edge_case`, `complexity`, `selection`, `editorial`.
+- Hint level is audit metadata only: it does not change weakness scores or establish review eligibility.
+- Automatic review queue entries advance through 7/30/90-day stages. Dashboard/API manual entries are one-shot; deleting or clearing queue entries preserves attempts and acceptance history.
 
 ## Agent JSON Rules
 

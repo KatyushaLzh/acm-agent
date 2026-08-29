@@ -20,6 +20,7 @@ GET  /api/bootstrap
 GET  /api/plans
 GET  /api/plans/{plan_id}
 GET  /api/problems/skipped
+GET  /api/review/queue
 GET  /api/ai/status
 GET  /api/ai/providers
 GET  /api/ai/connections
@@ -79,6 +80,9 @@ POST /api/sessions/start
 POST /api/jobs/verify
 POST /api/sessions/close
 POST /api/review/week
+POST /api/review/queue/add
+POST /api/review/queue/remove
+POST /api/review/queue/clear
 ```
 
 If the runtime file is stale or the health check fails, fall back to the CLI commands below. Do not start a server merely to answer a read-only status question unless the user asked to open the dashboard.
@@ -142,6 +146,7 @@ If configuration is missing, run `.\acm.ps1 init` and let the user enter a Codef
 - Cycle recommendation positions in groups of three: current CF rating +100, the combined CF-equivalent mean of up to the latest 50 distinct solved Codeforces problems and latest 50 distinct solved Luogu problems, then configured target CF rating. AI reranking may vary by up to 100 CF-equivalent rating points from each slot target; within that tolerance, difficulty proximity is a soft preference rather than a requirement to choose the topic's absolute closest candidate. Use the same slot targets for candidate construction and same-mode fallback.
 - Treat platform AC or a manual `close --result ac` as accepted. A local source file alone is `local_only`.
 - Treat `skipped` as a separate, reversible "mastered without implementation" state. It may complete plan progress but is never AC and never satisfies an AC replacement condition.
+- Treat `review_queue` as the mutable source of truth for scheduled reviews. It contains future and due items in date order; only due accepted items enter `review`/`mixed` recommendations. Automatic entries advance through 7/30/90 days, manual entries are one-shot, and hint level never changes weakness or review eligibility. Queue removal or clear preserves attempts, AC, source files, and plan progress.
 - Treat plan membership, deadlines, levels, and enabled state only as candidate eligibility and display metadata. They never add recommendation weight and are never evidence of an attempt or acceptance.
 - Default recommendations to `source_mode=balanced`; use `catalog_only` or `plan_only` only when the user asks, and pass `plan_ids` when the user names specific plans.
 - When the user names a plan by title, resolve it through `GET /api/plans`; if multiple IDs share that title, ask which ID to use. A user-selected problem may go directly to `start` without first calling `next`.

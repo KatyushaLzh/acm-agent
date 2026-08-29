@@ -248,35 +248,93 @@ class ServiceProblemMixin:
         today = date.today()
         with Database(self.paths.database) as db:
             with db.atomic():
+                was_accepted = db.problem_status(ref.platform, problem_id) == "accepted"
                 attempt_id = self._find_or_start_attempt(db, ref)
                 hint = max(hint, db.max_ai_hint_level(attempt_id))
                 previous = [
                     row for row in db.attempts(ref.platform, problem_id)
                     if row["id"] != attempt_id
                 ]
-                previous_wa = sum(str(row["result"] or "").upper() == "WA" for row in previous)
+                reset_attempt_id = db.review_reset_attempt_id(ref.platform, problem_id)
+                relevant_previous = [
+                    row for row in previous
+                    if int(row["id"]) > reset_attempt_id
+                ]
+                previous_wa = sum(
+                    str(row["result"] or "").upper() == "WA"
+                    for row in relevant_previous
+                )
                 previous_abandoned = any(
-                    str(row["result"] or "").upper() == "ABANDONED" for row in previous
+                    str(row["result"] or "").upper() == "ABANDONED"
+                    for row in relevant_previous
                 )
-                previous_stage = max((int(row["review_stage"] or 0) for row in previous), default=0)
-                previous_due = next(
-                    (row["review_due"][:10] for row in previous if row["review_due"]), None
-                )
-                qualifies = normalized_result == "AC" and (
-                    hint >= 2
-                    or previous_wa >= 2
+                queued = db.review_queue_entry(ref.platform, problem_id)
+                failure_qualifies = (failure or "") in {
+                    "selection", "modeling", "invariant", "editorial"
+                }
+                failure_evidence_qualifies = (
+                    previous_wa + (normalized_result == "WA") >= 2
                     or previous_abandoned
-                    or (failure or "") in {"selection", "modeling", "invariant", "editorial"}
-                    or previous_stage > 0
+                    or normalized_result == "ABANDONED"
+                    or failure_qualifies
                 )
-                if qualifies:
-                    next_stage = previous_stage + 1
-                    review_stage = min(next_stage, 3)
-                    delay = {1: 7, 2: 30, 3: 90}.get(next_stage)
-                    review_due = (today + timedelta(days=delay)).isoformat() if delay else None
-                elif previous_stage > 0 and normalized_result != "AC":
-                    review_stage = previous_stage
-                    review_due = previous_due or today.isoformat()
+                qualifies_new = failure_evidence_qualifies and (
+                    normalized_result == "AC" or was_accepted
+                )
+                if queued is not None:
+                    queue_type = str(queued["queue_type"])
+                    current_stage = int(queued["review_stage"] or 0)
+                    current_due = str(queued["review_due"])
+                    if normalized_result == "AC":
+                        if queue_type == "manual_once":
+                            db.remove_review_queue(
+                                ref.platform,
+                                problem_id,
+                                reset_attempt_id=attempt_id,
+                            )
+                            review_stage = 0
+                            review_due = None
+                        else:
+                            next_stage = current_stage + 1
+                            delay = {2: 30, 3: 90}.get(next_stage)
+                            if delay is None:
+                                db.remove_review_queue(
+                                    ref.platform,
+                                    problem_id,
+                                    reset_attempt_id=attempt_id,
+                                )
+                                review_stage = min(current_stage, 3)
+                                review_due = None
+                            else:
+                                review_stage = next_stage
+                                review_due = (today + timedelta(days=delay)).isoformat()
+                                db.upsert_review_queue(
+                                    ref.platform,
+                                    problem_id,
+                                    review_due=review_due,
+                                    queue_type="automatic",
+                                    review_stage=review_stage,
+                                )
+                    else:
+                        review_stage = current_stage
+                        review_due = min(current_due, today.isoformat())
+                        db.upsert_review_queue(
+                            ref.platform,
+                            problem_id,
+                            review_due=review_due,
+                            queue_type=queue_type,
+                            review_stage=review_stage,
+                        )
+                elif qualifies_new:
+                    review_stage = 1
+                    review_due = (today + timedelta(days=7)).isoformat()
+                    db.upsert_review_queue(
+                        ref.platform,
+                        problem_id,
+                        review_due=review_due,
+                        queue_type="automatic",
+                        review_stage=review_stage,
+                    )
                 else:
                     review_stage = 0
                     review_due = None
@@ -340,6 +398,7 @@ class ServiceProblemMixin:
                 if row["closed_at"] and datetime.fromisoformat(row["closed_at"]) >= cutoff
             ]
             due = self._review_due_rows(db)
+            queue = self._review_queue_payload(db)
             weakness = compute_weakness(self._attempt_rows_with_tags(db))
         results = Counter(str(row["result"] or "unknown") for row in attempts)
         failures = Counter(str(row["failure_mode"] or "none") for row in attempts)
@@ -356,6 +415,8 @@ class ServiceProblemMixin:
             "average_hint_level": average_hint,
             "weak_topics": weakness,
             "review_due": due,
+            "review_queue": queue["items"],
+            "review_queue_counts": queue["counts"],
         }
         self.paths.reports.mkdir(parents=True, exist_ok=True)
         report = self.paths.reports / f"week-{date.today().isoformat()}.md"
@@ -364,11 +425,23 @@ class ServiceProblemMixin:
             "",
             f"- 完成 session：{len(attempts)}",
             f"- 平均提示等级：{average_hint}",
-            f"- 到期复做：{len(due)}",
+            f"- 复做队列：{queue['counts']['total']}（已到期 {queue['counts']['due']}）",
             "",
             "## 结果",
             "",
             *(f"- {key}: {value}" for key, value in sorted(results.items())),
+            "",
+            "## 复做队列",
+            "",
+            *(
+                f"- {item['review_due']} · {item['problem_id']} · "
+                + (
+                    "一次性"
+                    if item["queue_type"] == "manual_once"
+                    else f"自动阶段 {item['review_stage']}"
+                )
+                for item in queue["items"]
+            ),
             "",
             "## 薄弱专题",
             "",
@@ -383,16 +456,122 @@ class ServiceProblemMixin:
 
     @staticmethod
     def _review_due_by_key(db: Database) -> dict[str, str]:
-        result: dict[str, str] = {}
-        seen: set[str] = set()
-        for row in db.attempts():
-            key = _problem_key(row["platform"], row["problem_id"])
-            if key in seen:
-                continue
-            seen.add(key)
-            if row["review_due"]:
-                result[key] = row["review_due"][:10]
-        return result
+        return {
+            _problem_key(row["platform"], row["problem_id"]): str(row["review_due"])[:10]
+            for row in db.review_queue_entries()
+        }
+
+    @staticmethod
+    def _review_queue_payload(db: Database) -> dict[str, Any]:
+        today = date.today()
+        items: list[dict[str, Any]] = []
+        overdue = due_today = future = 0
+        for row in db.review_queue_entries():
+            due = date.fromisoformat(str(row["review_due"])[:10])
+            delta = (due - today).days
+            if delta < 0:
+                status = "overdue"
+                overdue += 1
+            elif delta == 0:
+                status = "today"
+                due_today += 1
+            else:
+                status = "future"
+                future += 1
+            items.append(
+                {
+                    "platform": row["platform"],
+                    "problem_id": _display_problem_id(row["platform"], row["problem_id"]),
+                    "title": row["name"] or "",
+                    "url": row["url"] or "",
+                    "review_due": due.isoformat(),
+                    "queue_type": row["queue_type"],
+                    "review_stage": int(row["review_stage"] or 0),
+                    "status": status,
+                    "days_from_today": delta,
+                }
+            )
+        return {
+            "items": items,
+            "counts": {
+                "total": len(items),
+                "due": overdue + due_today,
+                "overdue": overdue,
+                "today": due_today,
+                "future": future,
+            },
+        }
+
+    def review_queue(self) -> dict[str, Any]:
+        load_config(self.paths)
+        with Database(self.paths.database) as db:
+            payload = self._review_queue_payload(db)
+        return {"ok": True, **payload}
+
+    def review_queue_add(
+        self,
+        problem: str,
+        *,
+        review_due: str,
+        source: str = "agent",
+    ) -> dict[str, Any]:
+        load_config(self.paths)
+        ref = parse_problem_ref(problem)
+        problem_id = _db_problem_id(ref.platform, ref.problem_id)
+        raw_due = str(review_due or "").strip()
+        try:
+            parsed_due = date.fromisoformat(raw_due)
+        except ValueError as exc:
+            raise ValueError("review_due 必须是 YYYY-MM-DD 日期") from exc
+        if parsed_due.isoformat() != raw_due:
+            raise ValueError("review_due 必须是 YYYY-MM-DD 日期")
+        if source not in {"web", "agent"}:
+            raise ValueError("source 必须是 web 或 agent")
+        with Database(self.paths.database) as db:
+            if db.problem_status(ref.platform, problem_id) != "accepted":
+                raise ValueError(f"{ref.problem_id} 尚未 AC，不能加入复做队列")
+            existing = db.review_queue_entry(ref.platform, problem_id)
+            db.upsert_review_queue(
+                ref.platform,
+                problem_id,
+                review_due=parsed_due.isoformat(),
+                queue_type=(str(existing["queue_type"]) if existing else "manual_once"),
+                review_stage=(int(existing["review_stage"] or 0) if existing else 0),
+            )
+            payload = self._review_queue_payload(db)
+        return {"ok": True, "created": existing is None, **payload}
+
+    def review_queue_remove(
+        self,
+        problem: str,
+        *,
+        source: str = "agent",
+    ) -> dict[str, Any]:
+        load_config(self.paths)
+        ref = parse_problem_ref(problem)
+        problem_id = _db_problem_id(ref.platform, ref.problem_id)
+        if source not in {"web", "agent"}:
+            raise ValueError("source 必须是 web 或 agent")
+        with Database(self.paths.database) as db:
+            removed = db.remove_review_queue(ref.platform, problem_id)
+            payload = self._review_queue_payload(db)
+        return {"ok": True, "removed": removed, **payload}
+
+    def review_queue_clear(
+        self,
+        *,
+        confirm: bool = False,
+        source: str = "agent",
+    ) -> dict[str, Any]:
+        load_config(self.paths)
+        if confirm is not True:
+            raise ValueError("清空复做队列必须显式传入 confirm=true")
+        if source not in {"web", "agent"}:
+            raise ValueError("source 必须是 web 或 agent")
+        with Database(self.paths.database) as db:
+            removed_count = db.clear_review_queue()
+            payload = self._review_queue_payload(db)
+        return {"ok": True, "removed_count": removed_count, **payload}
 
     def _review_due_rows(self, db: Database) -> list[dict[str, Any]]:
         today = date.today().isoformat()

@@ -16,6 +16,7 @@ class WebFrontendConcurrencyContractTests(unittest.TestCase):
         cls.today = (STATIC / "view_today.js").read_text(encoding="utf-8")
         cls.ai = (STATIC / "view_ai.js").read_text(encoding="utf-8")
         cls.review = (STATIC / "view_review.js").read_text(encoding="utf-8")
+        cls.events_review = (STATIC / "events_review.js").read_text(encoding="utf-8")
         cls.workbench = (STATIC / "view_workbench.js").read_text(encoding="utf-8")
         cls.events_today = (STATIC / "events_today.js").read_text(encoding="utf-8")
         cls.events_ai = (STATIC / "events_ai.js").read_text(encoding="utf-8")
@@ -30,6 +31,44 @@ class WebFrontendConcurrencyContractTests(unittest.TestCase):
         self.assertIn('if (done) throw new Error("模型流式响应在完成事件前中断")', self.ai)
         self.assertIn("if (done && buffer.trim())", self.ai)
         self.assertIn("return completed", self.ai)
+
+    def test_review_queue_ui_uses_structured_management_endpoints(self) -> None:
+        self.assertIn('api("/api/review/queue")', self.review)
+        self.assertIn('api("/api/review/queue/add", { body: { problem, review_due: reviewDue } })', self.review)
+        self.assertIn('api("/api/review/queue/remove", { body: { problem } })', self.review)
+        self.assertIn('api("/api/review/queue/clear", { body: { confirm: true } })', self.review)
+
+    def test_review_queue_controls_and_refresh_contract(self) -> None:
+        for element_id in (
+            "review-add-button", "review-clear-button", "review-add-dialog",
+            "review-add-form", "review-add-problem", "review-add-date",
+        ):
+            self.assertIn(f'id="{element_id}"', self.index)
+        self.assertIn("await loadReviewQueue();", self.review)
+        self.assertIn("await loadBootstrap();", self.review)
+        self.assertIn("if (hadRecommendations) await requestRecommendations();", self.review)
+        self.assertIn("form.elements.review_due.value = localDateValue();", self.review)
+        self.assertIn('$("#review-clear-button").disabled = items.length === 0;', self.review)
+        self.assertIn("removeReviewQueueItem(button.dataset.problem, button)", self.events_review)
+
+    def test_review_queue_renders_full_date_and_type_state(self) -> None:
+        for phrase in (
+            "复做队列", "复做队列为空", "逾期 ${Math.abs(delta)} 天", "今天",
+            "${delta} 天后", "一次性", "自动 · 阶段 ${stage}",
+        ):
+            self.assertIn(phrase, self.index + self.review)
+        self.assertIn('class="badge review-date-${escapeHtml(status.kind)}"', self.review)
+        self.assertIn('window.confirm(`确认清空全部 ${total} 道复做题目？', self.review)
+        self.assertIn('window.confirm(`确认从复做队列删除 ${problem}？', self.review)
+
+    def test_completed_disabled_buttons_do_not_keep_busy_cursor(self) -> None:
+        self.assertIn(".button:disabled { cursor: default;", self.styles)
+        self.assertIn(
+            '.button[data-busy="true"], .button[data-busy="true"]:disabled,',
+            self.styles,
+        )
+        self.assertIn('[aria-busy="true"] .button:disabled { cursor: progress;', self.styles)
+        self.assertNotIn(".button:disabled { cursor: wait;", self.styles)
 
     def test_ai_stream_completion_flag_survives_try_scope(self) -> None:
         body = self.ai.split("async function streamAiChat", 1)[1].split(

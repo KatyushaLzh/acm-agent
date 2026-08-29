@@ -713,33 +713,6 @@ def _keyring_failure(exc: Exception, *, action: str) -> CredentialStoreError:
     return CredentialStoreError(f"系统安全凭据库{action}失败。")
 
 
-def _linux_secret_service_backend(keyring_backend: Any | None = None) -> Any:
-    """Return a usable Secret Service backend after a data-free read probe."""
-
-    if keyring_backend is None:
-        if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
-            raise RuntimeError("D-Bus session address is unavailable")
-        import secretstorage
-        from keyring.backends.SecretService import Keyring
-
-        connection = secretstorage.dbus_init()
-        if not secretstorage.check_service_availability(connection):
-            raise RuntimeError("Secret Service D-Bus service is unavailable")
-        keyring_backend = Keyring()
-    _ = keyring_backend.priority
-    # Query a fresh account that the application never writes. This exercises
-    # the read path without storing or looking up user credentials.
-    probe_account = f"availability-probe-{uuid4()}"
-    _ = keyring_backend.get_password(_SYSTEM_KEYRING_SERVICE, probe_account)
-    return keyring_backend
-
-
-def probe_linux_secret_service() -> None:
-    """Probe D-Bus, Secret Service, and one non-sensitive keyring read."""
-
-    _linux_secret_service_backend()
-
-
 class SystemKeyringCredentialVault:
     """Origin-bound provider credentials stored in Keychain/Secret Service.
 
@@ -1264,7 +1237,11 @@ def create_platform_credential_vault(
     if selected.startswith("linux"):
         backend_name = "secret_service"
         try:
-            keyring_backend = _linux_secret_service_backend(keyring_backend)
+            if keyring_backend is None:
+                from keyring.backends.SecretService import Keyring
+
+                keyring_backend = Keyring()
+            _ = keyring_backend.priority
             return SystemKeyringCredentialVault(
                 root / "credentials", keyring_backend=keyring_backend, backend_name=backend_name
             )
@@ -1287,7 +1264,6 @@ __all__ = [
     "SystemKeyringCredentialVault",
     "UnavailableCredentialVault",
     "create_platform_credential_vault",
-    "probe_linux_secret_service",
     "protect_with_dpapi",
     "unprotect_with_dpapi",
 ]

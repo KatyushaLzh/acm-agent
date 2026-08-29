@@ -772,7 +772,7 @@ class Stage3CostStorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "state.db"
             with Database(path) as db:
-                self.assertEqual(SCHEMA_VERSION, 24)
+                self.assertEqual(SCHEMA_VERSION, 25)
                 db.create_ai_run(
                     "run-stage3",
                     kind="recommendation",

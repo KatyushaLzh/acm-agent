@@ -539,6 +539,9 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
         "/api/sessions/start": "start",
         "/api/sessions/close": "close",
         "/api/review/week": "weekly_review",
+        "/api/review/queue/add": "review_queue_add",
+        "/api/review/queue/remove": "review_queue_remove",
+        "/api/review/queue/clear": "review_queue_clear",
         "/api/plan/check": "plan_check",
         "/api/plans/preview": "plan_preview",
         "/api/plans/import": "plan_import",
@@ -833,7 +836,13 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
                     stream = self.server.service.ai_chat_stream(identifier, **payload)
                 self._send_sse(stream)
                 return
-            if path in {"/api/problems/skip", "/api/problems/unskip"}:
+            if path in {
+                "/api/problems/skip",
+                "/api/problems/unskip",
+                "/api/review/queue/add",
+                "/api/review/queue/remove",
+                "/api/review/queue/clear",
+            }:
                 payload.setdefault("source", "web")
             if path in self._job_routes:
                 method_name = self._job_routes[path]
@@ -989,6 +998,11 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/problems/skipped":
                 with self.server.service_lock:
                     result = self._invoke("skipped_problems", {})
+                self._send_success(result)
+                return
+            if path == "/api/review/queue":
+                with self.server.service_lock:
+                    result = self._invoke("review_queue", {})
                 self._send_success(result)
                 return
             if path == "/api/ai/status":

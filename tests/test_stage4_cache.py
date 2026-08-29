@@ -180,7 +180,7 @@ class Stage4StorageTests(unittest.TestCase):
         )
 
     def test_schema_v22_contains_cache_and_separate_run_audit(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 24)
+        self.assertEqual(SCHEMA_VERSION, 25)
         names = {
             row[0]
             for row in self.database.connection.execute(
@@ -227,7 +227,7 @@ class Stage4StorageTests(unittest.TestCase):
             )
         self.database = Database(self.path)
         self.assertEqual(
-            self.database.connection.execute("PRAGMA user_version").fetchone()[0], 24
+            self.database.connection.execute("PRAGMA user_version").fetchone()[0], 25
         )
 
     def test_failed_v22_migration_rolls_back_and_restart_succeeds(self) -> None:
@@ -264,7 +264,7 @@ class Stage4StorageTests(unittest.TestCase):
             connection.close()
         self.database = Database(self.path)
         self.assertEqual(
-            self.database.connection.execute("PRAGMA user_version").fetchone()[0], 24
+            self.database.connection.execute("PRAGMA user_version").fetchone()[0], 25
         )
 
     def test_hit_reruns_validator_and_lowering(self) -> None:

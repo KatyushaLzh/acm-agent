@@ -46,12 +46,11 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(result.stats["required_tasks"], 91)
         self.assertEqual(result.stats["required_by_platform"], {"codeforces": 50, "luogu": 41})
 
-    def test_flattened_contest_tasks_have_no_fixed_dates(self):
+    def test_flattened_contest_tasks_keep_unlock_date(self):
         records = plan_task_records(load_plan(PLAN))
         d14 = [row for row in records if row["day"] == 14]
         self.assertEqual(len(d14), 4)
-        self.assertTrue(all(row["unlock_at"] is None for row in d14))
-        self.assertTrue(all(row["due_date"] is None for row in d14))
+        self.assertTrue(all(row["unlock_at"] == "2026-08-09" for row in d14))
 
     def test_check_detects_readme_drift(self):
         text = README.read_text(encoding="utf-8-sig").replace("problem/P3374", "problem/P3375", 1)
@@ -219,14 +218,16 @@ class RecommendationTests(unittest.TestCase):
         )
         self.assertEqual(storage_key_result, [])
 
-    def test_weakness_uses_recent_failures_hints_and_independent_ac(self):
+    def test_weakness_uses_recent_failures_and_ignores_hint_level(self):
         attempts = [
             {"date": "2026-08-01", "result": "WA", "hint_level": 2, "tags": ["segment tree"]},
             {"date": "2026-08-02", "result": "AC", "hint_level": 0, "tags": ["segment tree"]},
+            {"date": "2026-08-02", "result": "AC", "hint_level": 4, "tags": ["hinted AC"]},
             {"date": "2026-04-01", "result": "ABANDONED", "tags": ["segment tree"]},
         ]
         weakness = compute_weakness(attempts, now=date(2026, 8, 3))
-        self.assertEqual(weakness["segment tree"], 2.5)
+        self.assertEqual(weakness["segment tree"], 1.0)
+        self.assertEqual(weakness["hinted AC"], 0.0)
 
     def test_platform_balance_breakdown_and_natural_tie_break(self):
         history = [{"problem_key": f"codeforces:CF{i}A", "platform": "codeforces"} for i in range(20)]

@@ -190,14 +190,16 @@ class AiStorageMigrationTests(unittest.TestCase):
 
             with Database(path) as database:
                 self.assertEqual(
-                    database.connection.execute("PRAGMA user_version").fetchone()[0], 24
+                    database.connection.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
                 )
                 self.assertIsNone(database.ai_run("old")["business_outcome"])
                 self.assertEqual(database.ai_run("old")["repair_attempts"], 0)
                 self.assertEqual(database.ai_run_legs("old")[0]["purpose"], "legacy")
             with Database(path) as reopened:
                 self.assertEqual(
-                    reopened.connection.execute("PRAGMA user_version").fetchone()[0], 24
+                    reopened.connection.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
                 )
 
     def test_failed_v23_migration_rolls_back_then_restart_succeeds(self):
@@ -229,7 +231,8 @@ class AiStorageMigrationTests(unittest.TestCase):
                 connection.close()
             with Database(path) as database:
                 self.assertEqual(
-                    database.connection.execute("PRAGMA user_version").fetchone()[0], 24
+                    database.connection.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
                 )
 
     def assert_v16_retirement_backup(self, backup: Path) -> None:
@@ -302,7 +305,7 @@ class AiStorageMigrationTests(unittest.TestCase):
                 connection.close()
 
             with Database(path) as database:
-                self.assertEqual(SCHEMA_VERSION, 24)
+                self.assertEqual(SCHEMA_VERSION, 25)
                 self.assertEqual(
                     database.connection.execute("PRAGMA user_version").fetchone()[0],
                     SCHEMA_VERSION,
@@ -638,7 +641,7 @@ class AiStorageMigrationTests(unittest.TestCase):
                 conversation = database.ai_conversation("historical-conversation")
                 self.assertEqual(
                     database.connection.execute("PRAGMA user_version").fetchone()[0],
-                    24,
+                    SCHEMA_VERSION,
                 )
                 self.assertIsNone(run["requested_reasoning_strength"])
                 self.assertIsNone(run["resolved_reasoning_strength"])
@@ -651,7 +654,7 @@ class AiStorageMigrationTests(unittest.TestCase):
             with Database(path) as database:
                 self.assertEqual(
                     database.connection.execute("PRAGMA user_version").fetchone()[0],
-                    24,
+                    SCHEMA_VERSION,
                 )
 
 
@@ -1248,6 +1251,272 @@ class AiCostScopeTests(unittest.TestCase):
                 self.assertEqual(metrics["observed_runs"], 1)
                 self.assertEqual(metrics["invalid_runs"], 1)
                 self.assertEqual(metrics["unknown_runs"], 1)
+
+
+class ReviewQueueStorageTests(unittest.TestCase):
+    @staticmethod
+    def _add_problem(
+        database: Database,
+        platform: str,
+        problem_id: str,
+        *,
+        name: str = "",
+    ) -> None:
+        database.upsert_problem(
+            {
+                "platform": platform,
+                "problem_id": problem_id,
+                "name": name,
+                "url": f"https://example.test/{platform}/{problem_id}",
+            }
+        )
+
+    def test_v25_starts_with_an_empty_queue_and_resets_only_latest_legacy_due(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.db"
+            connection = sqlite3.connect(path)
+            try:
+                for version in range(1, 25):
+                    connection.executescript(MIGRATIONS[version])
+                    connection.execute(f"PRAGMA user_version={version}")
+                for platform, problem_id in (
+                    ("codeforces", "1A"),
+                    ("codeforces", "2A"),
+                    ("luogu", "P1001"),
+                ):
+                    connection.execute(
+                        """INSERT INTO problems(
+                               platform,problem_id,tags_json,source_json,updated_at)
+                           VALUES(?,?, '[]','{}','2026-08-28T00:00:00+00:00')""",
+                        (platform, problem_id),
+                    )
+                connection.executemany(
+                    """INSERT INTO attempts(
+                           platform,problem_id,started_at,closed_at,result,
+                           review_stage,review_due,active)
+                       VALUES(?,?,?,?,?,?,?,0)""",
+                    (
+                        (
+                            "codeforces",
+                            "1A",
+                            "2026-08-20T00:00:00+00:00",
+                            "2026-08-20T01:00:00+00:00",
+                            "AC",
+                            1,
+                            "2026-08-27",
+                        ),
+                        (
+                            "codeforces",
+                            "2A",
+                            "2026-08-20T00:00:00+00:00",
+                            "2026-08-20T01:00:00+00:00",
+                            "AC",
+                            1,
+                            "2026-08-27",
+                        ),
+                        (
+                            "codeforces",
+                            "2A",
+                            "2026-08-21T00:00:00+00:00",
+                            "2026-08-21T01:00:00+00:00",
+                            "AC",
+                            0,
+                            None,
+                        ),
+                        (
+                            "luogu",
+                            "P1001",
+                            "2026-08-22T00:00:00+00:00",
+                            "2026-08-22T01:00:00+00:00",
+                            "AC",
+                            2,
+                            "2026-09-21",
+                        ),
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with Database(path) as database:
+                self.assertEqual(
+                    database.connection.execute("PRAGMA user_version").fetchone()[0],
+                    25,
+                )
+                self.assertEqual(database.review_queue_entries(), [])
+                self.assertEqual(
+                    database.review_reset_at("codeforces", "1A"),
+                    "2026-08-20T01:00:00+00:00",
+                )
+                self.assertEqual(database.review_reset_attempt_id("codeforces", "1A"), 1)
+                self.assertIsNone(database.review_reset_at("codeforces", "2A"))
+                self.assertEqual(database.review_reset_attempt_id("codeforces", "2A"), 0)
+                self.assertEqual(
+                    database.review_reset_at("luogu", "P1001"),
+                    "2026-08-22T01:00:00+00:00",
+                )
+                self.assertEqual(database.review_reset_attempt_id("luogu", "P1001"), 4)
+                self.assertEqual(
+                    database.connection.execute(
+                        "SELECT COUNT(*) FROM attempts WHERE review_due IS NOT NULL"
+                    ).fetchone()[0],
+                    3,
+                )
+
+            backup = path.with_name("state.db.v24.bak")
+            self.assertTrue(backup.exists())
+            backup_connection = sqlite3.connect(backup)
+            try:
+                self.assertEqual(
+                    backup_connection.execute("PRAGMA user_version").fetchone()[0],
+                    24,
+                )
+                self.assertIsNone(
+                    backup_connection.execute(
+                        "SELECT name FROM sqlite_master WHERE name='review_queue'"
+                    ).fetchone()
+                )
+            finally:
+                backup_connection.close()
+
+    def test_review_queue_crud_orders_entries_and_preserves_problem_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with Database(Path(temporary) / "state.db") as database:
+                self._add_problem(database, "codeforces", "2A", name="Second")
+                self._add_problem(database, "codeforces", "1A", name="First")
+                self._add_problem(database, "luogu", "P1001", name="A+B")
+
+                database.upsert_review_queue(
+                    "luogu",
+                    "P1001",
+                    review_due="2026-09-01",
+                    queue_type="manual_once",
+                    created_at="2026-08-01T00:00:00+00:00",
+                    updated_at="2026-08-01T00:00:00+00:00",
+                )
+                database.upsert_review_queue(
+                    "codeforces",
+                    "2A",
+                    review_due="2026-08-30",
+                    queue_type="automatic",
+                    review_stage=2,
+                )
+                database.upsert_review_queue(
+                    "codeforces",
+                    "1A",
+                    review_due="2026-08-30",
+                    queue_type="automatic",
+                    review_stage=1,
+                )
+
+                rows = database.review_queue_entries()
+                self.assertEqual(
+                    [(row["platform"], row["problem_id"]) for row in rows],
+                    [
+                        ("codeforces", "1A"),
+                        ("codeforces", "2A"),
+                        ("luogu", "P1001"),
+                    ],
+                )
+                self.assertEqual(rows[0]["name"], "First")
+                self.assertEqual(rows[0]["url"], "https://example.test/codeforces/1A")
+
+                updated = database.upsert_review_queue(
+                    "luogu",
+                    "P1001",
+                    review_due="2026-08-29",
+                    queue_type="manual_once",
+                    updated_at="2026-08-02T00:00:00+00:00",
+                )
+                self.assertEqual(updated["review_due"], "2026-08-29")
+                self.assertEqual(updated["created_at"], "2026-08-01T00:00:00+00:00")
+                self.assertEqual(updated["updated_at"], "2026-08-02T00:00:00+00:00")
+                self.assertIsNone(database.review_reset_at("luogu", "P1001"))
+
+    def test_remove_and_clear_write_reset_cutoffs_without_touching_problems(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with Database(Path(temporary) / "state.db") as database:
+                for problem_id in ("1A", "2A", "3A"):
+                    self._add_problem(database, "codeforces", problem_id)
+                    attempt_id = database.start_attempt(
+                        "codeforces",
+                        problem_id,
+                        started_at="2026-08-29T00:00:00+00:00",
+                    )
+                    database.close_attempt(
+                        attempt_id,
+                        result="WA",
+                        closed_at="2026-08-29T01:00:00+00:00",
+                    )
+                    database.upsert_review_queue(
+                        "codeforces",
+                        problem_id,
+                        review_due="2026-08-29",
+                        queue_type="automatic",
+                        review_stage=1,
+                    )
+
+                self.assertTrue(
+                    database.remove_review_queue(
+                        "codeforces",
+                        "1A",
+                        reset_at="2026-08-29T01:00:00+00:00",
+                    )
+                )
+                self.assertFalse(database.remove_review_queue("codeforces", "missing"))
+                self.assertEqual(
+                    database.review_reset_at("codeforces", "1A"),
+                    "2026-08-29T01:00:00+00:00",
+                )
+                reset_attempt_id = database.review_reset_attempt_id(
+                    "codeforces", "1A"
+                )
+                self.assertGreater(reset_attempt_id, 0)
+                self.assertIsNone(database.review_reset_at("codeforces", "missing"))
+
+                same_second_attempt = database.start_attempt(
+                    "codeforces",
+                    "1A",
+                    started_at="2026-08-29T01:00:00+00:00",
+                )
+                database.close_attempt(
+                    same_second_attempt,
+                    result="WA",
+                    closed_at="2026-08-29T01:00:00+00:00",
+                )
+                self.assertGreater(same_second_attempt, reset_attempt_id)
+
+                self.assertEqual(
+                    database.clear_review_queue(
+                        reset_at="2026-08-29T02:00:00+00:00"
+                    ),
+                    2,
+                )
+                self.assertEqual(database.review_queue_entries(), [])
+                for problem_id in ("2A", "3A"):
+                    self.assertEqual(
+                        database.review_reset_at("codeforces", problem_id),
+                        "2026-08-29T02:00:00+00:00",
+                    )
+                self.assertEqual(
+                    len(database.problems("codeforces")),
+                    3,
+                )
+
+    def test_review_queue_enforces_type_stage_invariant(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with Database(Path(temporary) / "state.db") as database:
+                self._add_problem(database, "codeforces", "1A")
+                for queue_type, stage in (("automatic", 0), ("manual_once", 1)):
+                    with self.subTest(queue_type=queue_type, stage=stage):
+                        with self.assertRaises(sqlite3.IntegrityError):
+                            database.upsert_review_queue(
+                                "codeforces",
+                                "1A",
+                                review_due="2026-08-29",
+                                queue_type=queue_type,
+                                review_stage=stage,
+                            )
 
 
 if __name__ == "__main__":

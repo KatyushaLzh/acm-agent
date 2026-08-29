@@ -12,7 +12,7 @@ single migration in place mutate this same dict object.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 
 MIGRATIONS: dict[int, str] = {
@@ -925,5 +925,37 @@ MIGRATIONS: dict[int, str] = {
         ON ai_runs(profile_id, local_cache_status, created_at DESC);
     CREATE INDEX ai_runs_outcome_idx
         ON ai_runs(business_outcome,usable,degraded,created_at DESC);
+    """,
+    25: """
+    CREATE TABLE review_queue (
+        platform TEXT NOT NULL,
+        problem_id TEXT NOT NULL,
+        review_due TEXT NOT NULL,
+        queue_type TEXT NOT NULL
+            CHECK (queue_type IN ('automatic', 'manual_once')),
+        review_stage INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (platform, problem_id),
+        CHECK (
+            (queue_type = 'automatic' AND review_stage BETWEEN 1 AND 3) OR
+            (queue_type = 'manual_once' AND review_stage = 0)
+        ),
+        FOREIGN KEY (platform, problem_id)
+            REFERENCES problems(platform, problem_id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE review_queue_resets (
+        platform TEXT NOT NULL,
+        problem_id TEXT NOT NULL,
+        reset_at TEXT NOT NULL,
+        reset_attempt_id INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (platform, problem_id),
+        FOREIGN KEY (platform, problem_id)
+            REFERENCES problems(platform, problem_id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX review_queue_due_idx
+        ON review_queue(review_due, platform, problem_id);
     """,
 }

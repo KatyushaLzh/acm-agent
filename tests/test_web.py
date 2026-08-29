@@ -246,6 +246,18 @@ class FakeService:
     def weekly_review(self, **values: object) -> dict[str, object]:
         return self._return("weekly_review", values)
 
+    def review_queue(self, **values: object) -> dict[str, object]:
+        return self._return("review_queue", values)
+
+    def review_queue_add(self, **values: object) -> dict[str, object]:
+        return self._return("review_queue_add", values)
+
+    def review_queue_remove(self, **values: object) -> dict[str, object]:
+        return self._return("review_queue_remove", values)
+
+    def review_queue_clear(self, **values: object) -> dict[str, object]:
+        return self._return("review_queue_clear", values)
+
     def plan_check(self, **values: object) -> dict[str, object]:
         return self._return("plan_check", values)
 
@@ -1094,6 +1106,9 @@ class WebServerTest(unittest.TestCase):
             "/api/sessions/start": "start",
             "/api/sessions/close": "close",
             "/api/review/week": "weekly_review",
+            "/api/review/queue/add": "review_queue_add",
+            "/api/review/queue/remove": "review_queue_remove",
+            "/api/review/queue/clear": "review_queue_clear",
             "/api/plan/check": "plan_check",
             "/api/plans/preview": "plan_preview",
             "/api/plans/import": "plan_import",
@@ -1111,6 +1126,22 @@ class WebServerTest(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual(payload["data"]["operation"], operation)
                 self.assertEqual(payload["data"]["marker"], operation)
+
+    def test_review_queue_routes_use_web_source(self) -> None:
+        status, payload, _ = self.request("GET", "/api/review/queue")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["operation"], "review_queue")
+
+        for path, operation, body in (
+            ("/api/review/queue/add", "review_queue_add", {"problem": "CF1A", "review_due": "2026-08-29"}),
+            ("/api/review/queue/remove", "review_queue_remove", {"problem": "CF1A"}),
+            ("/api/review/queue/clear", "review_queue_clear", {"confirm": True}),
+        ):
+            with self.subTest(path=path):
+                status, response, _ = self.request("POST", path, payload=body)
+                self.assertEqual(status, 200)
+                self.assertEqual(response["data"]["operation"], operation)
+                self.assertEqual(response["data"]["source"], "web")
 
     def test_skip_routes_use_singular_note_and_web_source(self) -> None:
         status, payload, _ = self.request(

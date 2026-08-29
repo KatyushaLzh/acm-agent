@@ -31,11 +31,11 @@ from .storage_schema import MIGRATIONS, SCHEMA_VERSION
 
 # Schema versions whose *preceding* schema is snapshotted when the database is
 # opened directly at that schema (the upgrade's first step).
-_BACKUP_ON_DIRECT_OPEN = frozenset((*range(5, 15), 17, 19, 24))
+_BACKUP_ON_DIRECT_OPEN = frozenset((*range(5, 15), 17, 19, 24, 25))
 # Subset that is also snapshotted when the schema is merely passed through as an
 # intermediate step of a longer upgrade.  Versions 5 and 6 keep the legacy
 # direct-open-only behavior.
-_BACKUP_AS_INTERMEDIATE = frozenset((*range(7, 15), 17, 19, 24))
+_BACKUP_AS_INTERMEDIATE = frozenset((*range(7, 15), 17, 19, 24, 25))
 
 
 class Database(
@@ -171,6 +171,8 @@ class Database(
                 self.connection.executescript("BEGIN IMMEDIATE;\n" + migration)
                 if version == 5:
                     self._backfill_attempt_tag_snapshots_v5()
+                if version == 25:
+                    self._backfill_review_queue_resets_v25()
                 self.connection.execute(f"PRAGMA user_version = {version}")
                 self.connection.execute("COMMIT")
             except Exception:
@@ -180,6 +182,40 @@ class Database(
             finally:
                 if rebuilds_fk_parent:
                     self.connection.execute("PRAGMA foreign_keys = ON")
+
+    def _backfill_review_queue_resets_v25(self) -> None:
+        """Cut off legacy review evidence without importing legacy schedules."""
+
+        attempts_exists = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='attempts'"
+        ).fetchone()
+        if attempts_exists is None:
+            return
+        attempt_columns = {
+            str(row[1]) for row in self.connection.execute("PRAGMA table_info(attempts)")
+        }
+        required = {"id", "platform", "problem_id", "started_at", "closed_at", "review_due"}
+        if not required.issubset(attempt_columns):
+            return
+        self.connection.execute(
+            """INSERT INTO review_queue_resets(
+                   platform, problem_id, reset_at, reset_attempt_id
+               )
+               SELECT latest.platform,
+                      latest.problem_id,
+                      COALESCE(latest.closed_at, latest.started_at),
+                      latest.id
+                 FROM attempts AS latest
+                WHERE latest.review_due IS NOT NULL
+                  AND latest.id = (
+                      SELECT candidate.id
+                        FROM attempts AS candidate
+                       WHERE candidate.platform = latest.platform
+                         AND candidate.problem_id = latest.problem_id
+                       ORDER BY candidate.started_at DESC, candidate.id DESC
+                       LIMIT 1
+                  )"""
+        )
 
 
     @contextmanager

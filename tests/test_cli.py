@@ -430,7 +430,7 @@ class CliEndToEndTests(unittest.TestCase):
                 closed = self.run_json(
                     root, "close", "P1000", "--result", "AC", "--minutes", "10",
                     "--hint-level", "2" if round_index == 0 else "0",
-                    "--failure", "none", "--non-interactive",
+                    "--failure", "modeling" if round_index == 0 else "none", "--non-interactive",
                 )
                 due_dates.append(closed["review_due"])
             self.assertTrue(all(due_dates[index] for index in range(3)))

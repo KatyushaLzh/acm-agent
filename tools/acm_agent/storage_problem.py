@@ -535,6 +535,152 @@ class _ProblemStorageMixin:
             f"SELECT * FROM attempts{where} ORDER BY started_at DESC, id DESC", params
         )
 
+    def review_queue_entries(self) -> list[sqlite3.Row]:
+        """Return every scheduled review in deterministic due-date order."""
+
+        return self.query(
+            """SELECT queue.*,problem.name,problem.name AS title,problem.url,
+                      problem.difficulty,problem.rating,problem.tags_json
+                 FROM review_queue AS queue
+                 LEFT JOIN problems AS problem
+                   ON problem.platform=queue.platform
+                  AND problem.problem_id=queue.problem_id
+                ORDER BY queue.review_due,queue.platform,queue.problem_id"""
+        )
+
+    def review_queue_entry(
+        self, platform: str, problem_id: str
+    ) -> sqlite3.Row | None:
+        return self.connection.execute(
+            """SELECT * FROM review_queue
+               WHERE platform=? AND problem_id=?""",
+            (str(platform).strip().lower(), str(problem_id).strip()),
+        ).fetchone()
+
+    def upsert_review_queue(
+        self,
+        platform: str,
+        problem_id: str,
+        *,
+        review_due: str,
+        queue_type: str,
+        review_stage: int = 0,
+        created_at: str | None = None,
+        updated_at: str | None = None,
+    ) -> sqlite3.Row:
+        """Create or replace one review schedule without changing its reset cutoff."""
+
+        platform = str(platform).strip().lower()
+        problem_id = str(problem_id).strip()
+        now = updated_at or utc_now()
+        self.connection.execute(
+            """INSERT INTO review_queue(
+                   platform,problem_id,review_due,queue_type,review_stage,
+                   created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(platform,problem_id) DO UPDATE SET
+                   review_due=excluded.review_due,
+                   queue_type=excluded.queue_type,
+                   review_stage=excluded.review_stage,
+                   updated_at=excluded.updated_at""",
+            (
+                platform,
+                problem_id,
+                str(review_due),
+                str(queue_type),
+                int(review_stage),
+                created_at or now,
+                now,
+            ),
+        )
+        row = self.review_queue_entry(platform, problem_id)
+        assert row is not None
+        return row
+
+    def review_reset_at(self, platform: str, problem_id: str) -> str | None:
+        row = self.connection.execute(
+            """SELECT reset_at FROM review_queue_resets
+               WHERE platform=? AND problem_id=?""",
+            (str(platform).strip().lower(), str(problem_id).strip()),
+        ).fetchone()
+        return str(row["reset_at"]) if row else None
+
+    def review_reset_attempt_id(self, platform: str, problem_id: str) -> int:
+        row = self.connection.execute(
+            """SELECT reset_attempt_id FROM review_queue_resets
+               WHERE platform=? AND problem_id=?""",
+            (str(platform).strip().lower(), str(problem_id).strip()),
+        ).fetchone()
+        return int(row["reset_attempt_id"]) if row else 0
+
+    def set_review_reset(
+        self,
+        platform: str,
+        problem_id: str,
+        *,
+        reset_at: str | None = None,
+        reset_attempt_id: int | None = None,
+    ) -> str:
+        platform = str(platform).strip().lower()
+        problem_id = str(problem_id).strip()
+        value = reset_at or utc_now()
+        if reset_attempt_id is None:
+            row = self.connection.execute(
+                """SELECT COALESCE(MAX(id),0) AS latest_id FROM attempts
+                   WHERE platform=? AND problem_id=?""",
+                (platform, problem_id),
+            ).fetchone()
+            reset_attempt_id = int(row["latest_id"])
+        self.connection.execute(
+            """INSERT INTO review_queue_resets(
+                   platform,problem_id,reset_at,reset_attempt_id)
+               VALUES(?,?,?,?)
+               ON CONFLICT(platform,problem_id) DO UPDATE SET
+                   reset_at=excluded.reset_at,
+                   reset_attempt_id=excluded.reset_attempt_id""",
+            (platform, problem_id, value, int(reset_attempt_id)),
+        )
+        return value
+
+    def remove_review_queue(
+        self,
+        platform: str,
+        problem_id: str,
+        *,
+        reset_at: str | None = None,
+        reset_attempt_id: int | None = None,
+    ) -> bool:
+        """Remove one live schedule and atomically advance its evidence cutoff."""
+
+        platform = str(platform).strip().lower()
+        problem_id = str(problem_id).strip()
+        with self.atomic():
+            cursor = self.connection.execute(
+                "DELETE FROM review_queue WHERE platform=? AND problem_id=?",
+                (platform, problem_id),
+            )
+            if cursor.rowcount:
+                self.set_review_reset(
+                    platform,
+                    problem_id,
+                    reset_at=reset_at,
+                    reset_attempt_id=reset_attempt_id,
+                )
+        return bool(cursor.rowcount)
+
+    def clear_review_queue(self, *, reset_at: str | None = None) -> int:
+        """Clear all schedules and atomically reset their evidence baselines."""
+
+        value = reset_at or utc_now()
+        with self.atomic():
+            entries = self.query("SELECT platform,problem_id FROM review_queue")
+            for entry in entries:
+                self.set_review_reset(
+                    entry["platform"], entry["problem_id"], reset_at=value
+                )
+            self.connection.execute("DELETE FROM review_queue")
+        return len(entries)
+
     def skip_problem(
         self,
         platform: str,

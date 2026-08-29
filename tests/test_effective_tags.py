@@ -121,7 +121,7 @@ class StorageV5Tests(unittest.TestCase):
             connection.close()
 
             with Database(path) as database:
-                self.assertEqual(SCHEMA_VERSION, 24)
+                self.assertEqual(SCHEMA_VERSION, 25)
                 self.assertEqual(
                     database.connection.execute("PRAGMA user_version").fetchone()[0],
                     SCHEMA_VERSION,

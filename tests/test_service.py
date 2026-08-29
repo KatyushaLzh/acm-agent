@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, timedelta
 import json
 from pathlib import Path
 import shutil
@@ -332,6 +333,163 @@ class AcmServiceTests(unittest.TestCase):
             self.assertEqual(bootstrap["active_sessions"], [])
             self.assertEqual(bootstrap["recent_sessions"][0]["problem_id"], "CF1A")
             self.assertEqual(bootstrap["review_due"], [])  # first review is seven days away
+
+    def test_hint_level_alone_does_not_schedule_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.prepare_root(root)
+            service = AcmService(root)
+            service.setup("fixture", "42", target_rating=1700, skip_validate=True)
+
+            service.start("CF1A")
+            closed = service.close(
+                "CF1A",
+                result="AC",
+                minutes=20,
+                hint_level=4,
+                failure="none",
+            )
+
+            self.assertIsNone(closed["review_due"])
+            self.assertEqual(closed["close"]["review_stage"], 0)
+            self.assertEqual(service.review_queue()["items"], [])
+
+    def test_manual_review_queue_is_one_shot_and_requires_accepted_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.prepare_root(root)
+            service = AcmService(root)
+            service.setup("fixture", "42", target_rating=1700, skip_validate=True)
+
+            service.start("CF1A")
+            service.close("CF1A", result="AC", minutes=10, hint_level=0, failure="none")
+            added = service.review_queue_add("CF1A", review_due="2099-01-01")
+            self.assertTrue(added["created"])
+            self.assertEqual(added["items"][0]["queue_type"], "manual_once")
+            self.assertEqual(added["items"][0]["review_stage"], 0)
+            self.assertEqual(service.recommendations(mode="review")["recommendations"], [])
+
+            rescheduled = service.review_queue_add("CF1A", review_due="2026-08-01")
+            self.assertFalse(rescheduled["created"])
+            self.assertEqual(
+                [item["problem_id"] for item in service.recommendations(mode="review")["recommendations"]],
+                ["CF1A"],
+            )
+
+            service.start("CF1A")
+            failed = service.close(
+                "CF1A", result="WA", minutes=10, hint_level=4, failure="implementation"
+            )
+            self.assertEqual(failed["review_due"], "2026-08-01")
+            self.assertEqual(service.review_queue()["counts"]["due"], 1)
+
+            service.start("CF1A")
+            completed = service.close(
+                "CF1A", result="AC", minutes=10, hint_level=0, failure="none"
+            )
+            self.assertIsNone(completed["review_due"])
+            self.assertEqual(service.review_queue()["items"], [])
+            self.assertEqual(service.recommendations(mode="review")["recommendations"], [])
+
+            service.start("P1000")
+            service.close("P1000", result="WA", minutes=10, hint_level=0, failure="none")
+            with self.assertRaisesRegex(ValueError, "尚未 AC"):
+                service.review_queue_add("P1000", review_due=date.today().isoformat())
+
+    def test_automatic_review_queue_progresses_and_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.prepare_root(root)
+            service = AcmService(root)
+            service.setup("fixture", "42", target_rating=1700, skip_validate=True)
+
+            for result in ("WA", "WA", "AC"):
+                service.start("CF1A")
+                closed = service.close(
+                    "CF1A", result=result, minutes=10, hint_level=4, failure="none"
+                )
+            self.assertEqual(closed["close"]["review_stage"], 1)
+            self.assertEqual(service.review_queue()["items"][0]["queue_type"], "automatic")
+
+            expected_delays = (30, 90)
+            for expected_stage, delay in enumerate(expected_delays, start=2):
+                service.start("CF1A")
+                closed = service.close(
+                    "CF1A", result="AC", minutes=10, hint_level=4, failure="none"
+                )
+                self.assertEqual(closed["close"]["review_stage"], expected_stage)
+                self.assertEqual(
+                    closed["review_due"],
+                    (date.today() + timedelta(days=delay)).isoformat(),
+                )
+
+            service.start("CF1A")
+            completed = service.close(
+                "CF1A", result="AC", minutes=10, hint_level=4, failure="none"
+            )
+            self.assertIsNone(completed["review_due"])
+            self.assertEqual(service.review_queue()["items"], [])
+
+    def test_review_queue_remove_resets_old_evidence_but_allows_new_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.prepare_root(root)
+            service = AcmService(root)
+            service.setup("fixture", "42", target_rating=1700, skip_validate=True)
+
+            for result in ("WA", "WA", "AC"):
+                service.start("CF1A")
+                service.close("CF1A", result=result, minutes=10, hint_level=0, failure="none")
+            self.assertEqual(service.review_queue()["counts"]["total"], 1)
+
+            removed = service.review_queue_remove("CF1A")
+            self.assertTrue(removed["removed"])
+
+            service.start("CF1A")
+            service.close("CF1A", result="AC", minutes=10, hint_level=0, failure="none")
+            self.assertEqual(service.review_queue()["items"], [])
+
+            for index, result in enumerate(("WA", "WA"), start=1):
+                service.start("CF1A")
+                service.close("CF1A", result=result, minutes=10, hint_level=0, failure="none")
+                self.assertEqual(
+                    service.review_queue()["counts"]["total"],
+                    1 if index == 2 else 0,
+                )
+            self.assertEqual(service.review_queue()["counts"]["total"], 1)
+
+            service.review_queue_remove("CF1A")
+            service.start("CF1A")
+            service.close(
+                "CF1A", result="ABANDONED", minutes=10, hint_level=4, failure="none"
+            )
+            self.assertEqual(service.review_queue()["counts"]["total"], 1)
+
+            service.review_queue_remove("CF1A")
+            service.start("CF1A")
+            service.close(
+                "CF1A", result="WA", minutes=10, hint_level=4, failure="invariant"
+            )
+            self.assertEqual(service.review_queue()["counts"]["total"], 1)
+
+    def test_review_queue_clear_preserves_attempts_and_requires_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.prepare_root(root)
+            service = AcmService(root)
+            service.setup("fixture", "42", target_rating=1700, skip_validate=True)
+
+            for problem in ("CF1A", "P1000"):
+                service.start(problem)
+                service.close(problem, result="AC", minutes=10, hint_level=0, failure="none")
+                service.review_queue_add(problem, review_due="2026-09-01")
+            with self.assertRaisesRegex(ValueError, "confirm=true"):
+                service.review_queue_clear()
+            cleared = service.review_queue_clear(confirm=True)
+            self.assertEqual(cleared["removed_count"], 2)
+            self.assertEqual(cleared["items"], [])
+            with Database(Paths.for_root(root).database) as db:
+                self.assertEqual(len(db.attempts()), 2)
 
     def test_recommend_and_verify_have_structured_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

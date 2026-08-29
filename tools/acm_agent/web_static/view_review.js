@@ -6,14 +6,24 @@ import { refreshPlanSummaries, selectPlan } from "./view_plans.js";
 import { requestRecommendations } from "./view_today.js";
 import { formatDeepSeekCost, renderAiAuditCards } from "./ai_model_controls.js";
 
+let reviewSnapshot = {};
+let reviewQueueState = { items: [], counts: { total: 0, due: 0, overdue: 0, today: 0, future: 0 } };
+
+function renderReviewSummary() {
+  const sessions = reviewSnapshot.sessions ?? 0;
+  const average = reviewSnapshot.average_hint_level ?? 0;
+  const counts = reviewQueueState.counts;
+  $("#review-summary").innerHTML = [
+    statCard("完成 session", sessions, `${reviewSnapshot.window?.from || "—"} 至 ${reviewSnapshot.window?.to || "—"}`),
+    statCard("平均提示等级", average, "0 为完全独立，4 为完整代码"),
+    statCard("复做队列", counts.total, `${counts.future} 题尚未到期`),
+    statCard("已到期", counts.due, `逾期 ${counts.overdue} 题 · 今天 ${counts.today} 题`),
+  ].join("");
+}
+
 function renderReview(data) {
-  const sessions = data.sessions ?? 0;
-  const average = data.average_hint_level ?? 0;
-  const due = data.review_due || [];
-  $("#review-summary").innerHTML = [statCard("完成 session", sessions, `${data.window?.from || "—"} 至 ${data.window?.to || "—"}`), statCard("平均提示等级", average, "0 为完全独立，4 为完整代码"), statCard("到期复做", due.length, "优先进入下一组训练")].join("");
-  const dueNode = $("#review-due");
-  dueNode.className = due.length ? "list" : "list empty-state compact";
-  dueNode.innerHTML = due.length ? due.map(item => `<div class="list-row"><strong>${escapeHtml(item.problem_id)}</strong><span>${escapeHtml(item.review_due)}</span></div>`).join("") : "暂无到期题目";
+  reviewSnapshot = asObject(data);
+  renderReviewSummary();
   const weak = Object.entries(asObject(data.weak_topics));
   const max = Math.max(1, ...weak.map(([, value]) => Number(value)));
   const weakNode = $("#weak-topics");
@@ -21,6 +31,152 @@ function renderReview(data) {
   weakNode.innerHTML = weak.length ? weak.sort((a, b) => b[1] - a[1]).slice(0, 10).map(([name, value]) => `<div class="bar-row"><span>${escapeHtml(name)}</span><progress class="bar-track" max="${escapeHtml(max)}" value="${escapeHtml(value)}"></progress><b>${escapeHtml(value)}</b></div>`).join("") : "暂无训练数据";
   renderChips("#result-distribution", data.results);
   renderChips("#failure-distribution", data.failure_modes);
+}
+
+function localDateValue(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function dayOrdinal(value) {
+  const matched = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ""));
+  if (!matched) return null;
+  const year = Number(matched[1]);
+  const month = Number(matched[2]);
+  const day = Number(matched[3]);
+  const timestamp = Date.UTC(year, month - 1, day);
+  const parsed = new Date(timestamp);
+  if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) return null;
+  return timestamp / 86400000;
+}
+
+function queueDateStatus(reviewDue) {
+  const dueDay = dayOrdinal(reviewDue);
+  const today = dayOrdinal(localDateValue());
+  if (dueDay == null || today == null) return { kind: "future", label: String(reviewDue || "日期未知") };
+  const delta = dueDay - today;
+  if (delta < 0) return { kind: "overdue", label: `逾期 ${Math.abs(delta)} 天` };
+  if (delta === 0) return { kind: "today", label: "今天" };
+  return { kind: "future", label: `${delta} 天后` };
+}
+
+function queueItems(payload) {
+  return Array.isArray(payload?.items) ? payload.items : [];
+}
+
+function queueCounts(payload, items) {
+  const supplied = asObject(payload?.counts);
+  const computed = { total: items.length, due: 0, overdue: 0, today: 0, future: 0 };
+  items.forEach(item => {
+    const kind = queueDateStatus(item.review_due).kind;
+    computed[kind] += 1;
+    if (kind === "overdue" || kind === "today") computed.due += 1;
+  });
+  return Object.fromEntries(Object.entries(computed).map(([key, value]) => [key, Number.isFinite(Number(supplied[key])) ? Number(supplied[key]) : value]));
+}
+
+function queueTypeLabel(item) {
+  const queueType = item.queue_type || item.type;
+  if (queueType === "manual_once") return "一次性";
+  const stage = item.review_stage ?? item.stage;
+  return stage == null ? "自动" : `自动 · 阶段 ${stage}`;
+}
+
+function renderReviewQueue(payload) {
+  const items = queueItems(payload);
+  reviewQueueState = { items, counts: queueCounts(payload, items) };
+  const { counts } = reviewQueueState;
+  $("#review-queue-counts").textContent = `队列 ${counts.total} 题 · 已到期 ${counts.due} 题`;
+  $("#review-clear-button").disabled = items.length === 0;
+  const root = $("#review-due");
+  if (!items.length) {
+    root.className = "review-queue-list empty-state compact";
+    root.textContent = "复做队列为空";
+    renderReviewSummary();
+    return;
+  }
+  root.className = "review-queue-list";
+  root.innerHTML = items.map(item => {
+    const problem = item.problem_id || item.problem || item.id || "未知题目";
+    const status = queueDateStatus(item.review_due);
+    const platform = item.platform ? `<span class="tag">${escapeHtml(item.platform)}</span>` : "";
+    return `<div class="review-queue-row">
+      <div class="review-queue-problem"><strong>${escapeHtml(problem)}</strong>${item.title ? `<small>${escapeHtml(item.title)}</small>` : ""}<span>${platform}<span class="tag">${escapeHtml(queueTypeLabel(item))}</span></span></div>
+      <div class="review-queue-date"><time datetime="${escapeHtml(item.review_due)}">${escapeHtml(item.review_due)}</time><span class="badge review-date-${escapeHtml(status.kind)}">${escapeHtml(status.label)}</span></div>
+      <button type="button" class="button danger review-remove-button" data-problem="${escapeHtml(problem)}">删除</button>
+    </div>`;
+  }).join("");
+  renderReviewSummary();
+}
+
+async function loadReviewQueue() {
+  try { renderReviewQueue(await api("/api/review/queue")); }
+  catch (error) {
+    const root = $("#review-due");
+    root.className = "review-queue-list empty-state compact";
+    root.textContent = `读取复做队列失败：${error.message}`;
+    toast("复做队列读取失败", error.message, "error");
+  }
+}
+
+function openReviewAddDialog() {
+  const form = $("#review-add-form");
+  form.reset();
+  form.elements.review_due.value = localDateValue();
+  $("#review-add-dialog").showModal();
+  form.elements.problem.focus();
+}
+
+async function refreshAfterReviewQueueChange(hadRecommendations) {
+  await loadReviewQueue();
+  await loadBootstrap();
+  if (hadRecommendations) await requestRecommendations();
+}
+
+async function addReviewQueueItem(button) {
+  const form = $("#review-add-form");
+  if (!form.reportValidity()) return;
+  const problem = form.elements.problem.value.trim();
+  const reviewDue = form.elements.review_due.value;
+  const hadRecommendations = state.recommendations.length > 0;
+  setBusy(button, true, "添加中…");
+  try {
+    await api("/api/review/queue/add", { body: { problem, review_due: reviewDue } });
+    $("#review-add-dialog").close();
+    toast("已加入复做队列", `${problem} · ${reviewDue}`);
+    await refreshAfterReviewQueueChange(hadRecommendations);
+  } catch (error) { toast("添加失败", error.message, "error"); }
+  finally { setBusy(button, false); }
+}
+
+async function removeReviewQueueItem(problem, button) {
+  if (!window.confirm(`确认从复做队列删除 ${problem}？\n训练历史与 AC 状态不会被删除。`)) return;
+  const hadRecommendations = state.recommendations.length > 0;
+  setBusy(button, true, "删除中…");
+  try {
+    await api("/api/review/queue/remove", { body: { problem } });
+    toast("已删除复做日程", `${problem} 的训练历史保持不变。`);
+    await refreshAfterReviewQueueChange(hadRecommendations);
+  } catch (error) { toast("删除失败", error.message, "error"); }
+  finally { setBusy(button, false); }
+}
+
+async function clearReviewQueue(button) {
+  const total = reviewQueueState.items.length;
+  if (!total || !window.confirm(`确认清空全部 ${total} 道复做题目？\n此操作不会删除训练历史或 AC 状态。`)) return;
+  const hadRecommendations = state.recommendations.length > 0;
+  setBusy(button, true, "清空中…");
+  try {
+    const result = await api("/api/review/queue/clear", { body: { confirm: true } });
+    toast("复做队列已清空", `已删除 ${result?.removed_count ?? total} 条复做日程。`);
+    await refreshAfterReviewQueueChange(hadRecommendations);
+  } catch (error) { toast("清空失败", error.message, "error"); }
+  finally {
+    setBusy(button, false);
+    button.disabled = reviewQueueState.items.length === 0;
+  }
 }
 
 function renderAiCostAudit(payload) {
@@ -158,6 +314,7 @@ async function loadReview() {
   try { renderReview(await api("/api/review/week", { body: {} })); }
   catch (error) { toast("复盘生成失败", error.message, "error"); }
   finally { setBusy(button, false); }
+  await loadReviewQueue();
   await loadSkippedProblems();
   try { renderAiCostAudit(await api("/api/ai/costs")); }
   catch (error) { toast("AI 费用读取失败", error.message, "error"); }
@@ -174,4 +331,7 @@ async function copyPath(path) {
   }
 }
 
-export { openSkipDialog, confirmSkip, unskipProblem, loadReview, copyPath, repriceAiCostAudit };
+export {
+  openSkipDialog, confirmSkip, unskipProblem, loadReview, copyPath, repriceAiCostAudit,
+  openReviewAddDialog, addReviewQueueItem, removeReviewQueueItem, clearReviewQueue,
+};

@@ -4,8 +4,6 @@
 
 核心服务兼容 Python 3.10 及以上正式版，无需 npm 或外部数据库；Linux/macOS Dashboard 的系统凭据存储依赖由启动器隔离管理，网页只监听 `127.0.0.1`。
 
-当前发布版本：`6.1.0`。
-
 > 下文截图使用隔离的演示工作区，不包含个人账号、真实提交记录、源码路径、API Key 或运行令牌；五个主界面的截图分别放在对应功能介绍处。
 
 ## 核心能力
@@ -51,7 +49,7 @@ chmod +x acm.sh start-acm-web.sh
 
 已有任意正式版 Python 3.10 或以上环境时会直接复用。自动安装完成后还会检查 `sqlite3`、`ssl` 等 Web 所需标准库；`tkinter` 缺失不阻止核心 Dashboard 启动，但原生文件选择器及相关操作会提示不可用。
 
-Linux/macOS 的 Web 入口会用固定且带 SHA-256 的 lock，在 `.acm/runtime/web-envs` 创建项目隔离环境并安装 Python 侧的系统凭据存储依赖。ready 环境会按解释器 ABI、lock 摘要和精确包版本离线复用；不会写入系统 site-packages 或修改 PATH/shell profile。依赖下载、哈希或版本校验失败时，启动器会告警并用基础 Python 继续启动核心 Dashboard，此时 Unix 安全存储不可用并在下次启动重试。仅在 Debian/Ubuntu、存在 `apt-get` 且 Secret Service 探测失败时，启动器会询问是否原样执行 `sudo apt-get install --no-install-recommends gnome-keyring seahorse`；拒绝、EOF、安装失败或安装后复探测失败都不阻止核心 Dashboard，也不会改变凭据持久化的 fail-closed 行为。普通 `./acm.sh` CLI 命令继续直接使用系统 `python3`，不会触发这些依赖。
+Linux/macOS 的 Web 入口会用固定且带 SHA-256 的 lock，在 `.acm/runtime/web-envs` 创建项目隔离环境并安装系统凭据存储依赖。ready 环境会按解释器 ABI、lock 摘要和精确包版本离线复用；不会调用 `sudo`、写入系统 site-packages 或修改 PATH/shell profile。依赖下载、哈希或版本校验失败时，启动器会告警并用基础 Python 继续启动核心 Dashboard，此时 Unix 安全存储不可用并在下次启动重试。普通 `./acm.sh` CLI 命令继续直接使用系统 `python3`，不会触发这些依赖。
 
 服务默认在 `127.0.0.1:8765`–`8775` 中选择可用端口并自动打开浏览器。首次使用时填写 Codeforces handle、洛谷数字 UID 和可选的目标 CF rating；验证后立即进入主界面，常驻同步卡会显示平台、阶段、完成计数和已用时间。洛谷公开 AC 会先变为可用，完整目录与标签继续在后台补齐；刷新或重新打开页面仍可恢复进度。新鲜全局目录会复用，洛谷分页与标签抓取采用保守的有界并发和失败退避；公开题面没有标签时记为 `tagless`，不误报为 partial。离线保存不会验证账号或同步平台状态。
 
@@ -95,7 +93,7 @@ AI 只能在确定性候选池内选择和排序，不能恢复 AC/Skip 题、�
 3. 在 `.acm/cases/<problem-key>/` 放置样例并运行验证。
 4. 可选使用按题隔离的 AI 对话，请求 1–3 级提示或 4 级代码诊断；补丁始终先预览、再确认应用。
 5. 结束时记录结果、独立思考时间、最高提示等级、失败类型和备注。
-6. 在复盘页查看到期复做、近七天结果、薄弱专题和 Skip 列表；Markdown 总结需要单独预览并确认写入。
+6. 在复盘页按日期查看并管理完整复做队列、近七天结果、薄弱专题和 Skip 列表；Markdown 总结需要单独预览并确认写入。
 
 ![AI 做题对话](docs/screenshots/ai-assist.png)
 
@@ -128,7 +126,7 @@ AI 预览不会创建题单文件或题单数据库记录，但会保留必要�
 
 ## 训练复盘
 
-“复盘”界面汇总近七天 session、平均提示等级、到期复做、薄弱专题、结果/失败分布、Skip 记录与模型路由费用审计：
+“复盘”界面汇总近七天 session、平均提示等级、按日期排序的复做队列、薄弱专题、结果/失败分布、Skip 记录与模型路由费用审计：
 
 ![训练复盘：近七天统计与 AI 费用审计](docs/screenshots/training-review.png)
 
@@ -151,7 +149,7 @@ AI 预览不会创建题单文件或题单数据库记录，但会保留必要�
 
 ![ai-model](docs/screenshots/ai-model.png)
 
-AI 功能只在用户显式点击或执行 AI 命令时调用。Dashboard 可直接保存 DeepSeek 或 OpenAI-compatible 中转站 API Key：Windows 使用当前用户作用域的 DPAPI，macOS 使用系统 Keychain，Linux 使用 Freedesktop Secret Service。密钥只会在受认证的 loopback 凭据请求体中短暂传递；不会写入 JSON 配置、SQLite、日志、浏览器存储、后台 job 或 API 响应。系统安全存储缺失或锁定时拒绝持久化，仍可临时使用进程环境变量，绝不退化为明文落盘。Debian/Ubuntu 的 Web 启动器只在探测失败且用户确认后调用交互式 `sudo` 安装 `gnome-keyring` 与图形管理器 `seahorse`；不执行 `apt update`、不代输密码、不启动或解锁服务。安装后会重新探测 D-Bus 服务并执行一次不包含敏感数据的 keyring 可用性检查；若仍失败，会明确提示“需启动/解锁用户钥匙环”。`libsecret-tools` 仅作为可选诊断工具，不自动安装。
+AI 功能只在用户显式点击或执行 AI 命令时调用。Dashboard 可直接保存 DeepSeek 或 OpenAI-compatible 中转站 API Key：Windows 使用当前用户作用域的 DPAPI，macOS 使用系统 Keychain，Linux 使用 Freedesktop Secret Service。密钥只会在受认证的 loopback 凭据请求体中短暂传递；不会写入 JSON 配置、SQLite、日志、浏览器存储、后台 job 或 API 响应。系统安全存储缺失或锁定时拒绝持久化，仍可临时使用进程环境变量，绝不退化为明文落盘。
 
 内置 DeepSeek 连接支持 `deepseek-v4-flash` 与 `deepseek-v4-pro`；托管 OpenAI-compatible 连接只能使用已发现且通过能力验证的模型。推理强度中的“Provider 默认”不会下发 thinking/reasoning 控制字段，“关闭”才会显式关闭推理；推荐、对话、补丁、题单与 Markdown 总结按各自 profile 运行，provider reasoning 内容不展示也不保存。
 
@@ -181,6 +179,12 @@ Stage 4 live 报告使用脱敏 provider-leg ledger 汇总请求、tokens、费�
 - Skip 不创建源码、session、attempt 或复做任务，也不是 AC。
 - Skip 不能满足题单中的 AC 替换条件，可随时撤销。
 - 已 AC 或存在 active session 的题不能 Skip。
+
+## 复做队列
+
+复盘页显示全部自动与手动复做日程，按日期升序排列，并区分逾期、今天和未来项目。自动复做继续按 7/30/90 天推进；提示等级只作为训练记录，不参与薄弱专题计分或复做资格。手动加入仅限已经 AC 的题，属于一次性复做：AC 后移出，未 AC 则保持到期。
+
+删除或清空只取消当前复做日程，不删除 AC、attempt、源码或题单进度；之后出现新的失败证据时，自动规则仍可重新加入。Dashboard 提供添加、单项删除与清空操作，CLI 暂不提供对应管理命令。
 
 ## 本地数据与隐私
 

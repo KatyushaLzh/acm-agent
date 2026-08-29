@@ -343,7 +343,10 @@ def compute_weakness(
     now: date | datetime | None = None,
     window_days: int = 90,
 ) -> dict[str, float]:
-    """Return non-negative per-tag weakness from recent local attempts."""
+    """Return result/failure-based per-tag weakness from recent attempts.
+
+    Hint level is retained as attempt metadata but does not affect weakness.
+    """
     today = (now.date() if isinstance(now, datetime) else now) or date.today()
     cutoff = today - timedelta(days=window_days)
     score: defaultdict[str, float] = defaultdict(float)
@@ -355,18 +358,15 @@ def compute_weakness(
             continue
         tags = tuple(str(tag) for tag in (_get(attempt, "tags", ()) or ()))
         result = str(_get(attempt, "result", "")).upper()
-        hint = int(_get(attempt, "hint_level", 0) or 0)
         failure_mode = str(_get(attempt, "failure_mode", "")).lower()
         delta = 0.0
         if result == "ABANDONED":
             delta += 3.0
         elif result in FAILED_RESULTS:
             delta += 2.0
-        if hint >= 2:
-            delta += 1.5
         if failure_mode in {"selection", "modeling", "invariant"}:
             delta += 1.0
-        if result in ACCEPTED_RESULTS and hint == 0:
+        if result in ACCEPTED_RESULTS:
             delta -= 1.0
         for tag in tags:
             score[tag] += delta

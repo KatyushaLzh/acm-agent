@@ -276,7 +276,7 @@
 
       <section id="review-view" class="view">
         <div class="section-heading"><div><p class="eyebrow">WEEKLY</p><h2>近七天复盘</h2></div><button id="review-button" class="button secondary">刷新周复盘</button></div>
-        <div id="review-summary" class="stats-grid"></div>
+        <div id="review-summary" class="stats-grid review-stats-grid"></div>
         <article class="panel lower-grid ai-cost-review-panel">
           <div class="panel-heading"><div><p class="eyebrow">AI COST AUDIT</p><h2>模型路由与估算费用</h2></div><button id="ai-cost-reprice-review" class="button secondary" type="button">按当前 DeepSeek 价格重算</button></div>
           <p class="subtle">费用仅统计 DeepSeek 官方连接；Token 与缓存统计覆盖所有已记录模型。缺失遥测不会按 0 处理，重算只追加 DeepSeek 价格版本，不改历史 Token。</p>
@@ -285,7 +285,10 @@
           <details class="audit-details"><summary>查看最近调用</summary><div id="ai-cost-runs" class="governance-table empty-state compact">暂无 AI run</div></details>
         </article>
         <div class="two-column lower-grid">
-          <article class="panel"><div class="panel-heading"><h2>到期复做</h2></div><div id="review-due" class="list empty-state compact">暂无到期题目</div></article>
+          <article class="panel review-queue-panel">
+            <div class="panel-heading"><div><h2>复做队列</h2><p id="review-queue-counts" class="subtle">队列 0 题 · 已到期 0 题</p></div><div class="review-queue-actions"><button id="review-add-button" class="button secondary" type="button">添加</button><button id="review-clear-button" class="button danger" type="button" disabled>清空</button></div></div>
+            <div id="review-due" class="review-queue-list empty-state compact" aria-live="polite">复做队列为空</div>
+          </article>
           <article class="panel"><div class="panel-heading"><h2>薄弱专题</h2></div><div id="weak-topics" class="bar-list empty-state compact">暂无训练数据</div></article>
         </div>
         <div class="two-column lower-grid">
@@ -487,6 +490,15 @@
       </div>
       <label>备注（可选）<textarea id="skip-note" rows="3" maxlength="500" placeholder="例如：已独立推导出状态设计与转移"></textarea></label>
       <div class="dialog-actions"><button class="button secondary" value="cancel">取消</button><button id="skip-confirm" class="button primary" type="button">确认 Skip</button></div>
+    </form>
+  </dialog>
+  <dialog id="review-add-dialog" class="dialog review-add-dialog" aria-labelledby="review-add-title">
+    <form id="review-add-form" class="dialog-shell">
+      <div class="dialog-heading"><div><p class="eyebrow">REVIEW QUEUE</p><h2 id="review-add-title">添加复做题目</h2></div><button class="icon-button dialog-close" type="button" data-review-add-cancel aria-label="关闭添加复做对话框">×</button></div>
+      <p class="subtle">仅可添加已经 AC 的题目；若题目已在队列中，将只更新复做日期。</p>
+      <label>题号<input id="review-add-problem" name="problem" autocomplete="off" required placeholder="例如 CF558E 或 P5787"></label>
+      <label>复做日期<input id="review-add-date" name="review_due" type="date" required></label>
+      <div class="dialog-actions"><button class="button secondary" type="button" data-review-add-cancel>取消</button><button id="review-add-confirm" class="button primary" type="submit">添加到队列</button></div>
     </form>
   </dialog>
   <template id="toast-template"><div class="toast"><strong></strong><p></p></div></template>

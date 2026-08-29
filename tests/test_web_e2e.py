@@ -181,8 +181,34 @@ class WebEndToEndTest(unittest.TestCase):
             },
         )
         self.assertTrue(closed["archive_candidate"])
+
+        queue = self.request("GET", "/api/review/queue")
+        self.assertEqual(queue["counts"]["total"], 1)
+        self.assertEqual(queue["items"][0]["queue_type"], "automatic")
+        self.assertEqual(queue["items"][0]["review_stage"], 1)
+
+        removed = self.request(
+            "POST", "/api/review/queue/remove", {"problem": problem}
+        )
+        self.assertTrue(removed["removed"])
+        self.assertEqual(
+            self.request("GET", "/api/review/queue")["counts"]["total"], 0
+        )
+
+        added = self.request(
+            "POST",
+            "/api/review/queue/add",
+            {"problem": problem, "review_due": "2026-08-29"},
+        )
+        self.assertEqual(added["items"][0]["queue_type"], "manual_once")
+        cleared = self.request(
+            "POST", "/api/review/queue/clear", {"confirm": True}
+        )
+        self.assertEqual(cleared["removed_count"], 1)
+
         review = self.request("POST", "/api/review/week", {})
         self.assertEqual(review["sessions"], 1)
+        self.assertEqual(review["review_queue_counts"]["total"], 0)
         self.assertEqual(self._knowledge_hashes(), self.before)
 
     def test_stage4_cache_control_endpoints_are_safe_on_empty_workspace(self) -> None:
