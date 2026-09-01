@@ -1232,6 +1232,25 @@ class ServiceAIMixin:
             catalog[str(model)] = definition
         return catalog
 
+    @staticmethod
+    def _supported_discovered_models(
+        connection_id: str, discovered: Sequence[str]
+    ) -> list[str]:
+        models = list(discovered)
+        if connection_id != "deepseek":
+            return models
+        # The official ``/models`` response can advertise models this
+        # text-only adapter does not yet support (for example, an
+        # experimental vision model). Keep the supported built-in routes
+        # usable instead of rejecting a valid credential or model refresh.
+        supported = [model for model in models if model in ALLOWED_MODELS]
+        if not supported:
+            raise ProviderConfigurationError(
+                "no_supported_models",
+                "DeepSeek /models returned no models supported by this version",
+            )
+        return supported
+
     def ai_connection_upsert(
         self,
         *,
@@ -1307,18 +1326,7 @@ class ServiceAIMixin:
             discovered = discover_openai_compatible_models(
                 base_url=normalized_base, api_key=staged.credential.secret
             )
-            if selected_id == "deepseek":
-                # The official ``/models`` response can advertise models this
-                # text-only adapter does not yet support (for example, an
-                # experimental vision model).  Keep the supported built-in
-                # routes usable instead of rejecting and rolling back a valid
-                # credential solely because the provider added another model.
-                discovered = [model for model in discovered if model in ALLOWED_MODELS]
-                if not discovered:
-                    raise ProviderConfigurationError(
-                        "no_supported_models",
-                        "DeepSeek /models returned no models supported by this version",
-                    )
+            discovered = self._supported_discovered_models(selected_id, discovered)
             old_models = (
                 dict(current.get("models") or {}) if isinstance(current, Mapping) else {}
             )
@@ -1396,6 +1404,7 @@ class ServiceAIMixin:
         discovered = discover_openai_compatible_models(
             base_url=str(provider["base_url"]), api_key=secret
         )
+        discovered = self._supported_discovered_models(selected, discovered)
         updated = dict(provider)
         updated["models"] = self._discovered_model_catalog(
             dict(provider.get("models") or {}), discovered, preserve_evidence=True

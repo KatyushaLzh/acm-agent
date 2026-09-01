@@ -963,6 +963,127 @@ class Stage2ServiceManagementTests(unittest.TestCase):
             )
             self.assertEqual(vault.load("deepseek").secret, "connection-secret")
 
+    def test_builtin_deepseek_blank_key_reuses_secret_while_filtering_models(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            vault = ProviderCredentialVault(
+                root / ".acm" / "credentials",
+                protect=lambda value: b"P" + value,
+                unprotect=lambda value: value[1:],
+            )
+            service = AcmService(root, credential_vault=vault)
+            service.setup("fixture", "42", skip_validate=True)
+            with patch(
+                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                return_value=["deepseek-v4-flash", "deepseek-v4-pro"],
+            ):
+                service.ai_connection_upsert(
+                    connection_id="deepseek",
+                    display_name="DeepSeek Official",
+                    base_url="https://api.deepseek.com",
+                    api_key="existing-secret",
+                )
+            with patch(
+                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                return_value=[
+                    "deepseek-v4-flash",
+                    "deepseek-v4-pro",
+                    "deepseek-v4-flash-vision-exp",
+                ],
+            ):
+                result = service.ai_connection_upsert(
+                    connection_id="deepseek",
+                    display_name="DeepSeek Official",
+                    base_url="https://api.deepseek.com",
+                    api_key="",
+                )
+            self.assertEqual(result["models_discovered"], 2)
+            self.assertEqual(vault.load("deepseek").secret, "existing-secret")
+
+    def test_builtin_deepseek_refresh_filters_extra_models(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            vault = ProviderCredentialVault(
+                root / ".acm" / "credentials",
+                protect=lambda value: b"P" + value,
+                unprotect=lambda value: value[1:],
+            )
+            service = AcmService(root, credential_vault=vault)
+            service.setup("fixture", "42", skip_validate=True)
+            with patch(
+                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                return_value=["deepseek-v4-flash", "deepseek-v4-pro"],
+            ):
+                service.ai_connection_upsert(
+                    connection_id="deepseek",
+                    display_name="DeepSeek Official",
+                    base_url="https://api.deepseek.com",
+                    api_key="existing-secret",
+                )
+            with patch(
+                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                return_value=[
+                    "deepseek-v4-flash",
+                    "deepseek-v4-flash-vision-exp",
+                ],
+            ):
+                result = service.ai_connection_refresh(connection_id="deepseek")
+            self.assertEqual(result["models_discovered"], 1)
+            connection = next(
+                item for item in service.ai_connections()["connections"]
+                if item["id"] == "deepseek"
+            )
+            models = {item["id"]: item for item in connection["models"]}
+            self.assertEqual(set(models), {"deepseek-v4-flash", "deepseek-v4-pro"})
+            self.assertTrue(models["deepseek-v4-flash"]["available"])
+            self.assertFalse(models["deepseek-v4-pro"]["available"])
+            self.assertEqual(vault.load("deepseek").secret, "existing-secret")
+
+    def test_builtin_deepseek_all_unknown_models_fail_without_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            vault = ProviderCredentialVault(
+                root / ".acm" / "credentials",
+                protect=lambda value: b"P" + value,
+                unprotect=lambda value: value[1:],
+            )
+            service = AcmService(root, credential_vault=vault)
+            service.setup("fixture", "42", skip_validate=True)
+            with patch(
+                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                return_value=["deepseek-v4-flash", "deepseek-v4-pro"],
+            ):
+                service.ai_connection_upsert(
+                    connection_id="deepseek",
+                    display_name="DeepSeek Official",
+                    base_url="https://api.deepseek.com",
+                    api_key="existing-secret",
+                )
+            original = load_config(service.paths)
+            with patch(
+                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                return_value=["deepseek-v4-flash-vision-exp"],
+            ):
+                with self.assertRaises(ProviderConfigurationError) as captured:
+                    service.ai_connection_upsert(
+                        connection_id="deepseek",
+                        display_name="DeepSeek Official",
+                        base_url="https://api.deepseek.com",
+                        api_key="replacement-secret",
+                    )
+            self.assertEqual(captured.exception.code, "no_supported_models")
+            self.assertEqual(load_config(service.paths), original)
+            self.assertEqual(vault.load("deepseek").secret, "existing-secret")
+            with patch(
+                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                return_value=["deepseek-v4-flash-vision-exp"],
+            ):
+                with self.assertRaises(ProviderConfigurationError) as captured:
+                    service.ai_connection_refresh(connection_id="deepseek")
+            self.assertEqual(captured.exception.code, "no_supported_models")
+            self.assertEqual(load_config(service.paths), original)
+            self.assertEqual(vault.load("deepseek").secret, "existing-secret")
+
     def test_simplified_connection_discovery_failure_rolls_back_config_and_credential(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
