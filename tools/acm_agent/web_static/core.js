@@ -3,6 +3,8 @@
 const state = {
   token: "",
   bootstrap: null,
+  activeSession: null,
+  closeAttempt: null,
   recommendations: [],
   recommendationEpoch: 0,
   recommendationController: null,
@@ -21,6 +23,7 @@ const state = {
   aiPlanJobId: "",
   aiPlanDraft: null,
   aiPlanPreview: null,
+  aiPlanValidatedContent: null,
   aiPlanMetadata: null,
   aiPlanValidationEpoch: 0,
   aiPlanValidationController: null,
@@ -49,6 +52,8 @@ const state = {
   knowledgeProposalId: "",
   knowledgeProposalRevision: null,
   knowledgeProposalDirty: false,
+  knowledgeEditEpoch: 0,
+  knowledgeRefreshRequest: null,
   knowledgeTargetInspection: null,
   templateDirty: false,
   initialSyncJobId: "",
@@ -375,6 +380,7 @@ function renderSources(sources) {
 }
 
 function renderActive(session) {
+  state.activeSession = session || null;
   const node = $("#active-session");
   if (!session) {
     node.className = "empty-state compact";

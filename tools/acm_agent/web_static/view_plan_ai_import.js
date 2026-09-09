@@ -103,6 +103,7 @@ async function stopAiPlanWork({ cancelJob = true } = {}) {
   state.aiPlanJobId = "";
   state.aiPlanImportEpoch += 1;
   state.aiPlanValidationEpoch += 1;
+  state.aiPlanValidatedContent = null;
   state.aiPlanImportController?.abort();
   state.aiPlanValidationController?.abort();
   state.aiPlanImportController = null;
@@ -216,6 +217,7 @@ async function generateAiPlan(button) {
     }
     state.aiPlanDraft = deepClone(plan);
     state.aiPlanPreview = result;
+    state.aiPlanValidatedContent = JSON.stringify(state.aiPlanDraft);
     state.aiPlanMetadata = {
       ...asObject(result.ai),
       mode,
@@ -353,10 +355,15 @@ function syncAiPlanImportAvailability() {
   const duplicate = previewDuplicate(preview);
   const confirmed = $("#ai-plan-replace-confirm input").checked;
   const requirement = generatedDraftRequirement();
-  $("#ai-plan-import-confirm").disabled = !preview || importErrors(preview).length > 0 || (duplicate && !confirmed) || Boolean(requirement?.missing);
+  const current = state.aiPlanValidatedContent === JSON.stringify(state.aiPlanDraft);
+  $("#ai-plan-import-confirm").disabled = !preview || !current || importErrors(preview).length > 0 || (duplicate && !confirmed) || Boolean(requirement?.missing);
 }
 
 function markAiPlanDraftDirty() {
+  state.aiPlanValidationEpoch += 1;
+  state.aiPlanValidationController?.abort();
+  state.aiPlanValidationController = null;
+  state.aiPlanValidatedContent = null;
   state.aiPlanPreview = null;
   $("#ai-plan-replace-confirm input").checked = false;
   $("#ai-plan-replace-confirm").classList.add("hidden");
@@ -379,14 +386,19 @@ async function validateAiPlanDraft() {
   state.aiPlanValidationController = controller;
   state.aiPlanValidationTimer = null;
   const content = JSON.stringify(state.aiPlanDraft);
+  const isCurrent = () => state.aiPlanValidationEpoch === epoch
+    && state.aiPlanValidationController === controller && !controller.signal.aborted
+    && $("#ai-plan-import-dialog").open && JSON.stringify(state.aiPlanDraft) === content;
   try {
     const preview = await api("/api/plans/preview", { body: { content }, signal: controller.signal });
-    if (state.aiPlanValidationEpoch !== epoch || controller.signal.aborted) return;
+    if (!isCurrent()) return;
     state.aiPlanPreview = preview;
+    state.aiPlanValidatedContent = content;
     renderAiPlanFeedback(preview);
   } catch (error) {
-    if (error.name === "AbortError" || state.aiPlanValidationEpoch !== epoch) return;
+    if (error.name === "AbortError" || !isCurrent()) return;
     state.aiPlanPreview = null;
+    state.aiPlanValidatedContent = null;
     const box = $("#ai-plan-errors");
     box.textContent = error.message;
     box.classList.remove("hidden");
@@ -480,6 +492,10 @@ async function importAiPlanDraft(button) {
   const preview = state.aiPlanPreview;
   if (!preview || !state.aiPlanDraft) return;
   const content = JSON.stringify(state.aiPlanDraft);
+  if (state.aiPlanValidatedContent !== content) {
+    markAiPlanDraftDirty();
+    return;
+  }
   try {
     await submitPlanImport({
       button,

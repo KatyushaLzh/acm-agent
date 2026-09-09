@@ -130,6 +130,8 @@ class ConfigTests(unittest.TestCase):
                 budget = old["ai"]["policy"]["budgets"][profile_id]
                 budget["max_output_tokens"] = output_tokens
                 budget["max_total_tokens"] = total_tokens
+                if profile_id in {"recommendation", "coaching", "summary"}:
+                    budget["request_timeout_seconds"] = 180.0 if profile_id == "summary" else 120.0
             old["ai"]["policy"]["budgets"]["summary"]["max_output_tokens"] = 7_777
             paths.config.write_text(json.dumps(old), encoding="utf-8")
 
@@ -137,9 +139,9 @@ class ConfigTests(unittest.TestCase):
             budgets = loaded["ai"]["policy"]["budgets"]
 
             self.assertEqual(loaded["version"], CONFIG_VERSION)
-            self.assertEqual(budgets["recommendation"]["max_output_tokens"], 4_096)
+            self.assertEqual(budgets["recommendation"]["max_output_tokens"], 16_384)
             self.assertEqual(budgets["recommendation"]["max_total_tokens"], 300_000)
-            self.assertEqual(budgets["coaching"]["max_output_tokens"], 8_192)
+            self.assertEqual(budgets["coaching"]["max_output_tokens"], 16_384)
             self.assertEqual(budgets["coaching"]["max_total_tokens"], 200_000)
             self.assertEqual(budgets["summary"]["max_output_tokens"], 7_777)
             self.assertEqual(budgets["summary"]["max_total_tokens"], 240_000)
@@ -222,7 +224,7 @@ class ConfigTests(unittest.TestCase):
 
                 config = load_config(paths)
 
-                self.assertEqual(CONFIG_VERSION, 16)
+                self.assertEqual(CONFIG_VERSION, 17)
                 self.assertEqual(config["version"], CONFIG_VERSION)
                 for retired_key in (
                     "validation_model",

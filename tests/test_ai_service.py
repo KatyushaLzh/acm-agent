@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-import shutil
 import sqlite3
 import tempfile
 import threading
@@ -28,7 +27,6 @@ from tools.acm_agent.service_common import AIConversationConflict
 from tools.acm_agent.storage import Database
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 CHINESE_EXPLANATION_RULE = "除非用户显式要求其他语言，否则解释性内容使用简体中文"
 
 
@@ -153,8 +151,29 @@ class AiServiceTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         target = self.root / "training" / "data-structures-30d"
         target.mkdir(parents=True)
-        shutil.copy2(REPO_ROOT / "training/data-structures-30d/plan.json", target / "plan.json")
-        shutil.copy2(REPO_ROOT / "training/data-structures-30d/README.md", target / "README.md")
+        # AI contract tests require classified candidates, independently of the
+        # shipped plan's optional metadata or the developer's training records.
+        plan = {
+            "schema_version": 2,
+            "plan_id": "data-structures-30d",
+            "title": "AI contract fixture",
+            "schedule_mode": "progressive",
+            "stages": [{
+                "stage_key": "fixture",
+                "topic": "Fixture candidates",
+                "kind": "practice",
+                "tasks": [{
+                    "task_key": f"fixture-{topic_index}-{index}",
+                    "platform": "codeforces",
+                    "problem_id": f"CF{1000 + topic_index * 10 + index}A",
+                    "level": "A",
+                    "tags": [tag],
+                } for topic_index, tag in enumerate(("dp", "graphs", "greedy"))
+                  for index in range(3)],
+            }],
+        }
+        (target / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        (target / "README.md").write_text("# AI contract fixture\n", encoding="utf-8")
         self.client = FakeDeepSeek()
         self.verify_calls = []
 
@@ -216,7 +235,7 @@ class AiServiceTests(unittest.TestCase):
         self.assertNotIn("private note", sent)
         self.assertNotIn(str(self.root), sent)
         self.assertNotIn("#include", sent)
-        self.assertEqual(self.client.calls[-1][2]["max_tokens"], 4_096)
+        self.assertEqual(self.client.calls[-1][2]["max_tokens"], 16_384)
 
     def test_cache_clear_allows_safe_profile_disabled_by_current_policy(self):
         config = load_config(self.service.paths)
@@ -245,7 +264,7 @@ class AiServiceTests(unittest.TestCase):
         sent = json.dumps(self.client.calls[-1][1], ensure_ascii=False)
         self.assertIn(CHINESE_EXPLANATION_RULE, sent)
         self.assertIn("代码、算法名和复杂度表达无需翻译", sent)
-        self.assertEqual(self.client.calls[-1][2]["max_tokens"], 8_192)
+        self.assertEqual(self.client.calls[-1][2]["max_tokens"], 16_384)
         loaded = self.service.ai_conversation(conversation["conversation_id"])
         self.assertEqual(loaded["messages"][-1]["content"], "第一段第二段")
         self.assertEqual(loaded["messages"][-1]["status"], "complete")
@@ -547,12 +566,26 @@ class AiServiceTests(unittest.TestCase):
             "hint_level": 1,
             "conversation_id": conversation_id,
         }
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        follower_ready = threading.Event()
+        begin_follower = self.service._begin_coalesced_coaching_run
+
+        def observe_follower(flight):
+            run_id = begin_follower(flight)
+            follower_ready.set()
+            return run_id
+
+        # Releasing on elapsed time can let the leader finish before the
+        # second request joins, correctly turning it into a new provider call.
+        with mock.patch.object(
+            self.service, "_begin_coalesced_coaching_run", side_effect=observe_follower
+        ), ThreadPoolExecutor(max_workers=2) as executor:
             leader = executor.submit(self.service.ai_chat, "CF1A", **request)
             self.assertTrue(started.wait(5))
             follower = executor.submit(self.service.ai_chat, "CF1A", **request)
-            time.sleep(0.1)
-            release.set()
+            try:
+                self.assertTrue(follower_ready.wait(5), "follower did not join the active flight")
+            finally:
+                release.set()
             leader_result = leader.result(timeout=5)
             follower_result = follower.result(timeout=5)
 
@@ -628,12 +661,26 @@ class AiServiceTests(unittest.TestCase):
             "hint_level": 1,
             "conversation_id": conversation_id,
         }
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        follower_ready = threading.Event()
+        begin_follower = self.service._begin_coalesced_coaching_run
+
+        def observe_follower(flight):
+            run_id = begin_follower(flight)
+            follower_ready.set()
+            return run_id
+
+        # Releasing on elapsed time can let the leader finish before the
+        # second request joins, correctly turning it into a new provider call.
+        with mock.patch.object(
+            self.service, "_begin_coalesced_coaching_run", side_effect=observe_follower
+        ), ThreadPoolExecutor(max_workers=2) as executor:
             leader_future = executor.submit(self.service.ai_chat, "CF1A", **request)
             self.assertTrue(provider_started.wait(5))
             follower_future = executor.submit(self.service.ai_chat, "CF1A", **request)
-            time.sleep(0.05)
-            release.set()
+            try:
+                self.assertTrue(follower_ready.wait(5), "follower did not join the active flight")
+            finally:
+                release.set()
             leader = leader_future.result(timeout=5)
             follower = follower_future.result(timeout=5)
 
@@ -669,12 +716,26 @@ class AiServiceTests(unittest.TestCase):
             "hint_level": 1,
             "conversation_id": conversation_id,
         }
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        follower_ready = threading.Event()
+        begin_follower = self.service._begin_coalesced_coaching_run
+
+        def observe_follower(flight):
+            run_id = begin_follower(flight)
+            follower_ready.set()
+            return run_id
+
+        # Releasing on elapsed time can let the leader finish before the
+        # second request joins, correctly turning it into a new provider call.
+        with mock.patch.object(
+            self.service, "_begin_coalesced_coaching_run", side_effect=observe_follower
+        ), ThreadPoolExecutor(max_workers=2) as executor:
             leader_future = executor.submit(self.service.ai_chat, "CF1A", **request)
             self.assertTrue(provider_started.wait(5))
             follower_future = executor.submit(self.service.ai_chat, "CF1A", **request)
-            time.sleep(0.05)
-            release.set()
+            try:
+                self.assertTrue(follower_ready.wait(5), "follower did not join the active flight")
+            finally:
+                release.set()
             leader = leader_future.result(timeout=5)
             follower = follower_future.result(timeout=5)
 

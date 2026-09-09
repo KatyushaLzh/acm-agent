@@ -16,6 +16,7 @@ from .ai_cache import build_cache_key
 from .ai_reliability import build_ai_outcome
 from .config import load_config
 from .provider import ProviderError
+from .provider_governance import governance_from_error, governance_from_result
 from .provider_registry import provider_definition_hash
 from .provider_policy import validate_model, validate_reasoning_effort
 from .knowledge import (
@@ -58,20 +59,24 @@ AI_SUMMARY_PROMPT_VERSION = "markdown-summary-prompt-v3"
 AI_SUMMARY_SCHEMA_VERSION = "markdown-summary-schema-v2"
 AI_SUMMARY_VALIDATOR_VERSION = "markdown-summary-validator-v3"
 AI_SUMMARY_LOWERING_VERSION = "markdown-summary-lowering-v3"
-AI_SUMMARY_REPAIR_VERSION = "markdown-summary-repair-v1"
+AI_SUMMARY_REPAIR_VERSION = "markdown-summary-repair-v2"
 
 
 def _observed_summary_repairs(result: Any, explicit: int = 0) -> int:
-    metadata = getattr(result, "provider_metadata", {})
-    governance = metadata.get("governance") if isinstance(metadata, Mapping) else None
-    observed = (
-        governance.get("validation_repairs", 0)
-        if isinstance(governance, Mapping)
-        else 0
-    )
+    governance = governance_from_result(result) or governance_from_error(result)
+    if governance is None:
+        return max(0, int(explicit))
+    observed = governance.get("validation_repairs", 0)
     if isinstance(observed, bool) or not isinstance(observed, int):
         observed = 0
-    return max(int(explicit), int(observed))
+    legs = governance.get("legs", [])
+    repair_legs = sum(
+        isinstance(leg, Mapping) and leg.get("purpose") == "validation_repair"
+        for leg in legs
+    ) if isinstance(legs, list) else 0
+    # The caller can express repair intent before admission; an authoritative
+    # zero means governance blocked it before any provider attempt was sent.
+    return max(0, int(observed), repair_legs)
 
 
 class ServiceKnowledgeMixin:
@@ -83,7 +88,11 @@ class ServiceKnowledgeMixin:
 
         normalized = validate_summary_schema(selected_schema)
         field_properties = {
-            str(field["key"]): {"type": "string", "maxLength": 65536}
+            str(field["key"]): {
+                "type": "string", "maxLength": 65536,
+                "minLength": 1 if field["required"] else 0,
+                "description": "UTF-8 编码不得超过 65536 字节；不得包含原始 HTML。必填字段去除空白后不能为空。",
+            }
             for field in normalized["fields"]
         }
         response_fields: dict[str, Any] = (
@@ -109,12 +118,12 @@ class ServiceKnowledgeMixin:
             }
         )
         properties: dict[str, Any] = {
-            "topic": {"type": "string", "minLength": 1, "maxLength": 200},
-            "title": {"type": "string", "minLength": 1, "maxLength": 200},
+            "topic": {"type": "string", "minLength": 1, "maxLength": 160},
+            "title": {"type": "string", "minLength": 1, "maxLength": 160},
             "aliases": {
                 "type": "array",
                 "maxItems": 20,
-                "items": {"type": "string", "minLength": 1, "maxLength": 200},
+                "items": {"type": "string", "minLength": 1, "maxLength": 160},
             },
             "confidence": {
                 "type": "number",
@@ -134,7 +143,7 @@ class ServiceKnowledgeMixin:
                 "type": "object",
                 "properties": {
                     "version": {"type": "string", "const": "summary-schema-v1"},
-                    "name": {"type": "string", "minLength": 1, "maxLength": 120},
+                    "name": {"type": "string", "minLength": 1, "maxLength": 80},
                     "category_heading_level": {"type": "integer", "minimum": 1, "maximum": 5},
                     "entry_heading_level": {"type": "integer", "minimum": 2, "maximum": 6},
                     "toc": {"type": "string", "enum": ["preserve", "typora", "none"]},
@@ -155,8 +164,8 @@ class ServiceKnowledgeMixin:
                             "additionalProperties": False,
                         },
                     },
-                    "blank_lines_between_fields": {"type": "integer", "minimum": 0, "maximum": 3},
-                    "blank_lines_between_entries": {"type": "integer", "minimum": 0, "maximum": 3},
+                    "blank_lines_between_fields": {"type": "integer", "minimum": 0, "maximum": 2},
+                    "blank_lines_between_entries": {"type": "integer", "minimum": 1, "maximum": 3},
                 },
                 "required": [
                     "version", "name", "category_heading_level", "entry_heading_level",
@@ -181,6 +190,108 @@ class ServiceKnowledgeMixin:
         if "candidate" in name or "markdown" in name:
             return "summary_lowering_invalid"
         return "summary_entry_invalid"
+
+    @staticmethod
+    def _summary_validation_feedback(
+        exc: BaseException,
+        selected_schema: Mapping[str, Any],
+        *,
+        artifact: Any,
+        ask_schema: bool,
+    ) -> dict[str, Any]:
+        """Translate known validator failures without reflecting model values.
+
+        Exception text can embed unknown keys or model-supplied labels. Match
+        only known diagnostics; emit fixed constraints and trusted paths. For
+        inferred fields emit bounded ordinal positions instead of model keys.
+        """
+        message = str(exc)
+        heading_rule = "必须为去除空白后非空的单行字符串，最多160字符；不能以#开头或包含HTML。"
+        fixed = {
+            "entry must be an object": ("$", "必须输出完整JSON对象。"),
+            "Markdown 总结缓存产物必须是对象": ("$", "必须输出完整JSON对象。"),
+            "entry.aliases must be an array with at most 20 values": ("aliases", "必须是至多20项的字符串数组。"),
+            "entry.confidence must be a number": ("confidence", "必须为0到1之间的数字，不能是布尔值或字符串。"),
+            "entry.confidence must be between 0 and 1": ("confidence", "必须为0到1之间的有限数字。"),
+            "entry.fields must be an object": ("fields", "按给定schema输出字段对象；推断schema时使用有序{key,value}数组。"),
+            "entry.rationale is invalid": ("rationale", "UTF-8编码至多16384字节，不得包含原始HTML。"),
+            "schema must be an object": ("schema", "必须输出summary-schema-v1声明式对象。"),
+            "schema.version must be summary-schema-v1": ("schema.version", "固定为summary-schema-v1。"),
+            "entry_heading_level must be deeper than category_heading_level": ("schema.entry_heading_level", "必须大于category_heading_level，且不超过6。"),
+            "toc must be typora, none, or preserve": ("schema.toc", "只能是typora、none或preserve。"),
+            "schema.fields must be a non-empty array": ("schema.fields", "必须为1到24项的字段定义数组。"),
+            "schema.fields may contain at most 24 fields": ("schema.fields", "必须为1到24项的字段定义数组。"),
+            "summary inferred fields must contain objects": ("fields", "每项必须为{key,value}对象，顺序与schema.fields一致。"),
+            "summary inferred fields contain duplicate keys": ("fields", "每个schema字段只能出现一次，顺序与schema.fields一致。"),
+            "rendered entry exceeds 64 KiB": ("fields", "压缩所有字段内容；整个渲染条目的UTF-8总大小必须不超过65536字节。"),
+            "rendered entry contains NUL or raw HTML": ("fields", "删除NUL和原始HTML，仅使用普通文本或Markdown。"),
+            "rendered entry must contain exactly one entry-level heading": ("fields", "字段正文不要引入与entry_heading_level同级的Markdown标题。"),
+            "rendered fields do not follow schema order": ("fields", "保持schema字段顺序，正文不要伪造其他字段的标题或标签。"),
+        }
+        for name in ("topic", "title"):
+            for suffix in ("must be a string", "is invalid"):
+                fixed[f"entry.{name} {suffix}"] = (name, heading_rule)
+        for suffix in ("must be a string", "is invalid"):
+            fixed[f"schema.name {suffix}"] = ("schema.name", "必须为非空单行字符串，最多80字符，不含HTML。")
+        for name, lower, upper in (
+            ("category_heading_level", 1, 5), ("entry_heading_level", 2, 6),
+            ("blank_lines_between_fields", 0, 2), ("blank_lines_between_entries", 1, 3),
+        ):
+            fixed[f"{name} must be an integer in [{lower}, {upper}]"] = (
+                f"schema.{name}", f"必须是{lower}到{upper}之间的整数，不能是布尔值。"
+            )
+        for index in range(20):
+            for suffix in ("must be a string", "is invalid"):
+                fixed[f"entry.aliases[{index}] {suffix}"] = (f"aliases[{index}]", heading_rule)
+        if message in fixed:
+            path, constraint = fixed[message]
+            return {"path": path, "constraint": constraint}
+        for prefix, path, constraint in (
+            ("unknown entry keys:", "$", "仅保留topic,title,aliases,confidence,fields,rationale；推断模式另含schema。"),
+            ("unknown schema keys:", "schema", "删除JSON Schema未声明的属性。"),
+            ("entry contains unknown fields:", "fields", "只使用所选schema声明的字段key。"),
+            ("duplicate field key:", "schema.fields", "字段key必须唯一。"),
+            ("duplicate field label:", "schema.fields", "字段label忽略大小写后必须唯一。"),
+        ):
+            if message.startswith(prefix):
+                return {"path": path, "constraint": constraint}
+        field_schema = artifact.get("schema") if ask_schema and isinstance(artifact, Mapping) else selected_schema
+        raw_fields = field_schema.get("fields", []) if isinstance(field_schema, Mapping) else []
+        if isinstance(raw_fields, list):
+            for index, field in enumerate(raw_fields[:24]):
+                if not isinstance(field, Mapping) or not isinstance(field.get("key"), str):
+                    continue
+                key = field["key"]
+                path = "fields" if ask_schema else f"fields.{key}"
+                rules = {
+                    f"field {key} must be a string": "必须为字符串。",
+                    f"field {key} exceeds 64 KiB": "UTF-8编码必须不超过65536字节。",
+                    f"field {key} contains raw HTML": "删除原始HTML，使用普通文本或Markdown。",
+                    f"required field is empty: {key}": "必填字段去除空白后不能为空；仅依据原始证据填写，不得虚构。",
+                    f"rendered field uses wrong layout: {key}": "正文不要引入与声明字段冲突的标题或标签，保持schema布局。",
+                    f"duplicate rendered field: {key}": "正文不要重复声明该schema字段的标题或标签。",
+                }
+                if message in rules:
+                    return {
+                        "path": path, "constraint": rules[message],
+                        **({"schema_field_index": index} if ask_schema else {}),
+                    }
+        for index in range(24):
+            prefix = f"fields[{index}]"
+            rules = {
+                f"{prefix} must be an object": "必须为字段定义对象。",
+                f"{prefix}.key is invalid": "key必须匹配^[a-z][a-z0-9_]{0,39}$。",
+                f"{prefix}.label must be a string": "label必须为非空单行字符串，最多80字符且不含HTML。",
+                f"{prefix}.label is invalid": "label必须为非空单行字符串，最多80字符且不含HTML。",
+                f"{prefix}.required must be boolean": "required必须为布尔值。",
+                f"{prefix}.layout must be bullet or subheading": "layout只能是bullet或subheading。",
+                f"{prefix}.instruction is invalid": "instruction最多500字符，不含HTML。",
+            }
+            if message in rules:
+                return {"path": f"schema.fields[{index}]", "constraint": rules[message]}
+            if message.startswith(f"unknown {prefix} keys:"):
+                return {"path": f"schema.fields[{index}]", "constraint": "只保留key,label,required,layout,instruction。"}
+        return {"path": "$", "constraint": "重新生成完整对象，严格遵守所选schema和Markdown结构；不得虚构证据。"}
 
     def knowledge_templates(self) -> dict[str, Any]:
         return {"ok": True, "templates": list_builtin_templates()}
@@ -919,6 +1030,10 @@ class ServiceKnowledgeMixin:
                                 "type": "validation_repair",
                                 "version": AI_SUMMARY_REPAIR_VERSION,
                                 "validation_code": validation_code,
+                                "violation": self._summary_validation_feedback(
+                                    validation_exc, selected_schema,
+                                    artifact=result.data, ask_schema=ask_schema,
+                                ),
                                 "instruction": "重新输出满足既定 JSON Schema 和业务约束的完整对象；不要解释错误。",
                             },
                             ensure_ascii=False,
@@ -1044,6 +1159,7 @@ class ServiceKnowledgeMixin:
             if artifact_ready:
                 raise
             if isinstance(exc, ProviderError):
+                repair_attempts = _observed_summary_repairs(exc, repair_attempts)
                 merge_usage(total_usage, dict(getattr(exc, "usage", {}) or {}))
             self._release_exact_cache_flight(
                 cache_key,

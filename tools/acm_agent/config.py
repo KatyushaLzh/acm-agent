@@ -23,7 +23,7 @@ from .provider_config import (
 )
 
 
-CONFIG_VERSION = 16
+CONFIG_VERSION = 17
 # Compatibility-only conversion for explicitly configured v14 USD guardrails.
 # DeepSeek usage itself is always priced from the native CNY catalog.
 LEGACY_LIMIT_USD_TO_CNY_RATE = 7.2
@@ -35,6 +35,19 @@ _V15_DEFAULT_TOKEN_BUDGETS: dict[str, dict[str, int]] = {
     "coaching": {"max_output_tokens": 4_096, "max_total_tokens": 150_000},
     "patch": {"max_output_tokens": 8_192, "max_total_tokens": 200_000},
     "summary": {"max_output_tokens": 6_000, "max_total_tokens": 180_000},
+}
+
+_V16_REASONING_BUDGETS = {
+    profile: {
+        "max_output_tokens": output, "request_timeout_seconds": timeout,
+        "max_retries": 1, "max_validation_repairs": 1,
+        "max_requests": 3, "max_total_tokens": total,
+    }
+    for profile, output, timeout, total in (
+        ("recommendation", 4_096, 120.0, 300_000),
+        ("coaching", 8_192, 120.0, 200_000),
+        ("summary", 8_192, 180.0, 240_000),
+    )
 }
 
 _REASONING_STRENGTHS = frozenset({"auto", "off", "low", "medium", "high"})
@@ -273,7 +286,31 @@ def _upgrade_v15_default_token_budgets(
             continue
         for field, old_value in old_values.items():
             if source_budget.get(field) == old_value:
-                budget[field] = new_budgets[profile_id][field]
+                budget[field] = _V16_REASONING_BUDGETS.get(
+                    profile_id, new_budgets[profile_id]
+                )[field]
+
+
+def _upgrade_v16_reasoning_budgets(
+    ai: dict[str, Any], source_ai: Mapping[str, Any], version: int
+) -> None:
+    """Upgrade complete legacy defaults; preserve any custom v16 budget."""
+    source_policy = source_ai.get("policy")
+    if not isinstance(source_policy, Mapping):
+        return
+    source_budgets = source_policy.get("budgets")
+    if not isinstance(source_budgets, Mapping):
+        return
+    for profile, baseline in _V16_REASONING_BUDGETS.items():
+        expected = dict(baseline)
+        if version <= 15:
+            expected.update(_V15_DEFAULT_TOKEN_BUDGETS[profile])
+        # No per-field guess: a tuned deadline, request count or token limit
+        # keeps the entire v16 budget. Partial/extended profiles are explicit.
+        if source_budgets.get(profile) == expected:
+            ai["policy"]["budgets"][profile] = dict(
+                default_ai_policy()["budgets"][profile]
+            )
 
 
 def _upgrade_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -367,6 +404,8 @@ def _upgrade_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
                     }
         if version <= 15:
             _upgrade_v15_default_token_budgets(ai, source_ai)
+        if version <= 16:
+            _upgrade_v16_reasoning_budgets(ai, source_ai, version)
         providers, profiles = validate_ai_catalog(ai.get("providers"), ai.get("profiles"))
         _upgrade_profiles_reasoning(profiles)
         ai["providers"] = providers

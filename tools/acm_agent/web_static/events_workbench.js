@@ -97,19 +97,35 @@ function bindWorkbenchEvents() {
     const button = $("button[type=submit]", form);
     const summarize = form.elements.knowledge_enabled.checked;
     const knowledgeEpoch = ++state.knowledgeEpoch;
+    const problem = form.elements.problem.value.trim();
+    const active = state.activeSession;
+    const problemId = value => String(value || "").trim().toUpperCase().split(":").pop().replace(/^CF(?=\d)/, "");
+    const matchesActive = active && problemId(active.problem_id || active.problem?.problem_id) === problemId(problem);
+    const attemptId = matchesActive ? (active.attempt_id ?? active.id)
+      : state.closeAttempt?.problem === problem ? state.closeAttempt.attemptId : null;
+    if (attemptId != null) state.closeAttempt = { problem, attemptId };
     setBusy(button, true, "记录中…");
     try {
       const data = await api("/api/sessions/close", { body: {
-        problem: form.elements.problem.value.trim(),
+        problem,
+        ...(attemptId != null ? { attempt_id: attemptId } : {}),
         result: form.elements.result.value,
         minutes: Number(form.elements.minutes.value),
         hint_level: Number(form.elements.hint_level.value),
         failure: form.elements.failure.value,
         notes: form.elements.notes.value.trim() || null,
       } });
+      state.closeAttempt = { problem, attemptId: data.attempt_id };
       const box = $("#close-result");
       box.className = "result-box success";
       box.innerHTML = `<strong>Session 已结束</strong><p>状态：${escapeHtml(data.status || data.close?.result || "已记录")}${data.review_due ? ` · 复做日期：${escapeHtml(data.review_due)}` : ""}</p><p>${summarize ? "正在生成可确认的 Markdown 预览；目标文件尚未修改。" : "归档候选已保存，未请求 Markdown 总结。"}</p>`;
+      if (data.report_status === "failed") {
+        box.className = "result-box warning";
+        box.innerHTML = `<strong>Session 已结束，训练结果已保存</strong><p>归档报告尚未生成；保持本次参数再次提交可重试报告。</p>`;
+      }
+      for (const warning of Array.isArray(data.warnings) ? data.warnings : []) {
+        box.innerHTML += `<p class="warning-text">${escapeHtml(warning.message || warning)}</p>`;
+      }
       renderActive(null);
       switchAiProblem("", { force: true });
       toast("复盘已记录", data.review_due ? `已加入 ${data.review_due} 复做队列。` : "本次结果已影响后续推荐。");

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
+import subprocess
 import unittest
 
 
@@ -9,6 +11,14 @@ STATIC = ROOT / "tools" / "acm_agent" / "web_static"
 
 
 class WebFrontendConcurrencyContractTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for frontend event-loop regression tests")
+    def test_async_preview_races_execute_in_node(self) -> None:
+        result = subprocess.run(
+            [shutil.which("node"), str(ROOT / "tests" / "frontend_async_races.cjs")],
+            cwd=ROOT, capture_output=True, text=True, encoding="utf-8", timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.core = (STATIC / "core.js").read_text(encoding="utf-8")

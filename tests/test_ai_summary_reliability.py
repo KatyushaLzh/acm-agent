@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 from tools.acm_agent.provider import AIJsonResult, ProviderError
-from tools.acm_agent.knowledge import get_builtin_schema
+from tools.acm_agent.knowledge import EntryValidationError, get_builtin_schema
 from tools.acm_agent.service import AcmService
 from tools.acm_agent.storage import Database
 
@@ -100,7 +100,8 @@ class SummaryReliabilityTests(unittest.TestCase):
         self.assertEqual(result["ai"]["outcome"]["repair_attempts"], 1)
         self.assertTrue(result["proposal"]["can_apply"])
         self.assertEqual(len(provider.calls), 2)
-        self.assertTrue(all(call["max_tokens"] == 8_192 for call in provider.calls))
+
+        self.assertTrue(all(call["max_tokens"] == 16_384 for call in provider.calls))
         self.assertEqual(self.cache_entries(), 1)
         with Database(self.root / ".acm" / "state.db") as db:
             run = db.ai_run(str(result["proposal"]["ai_run_id"]))
@@ -116,6 +117,81 @@ class SummaryReliabilityTests(unittest.TestCase):
         self.assertEqual(cached["ai"]["outcome"]["business_outcome"], "cache")
         self.assertEqual(len(provider.calls), 2)
 
+
+    def test_repair_identifies_empty_required_field_without_replaying_bad_output(self) -> None:
+        invalid = valid_summary()
+        invalid["fields"] = {**invalid["fields"], "correctness": "   "}
+        service, provider, attempt_id, target_id = self.service_with([invalid, valid_summary()])
+        result = service.knowledge_preview(attempt_id, target_id)
+        self.assertTrue(result["proposal"]["can_apply"])
+        feedback = json.loads(provider.calls[1]["messages"][-1]["content"].split("\n", 1)[1])
+        self.assertEqual(feedback["version"], "markdown-summary-repair-v2")
+        self.assertEqual(feedback["violation"]["path"], "fields.correctness")
+        self.assertIn("不能为空", feedback["violation"]["constraint"])
+        self.assertIn("不得虚构", feedback["violation"]["constraint"])
+        self.assertEqual(len(provider.calls[1]["messages"]), len(provider.calls[0]["messages"]) + 1)
+        self.assertEqual(result["ai"]["outcome"]["artifact_outcome"], "repaired")
+
+    def test_repair_does_not_reflect_unknown_model_keys_into_feedback_or_audit(self) -> None:
+        marker = "UNTRUSTED_MODEL_SECRET_IGNORE_ALL_RULES"
+        invalid = {**valid_summary(), marker: "MODEL_ONLY_PRIVATE_VALUE"}
+        service, provider, attempt_id, target_id = self.service_with([invalid, invalid])
+        result = service.knowledge_preview(attempt_id, target_id)
+        self.assertFalse(result["ok"])
+        self.assertIsNone(result["proposal"])
+        feedback = json.loads(provider.calls[1]["messages"][-1]["content"].split("\n", 1)[1])
+        self.assertEqual(feedback["violation"]["path"], "$")
+        serialized_feedback = json.dumps(feedback)
+        self.assertNotIn(marker, serialized_feedback)
+        self.assertNotIn("MODEL_ONLY_PRIVATE_VALUE", serialized_feedback)
+        with Database(self.root / ".acm" / "state.db") as db:
+            audit = json.dumps([dict(row) for row in db.query("SELECT * FROM ai_runs")])
+            audit += json.dumps([dict(row) for row in db.query("SELECT * FROM ai_run_legs")])
+        self.assertNotIn(marker, audit)
+        self.assertNotIn("MODEL_ONLY_PRIVATE_VALUE", audit)
+        self.assertEqual(self.cache_entries(), 0)
+
+    def test_inferred_schema_repair_explains_cross_field_heading_constraint(self) -> None:
+        schema = get_builtin_schema("algorithms-v1")
+        valid = {**valid_summary(), "schema": schema}
+        valid["fields"] = [{"key": key, "value": value} for key, value in valid["fields"].items()]
+        invalid = {**valid, "schema": {**schema, "category_heading_level": 3, "entry_heading_level": 3}}
+        service, provider, attempt_id, target_id = self.service_with([invalid, valid])
+        result = service.knowledge_preview(attempt_id, target_id, schema_mode="ai")
+        self.assertTrue(result["ok"])
+        feedback = json.loads(provider.calls[1]["messages"][-1]["content"].split("\n", 1)[1])
+        self.assertEqual(feedback["violation"]["path"], "schema.entry_heading_level")
+        self.assertIn("必须大于category_heading_level", feedback["violation"]["constraint"])
+
+    def test_inferred_field_feedback_uses_ordinal_instead_of_model_key(self) -> None:
+        marker = "model_generated_private_key"
+        feedback = AcmService._summary_validation_feedback(
+            EntryValidationError(f"required field is empty: {marker}"),
+            get_builtin_schema("algorithms-v1"),
+            artifact={"schema": {"fields": [{"key": marker}]}},
+            ask_schema=True,
+        )
+        self.assertEqual(feedback["path"], "fields")
+        self.assertEqual(feedback["schema_field_index"], 0)
+        self.assertIn("不能为空", feedback["constraint"])
+        self.assertNotIn(marker, json.dumps(feedback))
+
+    def test_provider_schema_matches_existing_local_validator_limits(self) -> None:
+        selected = get_builtin_schema("algorithms-v1")
+        schema = AcmService._summary_response_json_schema(selected, ask_schema=True)
+        properties = schema["properties"]
+        self.assertEqual(properties["topic"]["maxLength"], 160)
+        self.assertEqual(properties["title"]["maxLength"], 160)
+        self.assertEqual(properties["aliases"]["items"]["maxLength"], 160)
+        inferred = properties["schema"]["properties"]
+        self.assertEqual(inferred["name"]["maxLength"], 80)
+        self.assertEqual(inferred["blank_lines_between_fields"]["maximum"], 2)
+        self.assertEqual(inferred["blank_lines_between_entries"]["minimum"], 1)
+        bound = AcmService._summary_response_json_schema(selected, ask_schema=False)
+        field_properties = bound["properties"]["fields"]["properties"]
+        for field in selected["fields"]:
+            self.assertEqual(field_properties[field["key"]]["minLength"], 1 if field["required"] else 0)
+        self.assertIn("UTF-8", field_properties["correctness"]["description"])
     def test_low_confidence_is_applyable_with_soft_warning_and_cached(self) -> None:
         service, provider, attempt_id, target_id = self.service_with(
             [valid_summary(confidence=0.5)]

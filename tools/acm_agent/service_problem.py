@@ -230,8 +230,18 @@ class ServiceProblemMixin:
         hint_level: int,
         failure: str | None = None,
         notes: str | None = None,
+        attempt_id: int | None = None,
     ) -> dict[str, Any]:
+        """Close a training attempt, optionally replaying a specific close safely.
+
+        An explicit attempt_id identifies retries. Without one, retain the legacy
+        behavior of using the active attempt or starting a fresh attempt.
+        """
         load_config(self.paths)
+        if attempt_id is not None and (
+            isinstance(attempt_id, bool) or not isinstance(attempt_id, int) or attempt_id < 1
+        ):
+            raise ValueError("attempt_id 必须是正整数")
         ref = parse_problem_ref(problem)
         normalized_result = str(result).upper()
         if normalized_result not in RESULTS:
@@ -248,114 +258,150 @@ class ServiceProblemMixin:
         today = date.today()
         with Database(self.paths.database) as db:
             with db.atomic():
-                was_accepted = db.problem_status(ref.platform, problem_id) == "accepted"
-                attempt_id = self._find_or_start_attempt(db, ref)
-                hint = max(hint, db.max_ai_hint_level(attempt_id))
-                previous = [
-                    row for row in db.attempts(ref.platform, problem_id)
-                    if row["id"] != attempt_id
-                ]
-                reset_attempt_id = db.review_reset_attempt_id(ref.platform, problem_id)
-                relevant_previous = [
-                    row for row in previous
-                    if int(row["id"]) > reset_attempt_id
-                ]
-                previous_wa = sum(
-                    str(row["result"] or "").upper() == "WA"
-                    for row in relevant_previous
-                )
-                previous_abandoned = any(
-                    str(row["result"] or "").upper() == "ABANDONED"
-                    for row in relevant_previous
-                )
-                queued = db.review_queue_entry(ref.platform, problem_id)
-                failure_qualifies = (failure or "") in {
-                    "selection", "modeling", "invariant", "editorial"
-                }
-                failure_evidence_qualifies = (
-                    previous_wa + (normalized_result == "WA") >= 2
-                    or previous_abandoned
-                    or normalized_result == "ABANDONED"
-                    or failure_qualifies
-                )
-                qualifies_new = failure_evidence_qualifies and (
-                    normalized_result == "AC" or was_accepted
-                )
-                if queued is not None:
-                    queue_type = str(queued["queue_type"])
-                    current_stage = int(queued["review_stage"] or 0)
-                    current_due = str(queued["review_due"])
-                    if normalized_result == "AC":
-                        if queue_type == "manual_once":
-                            db.remove_review_queue(
-                                ref.platform,
-                                problem_id,
-                                reset_attempt_id=attempt_id,
-                            )
-                            review_stage = 0
-                            review_due = None
-                        else:
-                            next_stage = current_stage + 1
-                            delay = {2: 30, 3: 90}.get(next_stage)
-                            if delay is None:
+                existing = None
+                if attempt_id is not None:
+                    existing = db.connection.execute(
+                        "SELECT * FROM attempts WHERE id=?", (attempt_id,)
+                    ).fetchone()
+                    if existing is None:
+                        raise ValueError(f"attempt {attempt_id} 不存在")
+                    if (existing["platform"], existing["problem_id"]) != (ref.platform, problem_id):
+                        raise ValueError("attempt_id 与题目不匹配")
+                else:
+                    attempt_id = self._find_or_start_attempt(db, ref)
+                replayed = existing is not None and not existing["active"]
+                if replayed:
+                    requested = (
+                        normalized_result, minutes,
+                        max(hint, db.max_ai_hint_level(attempt_id)),
+                        None if failure == "none" else failure, notes,
+                    )
+                    persisted = tuple(existing[key] for key in (
+                        "result", "minutes", "hint_level", "failure_mode", "notes"
+                    ))
+                    if requested != persisted:
+                        raise ValueError("该 attempt 已关闭且结果不同；请 start 新训练后再 close")
+                else:
+                    was_accepted = db.problem_status(ref.platform, problem_id) == "accepted"
+                    hint = max(hint, db.max_ai_hint_level(attempt_id))
+                    previous = [
+                        row for row in db.attempts(ref.platform, problem_id)
+                        if row["id"] != attempt_id
+                    ]
+                    reset_attempt_id = db.review_reset_attempt_id(ref.platform, problem_id)
+                    relevant_previous = [
+                        row for row in previous
+                        if int(row["id"]) > reset_attempt_id
+                    ]
+                    previous_wa = sum(
+                        str(row["result"] or "").upper() == "WA"
+                        for row in relevant_previous
+                    )
+                    previous_abandoned = any(
+                        str(row["result"] or "").upper() == "ABANDONED"
+                        for row in relevant_previous
+                    )
+                    queued = db.review_queue_entry(ref.platform, problem_id)
+                    failure_qualifies = (failure or "") in {
+                        "selection", "modeling", "invariant", "editorial"
+                    }
+                    failure_evidence_qualifies = (
+                        previous_wa + (normalized_result == "WA") >= 2
+                        or previous_abandoned
+                        or normalized_result == "ABANDONED"
+                        or failure_qualifies
+                    )
+                    qualifies_new = failure_evidence_qualifies and (
+                        normalized_result == "AC" or was_accepted
+                    )
+                    if queued is not None:
+                        queue_type = str(queued["queue_type"])
+                        current_stage = int(queued["review_stage"] or 0)
+                        current_due = str(queued["review_due"])
+                        if normalized_result == "AC":
+                            if queue_type == "manual_once":
                                 db.remove_review_queue(
                                     ref.platform,
                                     problem_id,
                                     reset_attempt_id=attempt_id,
                                 )
-                                review_stage = min(current_stage, 3)
+                                review_stage = 0
                                 review_due = None
                             else:
-                                review_stage = next_stage
-                                review_due = (today + timedelta(days=delay)).isoformat()
-                                db.upsert_review_queue(
-                                    ref.platform,
-                                    problem_id,
-                                    review_due=review_due,
-                                    queue_type="automatic",
-                                    review_stage=review_stage,
-                                )
-                    else:
-                        review_stage = current_stage
-                        review_due = min(current_due, today.isoformat())
+                                next_stage = current_stage + 1
+                                delay = {2: 30, 3: 90}.get(next_stage)
+                                if delay is None:
+                                    db.remove_review_queue(
+                                        ref.platform,
+                                        problem_id,
+                                        reset_attempt_id=attempt_id,
+                                    )
+                                    review_stage = min(current_stage, 3)
+                                    review_due = None
+                                else:
+                                    review_stage = next_stage
+                                    review_due = (today + timedelta(days=delay)).isoformat()
+                                    db.upsert_review_queue(
+                                        ref.platform,
+                                        problem_id,
+                                        review_due=review_due,
+                                        queue_type="automatic",
+                                        review_stage=review_stage,
+                                    )
+                        else:
+                            review_stage = current_stage
+                            review_due = min(current_due, today.isoformat())
+                            db.upsert_review_queue(
+                                ref.platform,
+                                problem_id,
+                                review_due=review_due,
+                                queue_type=queue_type,
+                                review_stage=review_stage,
+                            )
+                    elif qualifies_new:
+                        review_stage = 1
+                        review_due = (today + timedelta(days=7)).isoformat()
                         db.upsert_review_queue(
                             ref.platform,
                             problem_id,
                             review_due=review_due,
-                            queue_type=queue_type,
+                            queue_type="automatic",
                             review_stage=review_stage,
                         )
-                elif qualifies_new:
-                    review_stage = 1
-                    review_due = (today + timedelta(days=7)).isoformat()
-                    db.upsert_review_queue(
-                        ref.platform,
-                        problem_id,
-                        review_due=review_due,
-                        queue_type="automatic",
+                    else:
+                        review_stage = 0
+                        review_due = None
+                    snapshot_tags = db.effective_problem_tags(ref.platform, problem_id)
+                    db.close_attempt(
+                        attempt_id,
+                        result=normalized_result,
+                        minutes=minutes,
+                        hint_level=hint,
+                        failure_mode=None if failure == "none" else failure,
+                        notes=notes,
                         review_stage=review_stage,
+                        review_due=review_due,
                     )
-                else:
-                    review_stage = 0
-                    review_due = None
-                snapshot_tags = db.effective_problem_tags(ref.platform, problem_id)
-                db.close_attempt(
-                    attempt_id,
-                    result=normalized_result,
-                    minutes=minutes,
-                    hint_level=hint,
-                    failure_mode=None if failure == "none" else failure,
-                    notes=notes,
-                    review_stage=review_stage,
-                    review_due=review_due,
-                )
-                conversation = db.active_ai_conversation(attempt_id)
-                if conversation is not None:
-                    db.close_ai_conversation(conversation["id"])
-                db.save_attempt_tag_snapshot(
-                    attempt_id, snapshot_tags, source="close"
-                )
+                    conversation = db.active_ai_conversation(attempt_id)
+                    if conversation is not None:
+                        db.close_ai_conversation(conversation["id"])
+                    db.save_attempt_tag_snapshot(
+                        attempt_id, snapshot_tags, source="close"
+                    )
             state = db.problem_status(ref.platform, problem_id)
+            closed = db.connection.execute(
+                "SELECT * FROM attempts WHERE id=?", (attempt_id,)
+            ).fetchone()
+            assert closed is not None
+            snapshot = db.attempt_tag_snapshot(attempt_id)
+            snapshot_tags = json.loads(snapshot["tags_json"]) if snapshot else []
+            normalized_result = closed["result"]
+            minutes = closed["minutes"]
+            hint = closed["hint_level"]
+            failure = closed["failure_mode"]
+            notes = closed["notes"]
+            review_stage = closed["review_stage"]
+            review_due = closed["review_due"]
 
         candidate = {
             "problem_key": _problem_key(ref.platform, problem_id),
@@ -372,20 +418,36 @@ class ServiceProblemMixin:
                 normalized_result == "AC" and (hint >= 2 or failure not in {None, "none"})
             ),
             "tags_snapshot": snapshot_tags,
-            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "created_at": closed["closed_at"],
         }
-        self.paths.reports.mkdir(parents=True, exist_ok=True)
         report = self.paths.reports / f"archive-candidate-{attempt_id}.json"
-        report.write_text(
-            json.dumps(candidate, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        warnings = []
+        report_status = "written"
+        try:
+            self.paths.reports.mkdir(parents=True, exist_ok=True)
+            report.write_text(
+                json.dumps(candidate, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except (OSError, UnicodeError):
+            # The training result is already durable. Report the partial outcome
+            # explicitly and let an attempt-bound retry regenerate this artifact.
+            report_status = "failed"
+            warnings.append({
+                "code": "archive_report_write_failed",
+                "message": "训练结果已保存，但归档报告写入失败；请使用同一 attempt_id 重试生成报告。",
+                "retry_attempt_id": attempt_id,
+            })
         return {
             "ok": True,
+            "committed": True,
+            "replayed": replayed,
+            "report_status": report_status,
+            "warnings": warnings,
             "attempt_id": attempt_id,
             "status": state,
             "review_due": review_due,
-            "archive_candidate": str(report),
+            "archive_candidate": str(report) if report_status == "written" else None,
             "close": candidate,
         }
 

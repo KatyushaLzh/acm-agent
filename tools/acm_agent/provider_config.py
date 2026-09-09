@@ -51,16 +51,15 @@ _DEEPSEEK_MODEL_IDS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
 
 _DEFAULT_TASK_BUDGETS: dict[str, dict[str, int | float]] = {
     "recommendation": {
-        "max_output_tokens": 4_096,
-        "request_timeout_seconds": 120.0,
+        "max_output_tokens": 16_384,
+        "request_timeout_seconds": 300.0,
         "max_retries": 1,
         "max_validation_repairs": 1,
         "max_requests": 3,
-        # The sanitized recommendation context can include hundreds of
-        # distinct accepted-problem summaries plus the bounded candidate pool.
-        # Live OpenAI-compatible usage is currently about 88k tokens for a
-        # mature workspace.  Keep enough headroom for one governed retry or
-        # validation repair without rejecting an already-paid response.
+        # History is bounded independently of the mature workspace size.
+        # Output includes reasoning: the 2026-09-09 medium Flash workload
+        # repeatedly exhausted 4096 tokens before producing a valid ranking.
+        # Preserve the existing total-token hard limit while calibrating output.
         "max_total_tokens": 300_000,
     },
     "plan_organize": {
@@ -80,8 +79,8 @@ _DEFAULT_TASK_BUDGETS: dict[str, dict[str, int | float]] = {
         "max_total_tokens": 400_000,
     },
     "coaching": {
-        "max_output_tokens": 8_192,
-        "request_timeout_seconds": 120.0,
+        "max_output_tokens": 16_384,
+        "request_timeout_seconds": 300.0,
         "max_retries": 1,
         "max_validation_repairs": 1,
         "max_requests": 3,
@@ -96,8 +95,8 @@ _DEFAULT_TASK_BUDGETS: dict[str, dict[str, int | float]] = {
         "max_total_tokens": 260_000,
     },
     "summary": {
-        "max_output_tokens": 8_192,
-        "request_timeout_seconds": 180.0,
+        "max_output_tokens": 16_384,
+        "request_timeout_seconds": 300.0,
         "max_retries": 1,
         "max_validation_repairs": 1,
         "max_requests": 3,

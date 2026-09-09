@@ -110,6 +110,7 @@ function bindAiEvents() {
   $("#knowledge-markdown-editor").addEventListener("input", () => {
     if (!state.knowledgeProposalId) return;
     state.knowledgeProposalDirty = true;
+    state.knowledgeEditEpoch += 1;
     $("#knowledge-proposal-state").className = "badge warn";
     $("#knowledge-proposal-state").textContent = "内容已编辑，需刷新";
     $("#knowledge-apply").disabled = true;

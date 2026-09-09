@@ -173,12 +173,12 @@ class Stage3PolicyTests(unittest.TestCase):
         budgets = default_ai_policy()["budgets"]
 
         expected = {
-            "recommendation": (1, 120.0, 4_096, 300_000, 3),
+            "recommendation": (1, 300.0, 16_384, 300_000, 3),
             "plan_organize": (1, 120.0, 16_000, 160_000, 3),
             "plan_generate": (1, 300.0, 32_000, 400_000, 6),
-            "coaching": (1, 120.0, 8_192, 200_000, 3),
+            "coaching": (1, 300.0, 16_384, 200_000, 3),
             "patch": (1, 240.0, 12_000, 260_000, 3),
-            "summary": (1, 180.0, 8_192, 240_000, 3),
+            "summary": (1, 300.0, 16_384, 240_000, 3),
         }
         for profile_id, values in expected.items():
             budget = budgets[profile_id]
@@ -268,17 +268,9 @@ class Stage3GovernorTests(unittest.TestCase):
         )
         self.assertEqual(audit["legs"][1]["validation_code"], "invalid_json_output")
 
-    def test_structured_repairs_empty_and_length_codes_but_not_content_filter(self):
+    def test_structured_repairs_empty_output_but_not_resource_or_filter_failures(self):
         for error in (
             ProviderError("empty_json_output", "empty", retryable=False),
-            ProviderError(
-                "response_incomplete", "length", retryable=False,
-                finish_reason="length",
-            ),
-            ProviderError(
-                "unexpected_empty_code", "length", retryable=False,
-                finish_reason="length",
-            ),
         ):
             with self.subTest(code=error.code):
                 config = _ai_config(max_requests=2, max_retries=0)
@@ -294,6 +286,14 @@ class Stage3GovernorTests(unittest.TestCase):
                 self.assertEqual(client.request_attempts, 2)
 
         for error in (
+            ProviderError(
+                "response_incomplete", "length", retryable=False,
+                finish_reason="length",
+            ),
+            ProviderError(
+                "unexpected_empty_code", "length", retryable=False,
+                finish_reason="length",
+            ),
             ProviderError("content_filter", "blocked", retryable=False),
             ProviderError(
                 "response_incomplete", "blocked", retryable=False,
@@ -319,7 +319,7 @@ class Stage3GovernorTests(unittest.TestCase):
                 self.assertEqual(captured.exception.code, error.code)
                 self.assertEqual(client.request_attempts, 1)
 
-    def test_structured_success_with_length_finish_is_repaired_or_rejected(self):
+    def test_structured_success_with_length_finish_is_rejected_without_same_cap_repair(self):
         config = _ai_config(max_requests=2, max_retries=0)
         config["policy"]["fallbacks"]["recommendation"] = []
         route = ProviderRegistry(config).route("recommendation")
@@ -328,22 +328,12 @@ class Stage3GovernorTests(unittest.TestCase):
             truncated, _structured_result(route.model),
         ])
 
-        result = GovernedProviderClient(
-            [route], lambda _route, _timeout: client
-        ).structured([], json_schema={"type": "object"}, schema_name="result")
-
-        self.assertTrue(result.data["ok"])
-        self.assertEqual(client.request_attempts, 2)
-        self.assertIn(
-            "validation_code=response_incomplete",
-            client.structured_calls[1][0][-1]["content"],
-        )
-
-        always_truncated = _CapturingStructuredClient([truncated, truncated])
         with self.assertRaises(ProviderError) as captured:
             GovernedProviderClient(
-                [route], lambda _route, _timeout: always_truncated
+                [route], lambda _route, _timeout: client
             ).structured([], json_schema={"type": "object"}, schema_name="result")
+        self.assertEqual(client.request_attempts, 1)
+        self.assertEqual(captured.exception.protocol_details["governance"]["validation_repairs"], 0)
         self.assertEqual(captured.exception.code, "response_incomplete")
         self.assertEqual(captured.exception.finish_reason, "length")
         self.assertEqual(str(captured.exception), OUTPUT_TOKEN_LIMIT_MESSAGE)

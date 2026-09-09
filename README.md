@@ -209,7 +209,7 @@ Stage 4 live 报告使用脱敏 provider-leg ledger 汇总请求、tokens、费�
 
 源码位于 `YYYY/M/D/`，用户注册的 Markdown 知识目标可位于其他本机目录。这些内容和 `.acm/` 都属于私人数据，不应提交到公开仓库。
 
-AI 推荐只发送分类后的去重平台 AC 摘要与确定性候选；工作台对话才会发送当前题面、有效标签、源码、attempt 和最近对话。所有 AI 界面都会在发送前展示对应的数据边界。
+AI 推荐发送完整专题统计、最多 12 条近期 AC 摘要与有界的确定性候选；工作台对话才会发送当前题面、有效标签、源码、attempt 和最近对话。所有 AI 界面都会在发送前展示对应的数据边界。
 
 ## 常用 CLI
 
@@ -226,6 +226,8 @@ AI 推荐只发送分类后的去重平台 AC 摘要与确定性候选；工作�
 .\acm.ps1 ai cache clear --profile recommendation --json
 .\acm.ps1 ai cache prune --json
 ```
+
+重复提交同一次关闭操作时，传入 `close ... --attempt-id ID`，其中 ID 来自 `start --json` 或上次关闭结果。归档报告写入失败会返回已提交的训练结果和重试 ID；使用相同 ID、相同参数重试不会新增训练或再次推进复做阶段。新一轮训练先执行 `start`。
 
 Linux/macOS 将 `.\acm.ps1` 换成 `./acm.sh`。完整参数分别见：
 
@@ -250,6 +252,16 @@ python -m tools.acm_agent plan check --json
 ```
 
 测试使用固定脱敏夹具，不依赖实时平台。GitHub Actions 在 Python 3.10 与 3.13 的 Windows、Ubuntu 环境运行完整检查，并在 macOS 上定向验证 Unix 启动器。
+
+六类 AI 业务的付费验收单独运行：
+
+```bash
+python -m tools.acm_agent.business_reliability_workload --root . --live
+```
+
+该命令读取本机凭据，在隔离的合成工作区调用 DeepSeek V4 Flash；每类固定 10 个案例，推理强度为中，每类至少 9 个完整成功才通过。缓存、降级和部分结果不算完整成功；有限重试和修复可能增加实际 HTTP 请求数。报告和逐案例账本保存在 `.acm/reports/business-reliability/`，不写入真实训练数据库。运行前冻结源码与样本；中断后可用 `--resume 报告目录` 继续已知未执行项，已发出但结果未知的请求不会自动重跑。此验收检验固定场景下的业务流程，不代表任意算法题的正确率。
+
+推荐、辅导和总结的默认最大输出为 16,384 Token，整次业务总时限为 300 秒，包含推理开销。明确耗尽输出配额时会保留失败和用量，不在相同配额下原样重试；完整输出后的 JSON、Schema 或业务约束错误仍允许有限修复。v17 配置会升级完整的旧默认业务配额；与旧默认不同的 v16 配额整组保留，模型选择、推理强度及费用硬限制保持原值。
 
 ## 平台说明
 

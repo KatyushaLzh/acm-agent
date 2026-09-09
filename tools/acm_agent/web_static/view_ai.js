@@ -313,6 +313,9 @@ function knowledgeProposalPayload(payload) {
 function renderKnowledgeProposal(proposal, epoch = state.knowledgeEpoch) {
   proposal = knowledgeProposalPayload(proposal || {});
   if (epoch !== state.knowledgeEpoch) return;
+  state.knowledgeRefreshRequest = null;
+  setBusy($("#knowledge-refresh"), false);
+  state.knowledgeEditEpoch += 1;
   state.knowledgeProposalId = proposal.proposal_id || proposal.id || state.knowledgeProposalId;
   state.knowledgeProposalRevision = Number(proposal.revision ?? proposal.proposal_revision ?? 0);
   state.knowledgeProposalDirty = false;
@@ -393,14 +396,46 @@ async function previewKnowledgeSummary(attemptId, epoch) {
 
 async function refreshKnowledgeProposal(button) {
   if (!state.knowledgeProposalId) return;
+  if (state.knowledgeRefreshRequest) return;
+  const request = {
+    epoch: state.knowledgeEpoch,
+    proposalId: state.knowledgeProposalId,
+    revision: state.knowledgeProposalRevision,
+    editEpoch: state.knowledgeEditEpoch,
+    markdown: $("#knowledge-markdown-editor").value,
+  };
+  state.knowledgeRefreshRequest = request;
+  const isCurrent = () => state.knowledgeRefreshRequest === request
+    && state.knowledgeEpoch === request.epoch
+    && state.knowledgeProposalId === request.proposalId
+    && state.knowledgeProposalRevision === request.revision;
   setBusy(button, true, "刷新中…");
   try {
-    const proposal = await api(`/api/knowledge/proposals/${encodeURIComponent(state.knowledgeProposalId)}/refresh`, { body: {
-      entry_markdown: $("#knowledge-markdown-editor").value,
-      expected_revision: state.knowledgeProposalRevision,
+    const payload = await api(`/api/knowledge/proposals/${encodeURIComponent(request.proposalId)}/refresh`, { body: {
+      entry_markdown: request.markdown,
+      expected_revision: request.revision,
     } });
-    renderKnowledgeProposal(knowledgeProposalPayload(proposal));
-  } finally { setBusy(button, false); }
+    if (!isCurrent()) return;
+    const proposal = knowledgeProposalPayload(payload);
+    if ((proposal.proposal_id || proposal.id || request.proposalId) !== request.proposalId) return;
+    if (state.knowledgeEditEpoch !== request.editEpoch
+        || $("#knowledge-markdown-editor").value !== request.markdown) {
+      // The server refreshed this proposal, but the user has newer local edits.
+      // Keep those edits and carry forward the revision needed by the next refresh.
+      state.knowledgeProposalRevision = Number(proposal.revision ?? proposal.proposal_revision ?? request.revision);
+      state.knowledgeProposalDirty = true;
+      $("#knowledge-apply").disabled = true;
+      return;
+    }
+    renderKnowledgeProposal(proposal, request.epoch);
+  } catch (error) {
+    if (isCurrent()) throw error;
+  } finally {
+    if (state.knowledgeRefreshRequest === request) {
+      state.knowledgeRefreshRequest = null;
+      setBusy(button, false);
+    }
+  }
 }
 
 async function applyKnowledgeProposal(button) {
@@ -437,6 +472,8 @@ async function revertKnowledgeProposal(button) {
 
 function cancelKnowledgeProposal() {
   state.knowledgeEpoch += 1;
+  state.knowledgeRefreshRequest = null;
+  setBusy($("#knowledge-refresh"), false);
   state.knowledgeProposalId = "";
   state.knowledgeProposalRevision = null;
   state.knowledgeProposalDirty = false;

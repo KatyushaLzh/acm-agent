@@ -625,9 +625,11 @@ class _ProblemStorageMixin:
         problem_id = str(problem_id).strip()
         value = reset_at or utc_now()
         if reset_attempt_id is None:
+            # An active attempt has no failure evidence yet. Its later close
+            # must remain eligible even when its schedule was just removed.
             row = self.connection.execute(
                 """SELECT COALESCE(MAX(id),0) AS latest_id FROM attempts
-                   WHERE platform=? AND problem_id=?""",
+                   WHERE platform=? AND problem_id=? AND active=0""",
                 (platform, problem_id),
             ).fetchone()
             reset_attempt_id = int(row["latest_id"])

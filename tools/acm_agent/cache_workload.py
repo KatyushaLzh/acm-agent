@@ -73,7 +73,14 @@ def _safe_error_code(value: Any) -> str | None:
         "validation_",
         "workload_",
     )
-    if selected.startswith(trusted_prefixes):
+    trusted_codes = {
+        "response_incomplete", "invalid_ai_ranking", "summary_entry_invalid",
+        "invalid_json_output", "invalid_response", "invalid_response_status",
+        "invalid_request", "content_filter", "timeout", "network_error",
+        "connection_error", "rate_limited", "server_error", "resource_failure",
+        "response_failed", "authentication_failed", "insufficient_balance",
+    }
+    if selected in trusted_codes or selected.startswith(trusted_prefixes):
         return selected
     return "unclassified_sha256_" + hashlib.sha256(selected.encode("utf-8")).hexdigest()
 

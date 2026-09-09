@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from tools.acm_agent.plan import check_plan, load_plan, plan_task_records
+from tools.acm_agent.plan import check_plan, load_plan_data, plan_task_records
 from tools.acm_agent.recommend import (
     compute_weakness,
     estimate_cf_baseline,
@@ -47,10 +47,37 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(result.stats["required_by_platform"], {"codeforces": 50, "luogu": 41})
 
     def test_flattened_contest_tasks_keep_unlock_date(self):
-        records = plan_task_records(load_plan(PLAN))
-        d14 = [row for row in records if row["day"] == 14]
-        self.assertEqual(len(d14), 4)
-        self.assertTrue(all(row["unlock_at"] == "2026-08-09" for row in d14))
+        for schedule_mode, stage_dates in (
+            ("dated", {"unlock_at": "2026-08-09", "due_date": "2026-08-10"}),
+            ("progressive", {}),
+        ):
+            with self.subTest(schedule_mode=schedule_mode):
+                plan = load_plan_data({
+                    "schema_version": 2,
+                    "plan_id": "contest-unlock-fixture",
+                    "title": "Contest unlock fixture",
+                    "schedule_mode": schedule_mode,
+                    "stages": [{
+                        "stage_key": "d14",
+                        "topic": "Contest",
+                        "kind": "contest",
+                        **stage_dates,
+                        "tasks": [
+                            {"task_key": f"d14-{index}", "problem_id": f"CF100{letter}",
+                             "platform": "codeforces"}
+                            for index, letter in enumerate("ABCD", start=1)
+                        ],
+                    }],
+                })
+                records = plan_task_records(plan)
+                self.assertEqual(len(records), 4)
+                self.assertEqual({row["problem_id"] for row in records},
+                                 {"CF100A", "CF100B", "CF100C", "CF100D"})
+                for row in records:
+                    self.assertEqual(row["stage_key"], "d14")
+                    self.assertEqual(row["day"], 1)
+                    self.assertEqual(row["unlock_at"], stage_dates.get("unlock_at"))
+                    self.assertEqual(row["due_date"], stage_dates.get("due_date"))
 
     def test_check_detects_readme_drift(self):
         text = README.read_text(encoding="utf-8-sig").replace("problem/P3374", "problem/P3375", 1)

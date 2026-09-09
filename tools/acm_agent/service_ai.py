@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -232,11 +233,12 @@ AI_PLAN_GENERATE_PROMPT_VERSION = "plan-generate-prompt-v1"
 AI_PLAN_GENERATE_SCHEMA_VERSION = "plan-generate-schema-v1"
 AI_PLAN_GENERATE_VALIDATOR_VERSION = "plan-generate-validator-v1"
 AI_PLAN_GENERATE_LOWERING_VERSION = "plan-v2-lowering-v1"
-AI_RECOMMENDATION_PROMPT_VERSION = "recommendation-prompt-v1"
+AI_RECOMMENDATION_PROMPT_VERSION = "recommendation-prompt-v3-dynamic-constraints"
+AI_RECOMMENDATION_HISTORY_LIMIT = 12
 AI_RECOMMENDATION_SCHEMA_VERSION = "recommendation-schema-v1"
 AI_RECOMMENDATION_VALIDATOR_VERSION = "recommendation-validator-v1"
 AI_RECOMMENDATION_LOWERING_VERSION = "recommendation-lowering-v1"
-AI_COACHING_PROMPT_VERSION = "coaching-prefix-v1"
+AI_COACHING_PROMPT_VERSION = "coaching-prefix-v2-result-provenance"
 AI_COACHING_SCHEMA_VERSION = "coaching-envelope-v1"
 AI_COACHING_VALIDATOR_VERSION = "coaching-validator-v1"
 AI_COACHING_LOWERING_VERSION = "coaching-message-lowering-v1"
@@ -244,7 +246,7 @@ AI_PATCH_PROMPT_VERSION = "patch-prompt-v1"
 AI_PATCH_SCHEMA_VERSION = "patch-schema-v1"
 AI_PATCH_VALIDATOR_VERSION = "patch-validator-v1"
 AI_PATCH_LOWERING_VERSION = "unified-patch-lowering-v1"
-AI_VALIDATION_REPAIR_VERSION = "validation-repair-v1"
+AI_VALIDATION_REPAIR_VERSION = "validation-repair-v2-feedback"
 
 ORGANIZE_RESPONSE_SCHEMA = {
     "type": "object",
@@ -308,7 +310,8 @@ PATCH_RESPONSE_SCHEMA = {
 
 
 def _repair_messages(
-    messages: Sequence[Mapping[str, Any]], *, error_code: str, schema_hint: str
+    messages: Sequence[Mapping[str, Any]], *, error_code: str, schema_hint: str,
+    validation_feedback: str = "",
 ) -> list[dict[str, str]]:
     """Append a stable repair envelope without persisting the rejected text."""
 
@@ -322,6 +325,7 @@ def _repair_messages(
                     "version": AI_VALIDATION_REPAIR_VERSION,
                     "error_code": str(error_code),
                     "required_schema": str(schema_hint),
+                    "validation_feedback": validation_feedback,
                     "instruction": "重新生成完整结果；不要解释，不要复述错误输出。",
                 }
             ),
@@ -363,6 +367,19 @@ def _coalesced_outcome(source: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
+def _recommendation_topic_constraints(
+    selected_count: int, eligible_topic_count: int,
+) -> dict[str, int | None]:
+    return {
+        "min_focus_topics": min(2, selected_count, eligible_topic_count),
+        "max_focus_topics": min(3, selected_count, eligible_topic_count),
+        "max_problems_per_topic": (
+            (selected_count + 1) // 2
+            if selected_count >= 2 and eligible_topic_count >= 2 else None
+        ),
+    }
+
+
 def _validate_recommendation_payload(
     value: Any,
     *,
@@ -382,10 +399,19 @@ def _validate_recommendation_payload(
     focus_topics = list(dict.fromkeys(str(topic) for topic in focus_raw))
     if not focus_topics or any(topic not in tier_topics for topic in focus_topics):
         raise ValueError("AI 推荐包含不属于当前模式区间的 focus topic")
-    maximum_focus = min(3, selected_count)
-    minimum_focus = min(2, selected_count, len(tier_topics))
+    constraints = _recommendation_topic_constraints(selected_count, len(tier_topics))
+    maximum_focus = constraints["max_focus_topics"]
+    minimum_focus = constraints["min_focus_topics"]
     if not minimum_focus <= len(focus_topics) <= maximum_focus:
-        raise ValueError("AI 推荐的 focus topic 数量不满足 2 至 3 个板块约束")
+        required = (
+            f"恰好 {minimum_focus} 个"
+            if minimum_focus == maximum_focus
+            else f"{minimum_focus} 至 {maximum_focus} 个"
+        )
+        raise ValueError(
+            f"AI 推荐的 focus_topics 去重后必须为{required}板块，"
+            f"实际为 {len(focus_topics)} 个；当前请求推荐 {selected_count} 题"
+        )
     by_key = {str(item["problem_key"]): item for item in outbound}
     ordered: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -407,7 +433,7 @@ def _validate_recommendation_payload(
             str(row.get("training_focus") or "").strip(),
         )
     if len(ordered) < selected_count:
-        raise ValueError("AI 推荐数量不足")
+        raise ValueError(f"AI 推荐数量不足：需要 {selected_count} 题，实际为 {len(ordered)} 题")
     output = ordered[:selected_count]
     selected_topics = [details[str(item["problem_key"])][0] for item in output]
     slots = recommendation_slots(selected_count)
@@ -421,16 +447,25 @@ def _validate_recommendation_payload(
         ):
             raise ValueError("AI 推荐题难度超出本槽目标正负 100 的允许范围")
     if selected_count >= 2:
-        required_diversity = min(2, selected_count, len(tier_topics))
+        required_diversity = minimum_focus
         if len(set(selected_topics)) < required_diversity:
-            raise ValueError("AI 推荐未满足知识板块多样性")
-        cap = (selected_count + 1) // 2
-        if len(tier_topics) >= 2 and any(
+            raise ValueError(
+                f"AI 推荐未满足知识板块多样性：至少覆盖 {required_diversity} 个板块，"
+                f"实际覆盖 {len(set(selected_topics))} 个"
+            )
+        cap = constraints["max_problems_per_topic"]
+        if cap is not None and any(
             selected_topics.count(topic) > cap for topic in set(selected_topics)
         ):
-            raise ValueError("AI 推荐的单板块题量超过上限")
+            raise ValueError(
+                f"AI 推荐的单板块题量超过上限：每个板块最多 {cap} 题，"
+                f"实际最多 {max(selected_topics.count(topic) for topic in set(selected_topics))} 题"
+            )
     if set(focus_topics) != set(selected_topics):
-        raise ValueError("AI 声明的 focus topic 与实际推荐不一致")
+        raise ValueError(
+            "AI 声明的 focus topic 与实际推荐不一致：focus_topics 必须恰好等于"
+            "前 requested_count 个入选题的 topic 去重集合，每个声明板块都必须由入选题覆盖"
+        )
     return output, details, focus_topics
 
 
@@ -783,7 +818,11 @@ AI_COACHING_SYSTEM_ANCHOR = (
     "不得揭示关键性质；level=2 可以说明关键性质，但不得给出完整转化、伪代码或实现；"
     "level=3 可以给出核心转化和伪代码，但不得给出完整实现；level=4 可以给出完整诊断、"
     "修复策略和代码级解释。不要声称已经运行过代码；相关时应精确说明不变量、复杂度、"
-    "UB 和边界情况。除非用户显式要求其他语言，否则解释性内容使用简体中文；代码、"
+    "UB 和边界情况。分析示例或反例时，必须区分按题意推导的正确结果与当前源码的"
+    "实际行为；源码可能存在缺陷，不能把其输出当作题意的正确答案。未执行的源码行为"
+    "应说明是手工推导；涉及 UB 或信息不足时，不得断言唯一输出。上述分析仍须遵守"
+    "当前提示披露等级，不得为了对比结果而泄露超出等级的关键性质、转化或实现。"
+    "除非用户显式要求其他语言，否则解释性内容使用简体中文；代码、"
     "算法名和复杂度表达无需翻译。"
 )
 
@@ -2322,10 +2361,11 @@ class ServiceAIMixin:
                         max_tokens=_max_output_tokens(route),
                         temperature=0.1,
                     )
+                    merge_usage(usage, result.usage)
                     repair_attempts = _observed_repair_attempts(result, repair_attempts)
                     try:
                         ir = validate_organize_ir(result.data, allowed_problem_keys=keys)
-                    except AIPlanImportError:
+                    except AIPlanImportError as validation_exc:
                         if repair_attempts >= _validation_repair_limit(route):
                             raise
                         repair_attempts = 1
@@ -2334,6 +2374,9 @@ class ServiceAIMixin:
                                 messages,
                                 error_code="invalid_plan_organize_ir",
                                 schema_hint="title + groups(topic,due_date,problem_keys)",
+                                validation_feedback=(str(validation_exc).split(":", 1)[0][:240]
+                                    if str(validation_exc).startswith("AI 整理结果")
+                                    else "检查字段类型、非空分组、日期顺序；输入题号必须恰好出现一次。"),
                             ),
                             json_schema=ORGANIZE_RESPONSE_SCHEMA,
                             schema_name="acm_plan_organize_v2",
@@ -2345,6 +2388,7 @@ class ServiceAIMixin:
                             max_tokens=_max_output_tokens(route),
                             temperature=0.1,
                         )
+                        merge_usage(usage, result.usage)
                         ir = validate_organize_ir(result.data, allowed_problem_keys=keys)
                     repair_attempts = _observed_repair_attempts(result, repair_attempts)
                     if cache_key is not None and cache_policy is not None:
@@ -2377,19 +2421,20 @@ class ServiceAIMixin:
                     error_code=getattr(exc, "code", type(exc).__name__),
                 )
                 error = self._plan_import_error(exc)
-                usage = result.usage if result is not None else dict(getattr(exc, "usage", {}) or {})
+                if isinstance(exc, ProviderError):
+                    merge_usage(usage, exc.usage)
                 with Database(self.paths.database) as db:
                     db.update_ai_run(
                         run_id,
                         status="failed",
-                        finish_reason=(result.finish_reason if result is not None else getattr(exc, "finish_reason", None)),
+                        finish_reason=(getattr(exc, "finish_reason", None) if isinstance(exc, ProviderError) else result.finish_reason if result is not None else None),
                         usage=usage,
                         error=error,
                         **(
-                            self._governance_storage_args(result, route)
-                            if result is not None
-                            else self._governance_storage_args(exc, route)
+                            self._governance_storage_args(exc, route)
                             if isinstance(exc, ProviderError)
+                            else self._governance_storage_args(result, route)
+                            if result is not None
                             else {}
                         ),
                         completed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -2421,13 +2466,12 @@ class ServiceAIMixin:
                         },
                     )
             else:
-                usage = result.usage
                 with Database(self.paths.database) as db:
                     db.update_ai_run(
                         run_id,
                         status="complete",
                         finish_reason=result.finish_reason,
-                        usage=result.usage,
+                        usage=usage,
                         resolved_model=result.model or None,
                         resolved_reasoning_strength=route.reasoning_strength,
                         local_cache_status=local_cache_status,
@@ -3022,7 +3066,16 @@ class ServiceAIMixin:
                 for index, slot in enumerate(recommendation_slots(selected_count))
             ],
             "eligible_focus_topics": tier_topics,
-            "accepted_problem_summary": profile["accepted_summaries"],
+            "focus_topic_constraints": _recommendation_topic_constraints(
+                selected_count, len(tier_topics)
+            ),
+            "accepted_topic_counts": profile["topic_counts"],
+            "accepted_problem_count": profile["accepted_problem_count"],
+            "accepted_problem_summary": sorted(
+                profile["accepted_summaries"],
+                key=lambda item: (str(item["accepted_date"] or ""), item["problem_key"]),
+                reverse=True,
+            )[:AI_RECOMMENDATION_HISTORY_LIMIT],
             "candidates": [
                 {
                     "problem_key": item["problem_key"],
@@ -3030,13 +3083,16 @@ class ServiceAIMixin:
                     "difficulty": item.get("equivalent_rating"),
                     "tags": item.get("tags", []),
                     "knowledge_topics": item["knowledge_topics"],
-                    "slot_scores": item.get("slot_scores") or {
-                        str(item.get("slot") or "main"): {
-                            "score": item.get("score"),
-                            "breakdown": item.get("breakdown", {}),
-                        }
+                    "slot_scores": {
+                        slot: {"score": score.get("score"), "difficulty_target": score.get("difficulty_target")}
+                        for slot, score in item["slot_scores"].items()
                     },
-                    "deterministic_reasons": item.get("reasons", []),
+                    "eligible_slots": [
+                        slot for slot, target in difficulty_targets.items()
+                        if item.get("equivalent_rating") is not None
+                        and abs(int(item["equivalent_rating"]) - int(target))
+                        <= AI_RECOMMENDATION_DIFFICULTY_TOLERANCE
+                    ],
                 }
                 for item in outbound
             ],
@@ -3048,11 +3104,19 @@ class ServiceAIMixin:
             '"training_focus":"..."}],"risk_warning":"..."}. '
             "只能选择 candidates 中已有的 problem_key；topic 必须属于该候选的 "
             "knowledge_topics，且必须列在 focus_topics 中。不得重复或虚构资格。"
+            "ranked 必须恰好 requested_count 项。每个位置只能选择 eligible_slots "
+            "包含该位置 slot 基础名（去掉序号）的候选，不需要自行重复计算难度资格。"
+            "accepted_topic_counts 是完整历史的权威板块计数；accepted_problem_summary "
+            "只是最近最多12题的示例，不代表全量历史。"
             "查漏补缺只使用低覆盖板块，专项强化只使用高覆盖板块。"
             "ranked 的顺序必须对应 slot_sequence；每个位置所选题目的等效难度必须位于 "
             "difficulty_target 正负 difficulty_tolerance 范围内。范围内的难度接近程度"
             "只是软排序偏好，不要求选择声明板块中绝对最接近目标的候选。"
-            "推荐至少两题时优先覆盖 2 至 3 个板块，任一板块不得超过一半（向上取整）。"
+            "focus_topics 必须取自 eligible_focus_topics，去重后的数量必须位于 "
+            "focus_topic_constraints 的 min_focus_topics 与 max_focus_topics 闭区间内；"
+            "上下限相等时必须恰好取该数量。focus_topics 必须恰好等于入选题 topic 的去重集合。"
+            "max_problems_per_topic 非 null 时，每个板块入选题数不得超过该值；"
+            "为 null 时不施加单板块题量限制。"
             "除非用户显式要求其他语言，否则解释性内容使用简体中文；"
             "代码、算法名和复杂度表达无需翻译。\n"
             + _stable_json(request_data)
@@ -3096,7 +3160,11 @@ class ServiceAIMixin:
                 taxonomy_version=TAXONOMY_VERSION,
                 correctness_inputs={
                     "candidate_eligibility": request_data["candidates"],
-                    "accepted_profile": request_data["accepted_problem_summary"],
+                    "accepted_profile": {
+                        "counts": request_data["accepted_topic_counts"],
+                        "total": request_data["accepted_problem_count"],
+                        "examples": request_data["accepted_problem_summary"],
+                    },
                     "difficulty_policy": request_data["slot_sequence"],
                     "request_controls": {
                         "count": int(count),
@@ -3154,6 +3222,7 @@ class ServiceAIMixin:
         result = None
         repair_attempts = 0
         provider_client = None
+        recommendation_usage: dict[str, Any] = {}
         try:
             if cache_claim_error is not None:
                 raise cache_claim_error
@@ -3180,6 +3249,7 @@ class ServiceAIMixin:
                 )
             )
             repair_attempts = _observed_repair_attempts(result, repair_attempts)
+            merge_usage(recommendation_usage, result.usage)
             try:
                 output, details, focus_topics = _validate_recommendation_payload(
                     result.data,
@@ -3188,7 +3258,7 @@ class ServiceAIMixin:
                     selected_count=selected_count,
                     difficulty_targets=difficulty_targets,
                 )
-            except (ValueError, TypeError, KeyError):
+            except (ValueError, TypeError, KeyError) as validation_exc:
                 if (
                     cached_response is not None
                     or repair_attempts >= _validation_repair_limit(route)
@@ -3201,6 +3271,9 @@ class ServiceAIMixin:
                         messages,
                         error_code="invalid_ai_ranking",
                         schema_hint="focus_topics + ranked(problem_key,topic,ai_reason,training_focus) + risk_warning",
+                        validation_feedback=(str(validation_exc)[:240]
+                            if str(validation_exc).startswith(("AI 推荐", "AI 声明"))
+                            else "检查字段类型，以及候选的槽位、板块和数量约束。"),
                     ),
                     json_schema=RECOMMENDATION_RESPONSE_SCHEMA,
                     schema_name="acm_recommendation_v1",
@@ -3212,6 +3285,7 @@ class ServiceAIMixin:
                     max_tokens=_max_output_tokens(route),
                     temperature=0.2,
                 )
+                merge_usage(recommendation_usage, result.usage)
                 output, details, focus_topics = _validate_recommendation_payload(
                     result.data,
                     outbound=outbound,
@@ -3219,6 +3293,8 @@ class ServiceAIMixin:
                     selected_count=selected_count,
                     difficulty_targets=difficulty_targets,
                 )
+            if provider_client is not None:
+                result = replace(result, usage=dict(recommendation_usage))
             final_slots = recommendation_slots(selected_count)
             for index, item in enumerate(output):
                 self._apply_ai_slot(
@@ -3327,6 +3403,8 @@ class ServiceAIMixin:
             }
         except (ProviderError, ValueError, TypeError, KeyError) as exc:
             repair_attempts = _observed_repair_attempts(exc, repair_attempts)
+            if isinstance(exc, ProviderError):
+                merge_usage(recommendation_usage, exc.usage)
             self._release_exact_cache_flight(
                 cache_key,
                 owner_id=run_id,
@@ -3343,17 +3421,17 @@ class ServiceAIMixin:
                 db.update_ai_run(
                     run_id,
                     status="failed",
-                    usage=(
-                        result.usage
-                        if result is not None
-                        else dict(getattr(exc, "usage", {}) or {})
-                    ),
+                    usage=recommendation_usage,
                     error=error,
+                    resolved_model=(
+                        exc.model if isinstance(exc, ProviderError)
+                        else (result.model or None) if result is not None else None
+                    ),
                     **(
-                        self._governance_storage_args(result, route)
-                        if result is not None
-                        else self._governance_storage_args(exc, route)
+                        self._governance_storage_args(exc, route)
                         if isinstance(exc, ProviderError)
+                        else self._governance_storage_args(result, route)
+                        if result is not None
                         else {}
                     ),
                     completed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -3484,11 +3562,7 @@ class ServiceAIMixin:
                 db.update_ai_run(
                     run_id,
                     status="complete",
-                    usage=(
-                        result.usage
-                        if result is not None
-                        else dict(getattr(exc, "usage", {}) or {})
-                    ),
+                    usage=recommendation_usage,
                     fallback={
                         "version": 1,
                         "outcome": fallback_business,
@@ -3500,6 +3574,7 @@ class ServiceAIMixin:
             deterministic["ai"] = {
                 **common_ai,
                 "fallback": error,
+                "usage": recommendation_usage,
                 "focus_topics": _focus_topic_details(
                     fallback_topics,
                     accepted_counts=profile["topic_counts"],
@@ -4270,6 +4345,8 @@ class ServiceAIMixin:
                 coalesced, follower_run_id=follower_run_id
             )
         repair_attempts = 0
+        governed_client = None
+        result = None
         try:
             governed_client = self._provider_client(route=prepared["route"])
             result = governed_client.chat(
@@ -4322,12 +4399,15 @@ class ServiceAIMixin:
                     result.content, hint_level=hint_level
                 )
         except ProviderError as exc:
+            if governed_client is not None:
+                exc.usage = governed_client.usage_snapshot
             if exc.code in {
                 "missing_api_key", "authentication_error", "permission_denied",
                 "insufficient_balance", "invalid_provider", "invalid_model",
                 "invalid_configuration", "budget_exceeded", "cost_limit_exceeded",
                 "cost_limit_unknown",
             }:
+                self._fail_ai_message(prepared, exc)
                 raise
             unavailable_outcome = build_ai_outcome(
                 provider_outcome="failed",
@@ -4353,7 +4433,10 @@ class ServiceAIMixin:
                 "ai": {"outcome": unavailable_outcome},
             }
         except ValueError as exc:
-            error = ProviderError("invalid_coaching_content", str(exc))
+            error = ProviderError("invalid_coaching_content", str(exc),
+                usage=governed_client.usage_snapshot if governed_client is not None else {},
+                protocol_details={"governance": governed_client.governance_snapshot}
+                    if governed_client is not None else {})
             unavailable_outcome = build_ai_outcome(
                 provider_outcome="succeeded",
                 artifact_outcome="invalid",
@@ -4371,12 +4454,13 @@ class ServiceAIMixin:
                 "content": "",
                 "status": "unavailable",
                 "model": prepared["model"],
-                "usage": getattr(result, "usage", {}),
+                "usage": error.usage,
                 "ai_run_id": prepared["run_id"],
                 "ai": {
                     "outcome": unavailable_outcome
                 },
             }
+        result = replace(result, usage=governed_client.usage_snapshot)
         truncated = _output_was_truncated(result.finish_reason)
         terminal_outcome = build_ai_outcome(
             provider_outcome="succeeded",
@@ -4545,6 +4629,7 @@ class ServiceAIMixin:
             resolved_model: str | None = None
             completed = False
             governed_client = None
+            provider_stream = None
             repair_attempts = 0
             flight_key = prepared["coaching_flight_key"]
 
@@ -4616,21 +4701,22 @@ class ServiceAIMixin:
                         content = _validate_coaching_content(
                             result.content, hint_level=hint_level
                         )
-                    usage = dict(result.usage or {})
+                    usage = governed_client.usage_snapshot
                     finish_reason = result.finish_reason
                     resolved_model = result.model or None
                     yield publish({"event": "delta", "data": {"content": content}})
                     if usage:
                         yield publish({"event": "usage", "data": {"usage": usage}})
                 else:
-                    for event in governed_client.stream_chat(
+                    provider_stream = governed_client.stream_chat(
                         prepared["messages"],
                         model=prepared["model"],
                         thinking=prepared["thinking"],
                         reasoning_effort=prepared["effort"],
                         max_tokens=_max_output_tokens(prepared["route"]),
                         temperature=0.2,
-                    ):
+                    )
+                    for event in provider_stream:
                         if event.kind == "delta":
                             content += event.content
                             yield publish({"event": "delta", "data": {"content": event.content}})
@@ -4706,6 +4792,8 @@ class ServiceAIMixin:
             except GeneratorExit:
                 raise
             except ProviderError as exc:
+                if governed_client is not None:
+                    exc.usage = governed_client.usage_snapshot
                 terminal_finish_reason = exc.finish_reason or finish_reason
                 truncated_failure = _output_was_truncated(terminal_finish_reason)
                 self._fail_ai_message(prepared, exc, content=content, interrupted=bool(content))
@@ -4736,7 +4824,10 @@ class ServiceAIMixin:
                     },
                 })
             except ValueError as exc:
-                error = ProviderError("invalid_coaching_content", str(exc))
+                error = ProviderError("invalid_coaching_content", str(exc),
+                    usage=governed_client.usage_snapshot if governed_client is not None else {},
+                    protocol_details={"governance": governed_client.governance_snapshot}
+                        if governed_client is not None else {})
                 self._fail_ai_message(prepared, error)
                 completed = True
                 terminal_outcome = build_ai_outcome(
@@ -4759,7 +4850,13 @@ class ServiceAIMixin:
                     },
                 })
             finally:
+                if provider_stream is not None:
+                    # Charge interrupted provider work before persisting the
+                    # terminal run, even when the consumer disconnects on a delta.
+                    provider_stream.close()
                 if not completed:
+                    if governed_client is not None:
+                        usage = governed_client.usage_snapshot
                     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
                     with Database(self.paths.database) as db:
                         row = db.ai_message(prepared["assistant_message_id"])
@@ -4771,6 +4868,13 @@ class ServiceAIMixin:
                                     status="interrupted",
                                     model=prepared["model"],
                                     usage=usage,
+                                    completed_at=stamp,
+                                )
+                                db.update_ai_run(
+                                    prepared["run_id"],
+                                    status="interrupted",
+                                    finish_reason=finish_reason,
+                                    usage=usage,
                                     **(
                                         self._governance_storage_snapshot_args(
                                             governed_client.governance_snapshot,
@@ -4779,13 +4883,6 @@ class ServiceAIMixin:
                                         )
                                         if governed_client is not None else {}
                                     ),
-                                    completed_at=stamp,
-                                )
-                                db.update_ai_run(
-                                    prepared["run_id"],
-                                    status="interrupted",
-                                    finish_reason=finish_reason,
-                                    usage=usage,
                                     completed_at=stamp,
                                 )
                     _publish_coaching_event(
@@ -4989,12 +5086,16 @@ class ServiceAIMixin:
                 str(exc),
                 usage=total_usage,
             )
+            error.usage = dict(total_usage)
             self._fail_ai_message(
                 {
                     "assistant_message_id": assistant_message_id,
                     "run_id": run_id,
                     "route": route,
-                    "governance_value": result if result is not None else error,
+                    "governance_value": (
+                        error if isinstance(exc, ProviderError)
+                        else result if result is not None else error
+                    ),
                 },
                 error,
             )

@@ -45,6 +45,19 @@ _STRUCTURED_REPAIR_CODES = frozenset(
 )
 
 
+def _output_budget_exhausted(error: ProviderError) -> bool:
+    """Distinguish resource exhaustion from a semantic-format failure."""
+
+    markers = {"length", "max_tokens", "max_output_tokens", "max_completion_tokens"}
+    details = error.protocol_details
+    reason = details.get("incomplete_reason") if isinstance(details, Mapping) else None
+    return (
+        str(error.finish_reason or "").strip().lower() in markers
+        or str(reason or "").strip().lower() in markers
+        or str(error.code or "").strip().lower() in markers - {"length"}
+    )
+
+
 def _structured_repair_code(error: ProviderError) -> str | None:
     """Return a finite audit code for failures safe to repair semantically."""
 
@@ -52,13 +65,15 @@ def _structured_repair_code(error: ProviderError) -> str | None:
         400, 401, 402, 422
     }:
         return None
+    if _output_budget_exhausted(error):
+        # Governance does not grant a larger output allowance on repair,
+        # retry or fallback. Preserve the resource failure and its usage.
+        return None
     code = str(error.code or "").strip().lower()
     if code == "content_filter" or error.finish_reason == "content_filter":
         return None
     if code in _STRUCTURED_REPAIR_CODES:
         return code
-    if error.finish_reason == "length":
-        return "response_incomplete"
     return None
 
 
@@ -134,6 +149,11 @@ class GovernedProviderClient:
     @property
     def request_attempts(self) -> int:
         return self._requests
+
+    @property
+    def usage_snapshot(self) -> dict[str, Any]:
+        """Cumulative run usage, including unsuccessful repair calls."""
+        return normalize_usage(self._usage)
 
     @property
     def governance_snapshot(self) -> dict[str, Any]:
@@ -369,7 +389,13 @@ class GovernedProviderClient:
         for route_index, route in enumerate(self.routes):
             retry_index = 0
             while True:
-                self._before_request(route)
+                try:
+                    self._before_request(route)
+                except ProviderError as exc:
+                    # A block between retry/fallback attempts must retain the
+                    # requests already consumed within this logical call.
+                    exc.usage = dict(call_usage)
+                    raise
                 if selected_purpose == "validation_repair" and not repair_registered:
                     self._validation_repairs += 1
                     repair_registered = True
@@ -410,6 +436,7 @@ class GovernedProviderClient:
                     last_error = exc
                     retry_allowed = (
                         exc.retryable
+                        and not _output_budget_exhausted(exc)
                         and retry_index < int(self.budget["max_retries"])
                         and self._remaining_requests() > 0
                         and self._remaining_seconds() > 0
@@ -424,7 +451,8 @@ class GovernedProviderClient:
                         if delay > 0:
                             self._sleep(delay)
                         continue
-                    if exc.retryable and route_index + 1 < len(self.routes) and self._remaining_requests() > 0:
+                    if (exc.retryable and not _output_budget_exhausted(exc)
+                            and route_index + 1 < len(self.routes) and self._remaining_requests() > 0):
                         next_route = self.routes[route_index + 1]
                         self._fallbacks.append(
                             {
@@ -497,6 +525,7 @@ class GovernedProviderClient:
         validation_code: str | None = None,
         **options: Any,
     ) -> AIJsonResult:
+        requests_before = self._requests
         invoke_options = {
             **options, "json_schema": json_schema, "schema_name": schema_name
         }
@@ -535,7 +564,7 @@ class GovernedProviderClient:
                 combined = dict(initial_usage)
                 merge_usage(combined, repair_error.usage)
                 if combined:
-                    combined["provider_requests"] = self._requests
+                    combined["provider_requests"] = self._requests - requests_before
                     if self._validation_repairs > 0:
                         combined["protocol_repairs"] = max(
                             1, int(combined.get("protocol_repairs") or 0)
@@ -551,7 +580,7 @@ class GovernedProviderClient:
                 raise
             combined = dict(initial_usage)
             merge_usage(combined, repaired.usage)
-            combined["provider_requests"] = self._requests
+            combined["provider_requests"] = self._requests - requests_before
             combined["protocol_repairs"] = max(
                 1, int(combined.get("protocol_repairs") or 0)
             )
@@ -578,6 +607,7 @@ class GovernedProviderClient:
             emitted = False
             usage: dict[str, Any] = {}
             terminal_model: str | None = None
+            terminal_event: AIStreamEvent | None = None
             try:
                 route_options = self._route_options(method, route, options)
                 for event in method(messages, **self._options(method, route_options)):
@@ -585,7 +615,25 @@ class GovernedProviderClient:
                     if event.usage:
                         usage = normalize_usage(event.usage)
                     terminal_model = event.model or terminal_model
-                    yield event
+                    # Publish completion only after the consumed request has
+                    # been charged and checked, including input tokens.
+                    if event.kind == "done":
+                        terminal_event = event
+                    else:
+                        yield event
+            except GeneratorExit:
+                # A disconnect after the HTTP request began still consumed a
+                # request. Preserve observed usage; absent token counts stay
+                # unknown rather than becoming a zero-cost successful run.
+                after = self._request_counter(client)
+                delta = after - before if before is not None and after is not None else None
+                leg_usage = self._charge(usage, request_delta=delta)
+                self._leg(
+                    route, status="failed", usage=leg_usage,
+                    error_code="stream_interrupted", resolved_model=terminal_model,
+                    purpose="transport_retry" if retry_index > 0 else "initial",
+                )
+                raise
             except ProviderError as exc:
                 after = self._request_counter(client)
                 delta = after - before if before is not None and after is not None else None
@@ -598,6 +646,7 @@ class GovernedProviderClient:
                 if (
                     not emitted
                     and exc.retryable
+                    and not _output_budget_exhausted(exc)
                     and retry_index < int(self.budget["max_retries"])
                     and self._remaining_requests() > 0
                     and self._remaining_seconds() > 0
@@ -616,6 +665,16 @@ class GovernedProviderClient:
                     resolved_model=terminal_model,
                     purpose="transport_retry" if retry_index > 0 else "initial",
                 )
+                if self._requests > int(self.budget["max_requests"]):
+                    raise self._budget_error(
+                        "provider_request_count_exceeded", usage=self._usage
+                    )
+                if self._observed_tokens() > int(self.budget["max_total_tokens"]):
+                    raise self._budget_error(
+                        "observed_token_budget_exceeded", usage=self._usage
+                    )
+                if terminal_event is not None:
+                    yield replace(terminal_event, usage=self.usage_snapshot)
                 return
 
     def test_connection(self, model: str) -> ProviderHealth:

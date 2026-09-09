@@ -712,13 +712,18 @@ def command_close(args: argparse.Namespace, paths: Any) -> int:
         hint_level=hint,
         failure=failure,
         notes=notes,
+        attempt_id=getattr(args, "attempt_id", None),
     )
     human = f"已结束 {payload['close']['problem_id']}：{result}，状态 {payload['status']}"
     if payload["review_due"]:
         human += (
             f"；第 {payload['close']['review_stage']} 阶段复做日期 {payload['review_due']}"
         )
-    human += f"；归档候选已保存（未修改知识索引）：{payload['archive_candidate']}"
+    if payload.get("report_status") == "failed":
+        human += "；训练结果已保存，归档报告写入失败"
+        human += f"；使用 --attempt-id {payload['attempt_id']} 和相同参数重试生成报告"
+    else:
+        human += f"；归档候选已保存（未修改知识索引）：{payload['archive_candidate']}"
     _emit(payload, as_json=args.json, human=human)
     return 0
 
@@ -1244,6 +1249,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     close = sub.add_parser("close", help="结束 session 并记录复盘")
     close.add_argument("problem")
+    close.add_argument("--attempt-id", type=int, help="绑定训练记录，允许安全重试关闭请求")
     close.add_argument("--result", type=str.upper, choices=RESULTS)
     close.add_argument("--minutes", type=int)
     close.add_argument("--hint-level", type=int)
