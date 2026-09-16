@@ -36,7 +36,6 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 
 from .ai_policy import (
-    ALLOWED_MODELS,
     ALLOWED_REASONING_EFFORTS,
     DEFAULT_MODEL,
     DEFAULT_REASONING_EFFORT,
@@ -54,6 +53,7 @@ from .provider import (
     RetryCallback,
 )
 from .usage import merge_usage, normalize_usage
+from .provider_config import validate_model_id
 
 
 DEEPSEEK_ENDPOINT = "https://api.deepseek.com/chat/completions"
@@ -109,13 +109,12 @@ class DeepSeekProtocolError(DeepSeekError, ProviderProtocolError):
 
 
 def validate_model(model: str) -> str:
-    model = str(model).strip()
-    if model not in ALLOWED_MODELS:
-        allowed = ", ".join(sorted(ALLOWED_MODELS))
+    try:
+        return validate_model_id(model)
+    except ProviderConfigurationError as exc:
         raise DeepSeekConfigurationError(
-            "invalid_model", f"Unsupported DeepSeek model; allowed: {allowed}"
-        )
-    return model
+            exc.code, str(exc)
+        ) from None
 
 
 def validate_reasoning_effort(reasoning_effort: str) -> str:
@@ -295,6 +294,7 @@ class DeepSeekClient:
         self,
         api_key: str | None = None,
         *,
+        models: Mapping[str, CapabilityProfile] | None = None,
         transport: Transport | None = None,
         timeout: float = 60.0,
         retries: int = 2,
@@ -308,6 +308,7 @@ class DeepSeekClient:
             else str(os.environ.get("DEEPSEEK_API_KEY") or "").strip()
         )
         self._transport = transport or self._default_transport
+        self._models = dict(models or {})
         self.timeout = float(timeout)
         self.retries = max(0, int(retries))
         self._sleep = sleep
@@ -335,6 +336,10 @@ class DeepSeekClient:
 
     def capabilities(self, model: str) -> CapabilityProfile:
         selected = validate_model(model)
+        if selected in self._models:
+            return self._models[selected]
+        # Discovery determines model identity. Optional API features and token
+        # limits must come from the catalog, never from a versioned model name.
         return CapabilityProfile(
             text_chat=True,
             streaming=True,
@@ -343,12 +348,10 @@ class DeepSeekClient:
             thinking=True,
             prompt_cache=True,
             usage_cache_tokens=True,
-            max_context_tokens=1_000_000,
-            max_output_tokens=384_000,
             usage=True,
             stream_usage=True,
-            json_schema=selected == "deepseek-v4-flash",
-            evidence="verified_builtin",
+            json_schema=False,
+            evidence="declared",
         )
 
     def test_connection(self, model: str) -> ProviderHealth:
@@ -978,15 +981,14 @@ class DeepSeekClient:
         request_timeout: float | None = None,
         request_retries: int | None = None,
     ) -> JsonChatResult:
-        """Generate a schema-constrained object through Flash Responses API.
+        """Use Responses JSON Schema when the catalog declares support.
 
-        DeepSeek documents Responses JSON Schema only for v4 Flash.  Pro stays
-        on the existing Chat JSON Output path so its wire contract is not
-        guessed or silently ignored.
+        Other models use Chat JSON Output without assuming Responses support
+        from their names or release versions.
         """
 
         selected_model = validate_model(model)
-        if selected_model != "deepseek-v4-flash":
+        if not self.capabilities(selected_model).json_schema:
             fallback_result = self.chat_json(
                 messages,
                 model=selected_model,

@@ -164,8 +164,8 @@ def discover_openai_compatible_models(
 class OpenAICompatibleClient(DeepSeekClient):
     """Configured adapter that reuses the proven parser/retry wire core.
 
-    DeepSeek remains a separate public adapter; this class deliberately does
-    not inherit its fixed model allowlist or automatically emit its extensions.
+    DeepSeek remains a separate public adapter; this class uses its own catalog
+    and does not automatically emit DeepSeek-specific extensions.
     """
 
     def __init__(
@@ -187,13 +187,12 @@ class OpenAICompatibleClient(DeepSeekClient):
         self.origin = endpoint_origin(base_url)
         self.credential_origin = endpoint_origin(credential_origin or base_url)
         self.auth = validate_auth(auth)
-        self._models = dict(models)
         self.thinking_wire = str(thinking_wire or "none").strip().lower()
         if self.thinking_wire not in {"none", "deepseek"}:
             raise ProviderConfigurationError(
                 "invalid_provider", "thinking_wire must be none or deepseek"
             )
-        super().__init__(api_key=api_key, transport=transport, **options)
+        super().__init__(api_key=api_key, models=models, transport=transport, **options)
 
     def __repr__(self) -> str:
         return (

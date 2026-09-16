@@ -293,16 +293,16 @@ class ProviderRegistry:
         provider = route.provider
         secret, _source = self._secret(route.provider_id, provider)
         adapter = str(provider["adapter"])
+        models = {
+            model: capability_profile(provider, model)
+            for model in (provider.get("models") or {})
+        }
         if adapter == "deepseek":
             if endpoint_origin(provider["base_url"]) != "https://api.deepseek.com":
                 raise ProviderConfigurationError(
                     "invalid_endpoint", "the DeepSeek adapter is pinned to the official origin"
                 )
-            return DeepSeekClient(api_key=secret, timeout=timeout, retries=0)
-        models = {
-            model: capability_profile(provider, model)
-            for model in (provider.get("models") or {})
-        }
+            return DeepSeekClient(api_key=secret, models=models, timeout=timeout, retries=0)
         return OpenAICompatibleClient(
             api_key=secret,
             provider_id=route.provider_id,

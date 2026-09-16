@@ -42,7 +42,6 @@ from .ai_cache import (
     validate_cached_artifact,
 )
 from .ai_reliability import build_ai_outcome
-from .ai_policy import ALLOWED_MODELS
 from .ai_telemetry import load_price_catalog, price_catalog_hash
 from .ai_context import (
     AIContextError,
@@ -69,6 +68,7 @@ from .provider import (
     ProviderError,
 )
 from .provider_config import (
+    DEEPSEEK_CAPABILITIES,
     TASK_PROFILE_IDS,
     endpoint_origin,
     normalize_base_url,
@@ -1242,6 +1242,7 @@ class ServiceAIMixin:
         discovered: Sequence[str],
         *,
         preserve_evidence: bool,
+        adapter: str = "openai_compatible",
     ) -> dict[str, Any]:
         """Merge discovery without silently deleting models referenced by profiles."""
 
@@ -1254,7 +1255,12 @@ class ServiceAIMixin:
                 definition["available"] = True
             else:
                 definition = {
-                    "capabilities": dict(_DISCOVERED_MODEL_CAPABILITIES),
+                    "capabilities": (
+                        {**DEEPSEEK_CAPABILITIES, "json_schema": False,
+                         "max_context_tokens": None, "max_output_tokens": None}
+                        if adapter == "deepseek"
+                        else dict(_DISCOVERED_MODEL_CAPABILITIES)
+                    ),
                     "evidence": "declared",
                     "evidence_hash": None,
                     "verified_at": None,
@@ -1270,25 +1276,6 @@ class ServiceAIMixin:
             definition["available"] = False
             catalog[str(model)] = definition
         return catalog
-
-    @staticmethod
-    def _supported_discovered_models(
-        connection_id: str, discovered: Sequence[str]
-    ) -> list[str]:
-        models = list(discovered)
-        if connection_id != "deepseek":
-            return models
-        # The official ``/models`` response can advertise models this
-        # text-only adapter does not yet support (for example, an
-        # experimental vision model). Keep the supported built-in routes
-        # usable instead of rejecting a valid credential or model refresh.
-        supported = [model for model in models if model in ALLOWED_MODELS]
-        if not supported:
-            raise ProviderConfigurationError(
-                "no_supported_models",
-                "DeepSeek /models returned no models supported by this version",
-            )
-        return supported
 
     def ai_connection_upsert(
         self,
@@ -1365,7 +1352,6 @@ class ServiceAIMixin:
             discovered = discover_openai_compatible_models(
                 base_url=normalized_base, api_key=staged.credential.secret
             )
-            discovered = self._supported_discovered_models(selected_id, discovered)
             old_models = (
                 dict(current.get("models") or {}) if isinstance(current, Mapping) else {}
             )
@@ -1385,7 +1371,7 @@ class ServiceAIMixin:
                     "auth": auth,
                     "enabled": True,
                     "models": self._discovered_model_catalog(
-                        old_models, discovered, preserve_evidence=preserve
+                        old_models, discovered, preserve_evidence=preserve, adapter=adapter
                     ),
                 },
             )
@@ -1443,10 +1429,10 @@ class ServiceAIMixin:
         discovered = discover_openai_compatible_models(
             base_url=str(provider["base_url"]), api_key=secret
         )
-        discovered = self._supported_discovered_models(selected, discovered)
         updated = dict(provider)
         updated["models"] = self._discovered_model_catalog(
-            dict(provider.get("models") or {}), discovered, preserve_evidence=True
+            dict(provider.get("models") or {}), discovered, preserve_evidence=True,
+            adapter=str(provider["adapter"]),
         )
         config["ai"]["providers"][selected] = validate_provider(selected, updated)
         save_config(self.paths, config)
@@ -1629,7 +1615,11 @@ class ServiceAIMixin:
                     "message": "系统安全凭据库不可用。",
                 }
             ),
-            "allowed_models": sorted(ALLOWED_MODELS),
+            "allowed_models": sorted(
+                model for model, definition in
+                config["ai"]["providers"].get("deepseek", {}).get("models", {}).items()
+                if definition.get("available", True)
+            ),
             "settings": settings,
             "providers": provider_data["providers"],
             "connections": self.ai_connections()["connections"],

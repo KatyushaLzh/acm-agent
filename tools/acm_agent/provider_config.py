@@ -47,7 +47,6 @@ _CAPABILITY_KEYS = {
     "usage",
     "stream_usage",
 }
-_DEEPSEEK_MODEL_IDS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
 
 _DEFAULT_TASK_BUDGETS: dict[str, dict[str, int | float]] = {
     "recommendation": {
@@ -122,6 +121,8 @@ DEEPSEEK_CAPABILITIES: dict[str, Any] = {
 
 
 def default_provider_config() -> dict[str, Any]:
+    # Preserve offline bootstrap/legacy configuration. This snapshot is not an
+    # allowlist: connection discovery accepts new IDs and verifies them live.
     flash_capabilities = deepcopy(DEEPSEEK_CAPABILITIES)
     flash_capabilities["json_schema"] = True
     pro_capabilities = deepcopy(DEEPSEEK_CAPABILITIES)
@@ -634,18 +635,6 @@ def validate_provider(provider_id: Any, value: Any) -> dict[str, Any]:
             ),
             "available": _strict_bool(definition.get("available", True), label="available"),
         }
-    if adapter == "deepseek":
-        if set(normalized_models) - _DEEPSEEK_MODEL_IDS:
-            raise ProviderConfigurationError(
-                "invalid_model", "the official DeepSeek adapter received an unsupported model"
-            )
-        for definition in normalized_models.values():
-            definition["evidence"] = "verified_builtin"
-            definition["verified_capabilities"] = sorted(
-                key for key, value in definition["capabilities"].items()
-                if isinstance(value, bool) and value
-            )
-            definition["verified_reasoning_strengths"] = ["off", "medium", "high"]
     slot = validate_identifier(
         source.get("credential_slot") or selected_id, label="credential_slot"
     )

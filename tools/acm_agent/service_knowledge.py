@@ -865,7 +865,7 @@ class ServiceKnowledgeMixin:
                     "transport_api": (
                         "responses_json_schema"
                         if route.provider_id == "deepseek"
-                        and selected_model == "deepseek-v4-flash"
+                        and route.capabilities.json_schema
                         else "chat_json_object"
                     ),
                     "response_schema_hash": response_schema_hash,

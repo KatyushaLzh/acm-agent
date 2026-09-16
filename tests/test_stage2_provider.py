@@ -271,7 +271,10 @@ class DeepSeekResponsesTests(unittest.TestCase):
 
     def test_flash_structured_uses_responses_schema_and_normalizes_usage(self):
         transport = QueueTransport(Response(responses_result()))
-        client = DeepSeekClient(api_key="secret", transport=transport, retries=0)
+        client = DeepSeekClient(
+            api_key="secret", transport=transport, retries=0,
+            models={"deepseek-v4-flash": capabilities(json_schema=True)},
+        )
         result = client.structured(
             [{"role": "system", "content": "stable"}, {"role": "user", "content": "x"}],
             model="deepseek-v4-flash",
@@ -300,6 +303,7 @@ class DeepSeekResponsesTests(unittest.TestCase):
     def test_responses_incomplete_and_failed_are_typed_without_blind_retry(self):
         incomplete = DeepSeekClient(
             api_key="secret",
+            models={"deepseek-v4-flash": capabilities(json_schema=True)},
             transport=QueueTransport(
                 Response(responses_result(status="incomplete", reason="max_output_tokens"))
             ),
@@ -319,6 +323,7 @@ class DeepSeekResponsesTests(unittest.TestCase):
 
         failed = DeepSeekClient(
             api_key="secret",
+            models={"deepseek-v4-flash": capabilities(json_schema=True)},
             transport=QueueTransport(
                 Response(responses_result(
                     status="failed", error={"code": "resource_exhausted", "message": "busy"}
@@ -928,7 +933,7 @@ class Stage2ServiceManagementTests(unittest.TestCase):
             with self.assertRaisesRegex(ProviderConfigurationError, "recommendation"):
                 service.ai_connection_delete(connection_id=connection_id)
 
-    def test_builtin_deepseek_ignores_discovered_models_outside_its_allowlist(self):
+    def test_builtin_deepseek_discovers_new_models_without_an_allowlist(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             vault = ProviderCredentialVault(
@@ -943,7 +948,7 @@ class Stage2ServiceManagementTests(unittest.TestCase):
                 return_value=[
                     "deepseek-v4-flash",
                     "deepseek-v4-pro",
-                    "deepseek-v4-flash-vision-exp",
+                    "future-family-2032-beta",
                 ],
             ):
                 result = service.ai_connection_upsert(
@@ -952,18 +957,18 @@ class Stage2ServiceManagementTests(unittest.TestCase):
                     base_url="https://api.deepseek.com",
                     api_key="connection-secret",
                 )
-            self.assertEqual(result["models_discovered"], 2)
+            self.assertEqual(result["models_discovered"], 3)
             connection = next(
                 item for item in service.ai_connections()["connections"]
                 if item["id"] == "deepseek"
             )
             self.assertEqual(
                 {item["id"] for item in connection["models"]},
-                {"deepseek-v4-flash", "deepseek-v4-pro"},
+                {"deepseek-v4-flash", "deepseek-v4-pro", "future-family-2032-beta"},
             )
             self.assertEqual(vault.load("deepseek").secret, "connection-secret")
 
-    def test_builtin_deepseek_blank_key_reuses_secret_while_filtering_models(self):
+    def test_builtin_deepseek_blank_key_reuses_secret_with_new_models(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             vault = ProviderCredentialVault(
@@ -988,7 +993,7 @@ class Stage2ServiceManagementTests(unittest.TestCase):
                 return_value=[
                     "deepseek-v4-flash",
                     "deepseek-v4-pro",
-                    "deepseek-v4-flash-vision-exp",
+                    "future-family-2032-beta",
                 ],
             ):
                 result = service.ai_connection_upsert(
@@ -997,10 +1002,10 @@ class Stage2ServiceManagementTests(unittest.TestCase):
                     base_url="https://api.deepseek.com",
                     api_key="",
                 )
-            self.assertEqual(result["models_discovered"], 2)
+            self.assertEqual(result["models_discovered"], 3)
             self.assertEqual(vault.load("deepseek").secret, "existing-secret")
 
-    def test_builtin_deepseek_refresh_filters_extra_models(self):
+    def test_builtin_deepseek_refresh_preserves_new_models_and_marks_missing(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             vault = ProviderCredentialVault(
@@ -1024,22 +1029,24 @@ class Stage2ServiceManagementTests(unittest.TestCase):
                 "tools.acm_agent.service_ai.discover_openai_compatible_models",
                 return_value=[
                     "deepseek-v4-flash",
-                    "deepseek-v4-flash-vision-exp",
+                    "future-family-2032-beta",
                 ],
             ):
                 result = service.ai_connection_refresh(connection_id="deepseek")
-            self.assertEqual(result["models_discovered"], 1)
+            self.assertEqual(result["models_discovered"], 2)
             connection = next(
                 item for item in service.ai_connections()["connections"]
                 if item["id"] == "deepseek"
             )
             models = {item["id"]: item for item in connection["models"]}
-            self.assertEqual(set(models), {"deepseek-v4-flash", "deepseek-v4-pro"})
+            self.assertEqual(set(models), {"deepseek-v4-flash", "deepseek-v4-pro", "future-family-2032-beta"})
+            self.assertEqual(models["future-family-2032-beta"]["evidence"], "declared")
+            self.assertEqual(models["future-family-2032-beta"]["verified_capabilities"], [])
             self.assertTrue(models["deepseek-v4-flash"]["available"])
             self.assertFalse(models["deepseek-v4-pro"]["available"])
             self.assertEqual(vault.load("deepseek").secret, "existing-secret")
 
-    def test_builtin_deepseek_all_unknown_models_fail_without_mutation(self):
+    def test_builtin_deepseek_replacement_catalog_retains_unavailable_profile_models(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             vault = ProviderCredentialVault(
@@ -1059,29 +1066,20 @@ class Stage2ServiceManagementTests(unittest.TestCase):
                     base_url="https://api.deepseek.com",
                     api_key="existing-secret",
                 )
-            original = load_config(service.paths)
+            original_profiles = load_config(service.paths)["ai"]["profiles"]
             with patch(
                 "tools.acm_agent.service_ai.discover_openai_compatible_models",
-                return_value=["deepseek-v4-flash-vision-exp"],
+                return_value=["future-family-2032-beta"],
             ):
-                with self.assertRaises(ProviderConfigurationError) as captured:
-                    service.ai_connection_upsert(
-                        connection_id="deepseek",
-                        display_name="DeepSeek Official",
-                        base_url="https://api.deepseek.com",
-                        api_key="replacement-secret",
-                    )
-            self.assertEqual(captured.exception.code, "no_supported_models")
-            self.assertEqual(load_config(service.paths), original)
-            self.assertEqual(vault.load("deepseek").secret, "existing-secret")
-            with patch(
-                "tools.acm_agent.service_ai.discover_openai_compatible_models",
-                return_value=["deepseek-v4-flash-vision-exp"],
-            ):
-                with self.assertRaises(ProviderConfigurationError) as captured:
-                    service.ai_connection_refresh(connection_id="deepseek")
-            self.assertEqual(captured.exception.code, "no_supported_models")
-            self.assertEqual(load_config(service.paths), original)
+                result = service.ai_connection_refresh(connection_id="deepseek")
+            self.assertEqual(result["models_discovered"], 1)
+            config = load_config(service.paths)
+            self.assertEqual(config["ai"]["profiles"], original_profiles)
+            models = config["ai"]["providers"]["deepseek"]["models"]
+            self.assertTrue(models["future-family-2032-beta"]["available"])
+            self.assertEqual(models["future-family-2032-beta"]["evidence"], "declared")
+            self.assertFalse(models["deepseek-v4-flash"]["available"])
+            self.assertFalse(models["deepseek-v4-pro"]["available"])
             self.assertEqual(vault.load("deepseek").secret, "existing-secret")
 
     def test_simplified_connection_discovery_failure_rolls_back_config_and_credential(self):

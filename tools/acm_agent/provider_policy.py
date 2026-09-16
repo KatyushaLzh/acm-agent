@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-from .ai_policy import ALLOWED_MODELS, ALLOWED_REASONING_EFFORTS
+from .ai_policy import ALLOWED_REASONING_EFFORTS
 from .provider import ProviderConfigurationError
+from .provider_config import validate_model_id
 
 
 def validate_model(model: str) -> str:
-    selected = str(model).strip()
-    if selected not in ALLOWED_MODELS:
-        allowed = ", ".join(sorted(ALLOWED_MODELS))
-        raise ProviderConfigurationError(
-            "invalid_model", f"Unsupported DeepSeek model; allowed: {allowed}"
-        )
-    return selected
+    # Catalog membership and availability are enforced by ProviderRegistry.
+    return validate_model_id(model)
 
 
 def validate_reasoning_effort(reasoning_effort: str) -> str:

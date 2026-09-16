@@ -7,12 +7,15 @@ import socket
 import tempfile
 import unittest
 import urllib.error
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 from tools.acm_agent.config import CONFIG_VERSION, Paths, load_config
 from tools.acm_agent.deepseek import (
     DEEPSEEK_ENDPOINT,
+    DEEPSEEK_RESPONSES_ENDPOINT,
     DeepSeekClient,
     DeepSeekConfigurationError,
     DeepSeekError,
@@ -312,11 +315,63 @@ class DeepSeekClientTests(unittest.TestCase):
         with self.assertRaises(DeepSeekConfigurationError) as missing:
             client.chat([{"role": "user", "content": "hi"}])
         self.assertEqual(missing.exception.code, "missing_api_key")
-        with self.assertRaises(DeepSeekConfigurationError) as invalid:
-            DeepSeekClient("x", transport=QueueTransport()).chat(
-                [{"role": "user", "content": "hi"}], model="deepseek-chat"
-            )
-        self.assertEqual(invalid.exception.code, "invalid_model")
+        for model in ("", "bad model", "bad\nmodel", "x" * 129):
+            with self.subTest(model=model):
+                with self.assertRaises(DeepSeekConfigurationError) as invalid:
+                    DeepSeekClient("x", transport=QueueTransport()).chat(
+                        [{"role": "user", "content": "hi"}], model=model
+                    )
+                self.assertEqual(invalid.exception.code, "invalid_model")
+
+    def test_new_model_ids_are_sent_without_a_release_specific_allowlist(self) -> None:
+        model = f"future-{uuid4().hex}"
+        transport = QueueTransport(FakeResponse(completion("ok", model=model)))
+        client = DeepSeekClient("key", transport=transport, retries=0)
+        result = client.chat([{"role": "user", "content": "hi"}], model=model)
+        payload = json.loads(transport.requests[0][0].data)
+        self.assertEqual(payload["model"], model)
+        self.assertEqual(result.requested_model, model)
+        self.assertEqual(result.resolved_model, model)
+        capabilities = client.capabilities(model)
+        self.assertEqual(capabilities.evidence, "declared")
+        self.assertFalse(capabilities.json_schema)
+        self.assertIsNone(capabilities.max_context_tokens)
+        self.assertIsNone(capabilities.max_output_tokens)
+
+    def test_structured_routes_by_catalog_capability_for_arbitrary_model_ids(self) -> None:
+        model = f"future-{uuid4().hex}"
+        baseline = DeepSeekClient("key").capabilities(model)
+        profile = replace(baseline, json_schema=True, evidence="verified")
+        responses = json.dumps({
+            "id": "response-future",
+            "model": model,
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": '{"ok":true}'}],
+            }],
+        }).encode()
+        transport = QueueTransport(FakeResponse(responses))
+        catalog = {model: profile}
+        client = DeepSeekClient("key", models=catalog, transport=transport, retries=0)
+        catalog.clear()
+        self.assertEqual(client.capabilities(model), profile)
+        result = client.structured(
+            [{"role": "user", "content": "Return JSON."}],
+            model=model, schema_name="result", json_schema={"type": "object"},
+        )
+        request = transport.requests[0][0]
+        self.assertEqual(request.full_url, DEEPSEEK_RESPONSES_ENDPOINT)
+        self.assertEqual(json.loads(request.data)["model"], model)
+        self.assertEqual(result.data, {"ok": True})
+
+        fallback = QueueTransport(FakeResponse(completion('{"ok":true}', model=model)))
+        result = DeepSeekClient("key", transport=fallback, retries=0).structured(
+            [{"role": "user", "content": "Return JSON."}],
+            model=model, schema_name="result", json_schema={"type": "object"},
+        )
+        self.assertEqual(fallback.requests[0][0].full_url, DEEPSEEK_ENDPOINT)
+        self.assertEqual(result.provider_metadata["structured_format"], "json_object")
 
     def test_retryable_http_status_retries_but_auth_does_not(self) -> None:
         rate_limited = urllib.error.HTTPError(
