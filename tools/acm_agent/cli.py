@@ -253,6 +253,42 @@ def command_ai_settings(args: argparse.Namespace, paths: Any) -> int:
     return 0
 
 
+def command_ai_connection_detect(args: argparse.Namespace, paths: Any) -> int:
+    secret = (str(os.environ.get(args.from_env) or "") if args.from_env
+              else getpass.getpass("API Key（编辑时留空保留）: "))
+    if args.from_env and not secret:
+        raise ValueError("指定环境变量未提供 API Key")
+    headers = json.loads(args.headers_file.read_text(encoding="utf-8-sig")) if args.headers_file else {}
+    if not isinstance(headers, dict) or any(not isinstance(value, str) for value in headers.values()):
+        raise ValueError("headers-file 必须包含字符串值的 JSON 对象")
+    values: dict[str, Any] = dict(display_name=args.name, base_url=args.base_url,
+        adapter=args.adapter, api_key=secret, manual_models=args.model or [], headers=headers)
+    if args.connection_id:
+        values["connection_id"] = args.connection_id
+    if args.auth_type != "auto":
+        values["auth"] = ({"type": "bearer"} if args.auth_type == "bearer"
+                          else {"type": "header", "header": args.header_name or "x-api-key"})
+    payload = _service(paths).ai_connection_detect(**values)
+    status = {"needs_model": "待补充模型 ID", "needs_verification": "待验证", "ready": "已就绪"}.get(payload.get("state"), "检测完成")
+    notes = "；".join(str(item) for item in payload.get("warnings", []))
+    _emit(payload, as_json=args.json, human=f"连接{status}。{notes}")
+    return 0
+
+
+def command_ai_connection_list(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_connections()
+    lines = [f"{item['id']}  {item.get('display_name', '')}  {item.get('state', item.get('connection_state', item.get('status', '')))}"
+             for item in payload["connections"]]
+    _emit(payload, as_json=args.json, human="\n".join(lines) or "暂无模型连接。")
+    return 0
+
+
+def command_ai_connection_refresh(args: argparse.Namespace, paths: Any) -> int:
+    payload = _service(paths).ai_connection_refresh(connection_id=args.connection_id)
+    _emit(payload, as_json=args.json, human="模型目录已刷新；手填模型保留。")
+    return 0
+
+
 def command_ai_provider_list(args: argparse.Namespace, paths: Any) -> int:
     payload = _service(paths).ai_providers()
     lines = [
@@ -1013,6 +1049,27 @@ def build_parser() -> argparse.ArgumentParser:
     ai_settings.add_argument("--json", action="store_true")
     ai_settings.set_defaults(handler=command_ai_settings)
 
+    ai_connection = ai_sub.add_parser("connection", help="自动检测与管理模型连接")
+    ai_connection_sub = ai_connection.add_subparsers(dest="connection_command", required=True)
+    ai_connection_detect = ai_connection_sub.add_parser("detect", help="发现模型并检测连接，可能产生少量 API 调用")
+    ai_connection_detect.add_argument("--connection-id")
+    ai_connection_detect.add_argument("--name", required=True)
+    ai_connection_detect.add_argument("--base-url", required=True)
+    ai_connection_detect.add_argument("--adapter", choices=("auto", "openai_compatible", "openai_responses", "anthropic"), default="auto")
+    ai_connection_detect.add_argument("--model", action="append", help="手填模型 ID，可重复")
+    ai_connection_detect.add_argument("--auth-type", choices=("auto", "bearer", "header"), default="auto")
+    ai_connection_detect.add_argument("--header-name")
+    ai_connection_detect.add_argument("--headers-file", type=Path, help="非敏感请求头 JSON 文件")
+    ai_connection_detect.add_argument("--from-env", help="从指定环境变量读取 API Key，否则安全提示输入")
+    ai_connection_detect.add_argument("--json", action="store_true")
+    ai_connection_detect.set_defaults(handler=command_ai_connection_detect)
+    ai_connection_list = ai_connection_sub.add_parser("list")
+    ai_connection_list.add_argument("--json", action="store_true")
+    ai_connection_list.set_defaults(handler=command_ai_connection_list)
+    ai_connection_refresh = ai_connection_sub.add_parser("refresh")
+    ai_connection_refresh.add_argument("connection_id")
+    ai_connection_refresh.add_argument("--json", action="store_true")
+    ai_connection_refresh.set_defaults(handler=command_ai_connection_refresh)
     ai_provider = ai_sub.add_parser("provider", help="管理模型 Provider")
     ai_provider_sub = ai_provider.add_subparsers(dest="provider_command", required=True)
     ai_provider_list = ai_provider_sub.add_parser("list")
@@ -1021,7 +1078,7 @@ def build_parser() -> argparse.ArgumentParser:
     ai_provider_set = ai_provider_sub.add_parser("set")
     ai_provider_set.add_argument("provider_id")
     ai_provider_set.add_argument("--name", required=True)
-    ai_provider_set.add_argument("--adapter", choices=("deepseek", "openai_compatible"), default="openai_compatible")
+    ai_provider_set.add_argument("--adapter", choices=("deepseek", "openai_compatible", "openai_responses", "anthropic"), default="openai_compatible")
     ai_provider_set.add_argument("--base-url", required=True)
     ai_provider_set.add_argument("--credential-slot", required=True)
     ai_provider_set.add_argument("--models-file", type=Path, required=True)

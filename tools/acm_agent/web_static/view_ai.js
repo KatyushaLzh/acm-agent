@@ -364,6 +364,7 @@ async function previewKnowledgeSummary(attemptId, epoch) {
   const targetId = $("#knowledge-target").value;
   if (!targetId) throw new Error("请先选择或保存一个 Markdown 目标");
   const selection = knowledgeSchemaSelection();
+  await ensureSelectionVerified("summary", aiRequestSelection("summary"));
   const started = await api("/api/jobs/ai/knowledge/preview", { body: {
     attempt_id: attemptId,
     target_id: targetId,
@@ -497,6 +498,8 @@ async function requestAiRecommendations(button, aiMode = "gap_fill") {
       navigate("settings");
       return;
     }
+    await ensureSelectionVerified("recommendation", aiRequestSelection("recommendation"));
+    if (controller.signal.aborted || state.recommendationEpoch !== epoch) return;
     const planIds = $$("input[type=checkbox]:checked", $("#recommend-plan-options")).map(input => input.value);
     const started = await api("/api/jobs/ai/recommendations", { body: {
       mode: form.elements.mode.value,
@@ -879,8 +882,7 @@ async function repriceAiCosts(button) {
 
 function profileCredentialReady(status, profileId) {
   const profile = asObject(asObject(status?.profiles)[profileId]);
-  if (typeof profile.ready === "boolean") return profile.ready;
-  const provider = connectionRows(status).find(item => item.id === profile.provider_id);
+  const provider = connectionRows(status).find(item => item.id === (profile.model_ref?.provider_id || profile.provider_id));
   return Boolean(provider?.enabled !== false && provider?.credential?.detected && !provider?.credential?.error);
 }
 
@@ -888,6 +890,8 @@ function resetConnectionForm() {
   const form = $("#ai-connection-form");
   form.reset();
   form.elements.connection_id.value = "";
+  form.elements.adapter.disabled = false;
+  form.elements.adapter.value = "auto";
   form.elements.base_url.readOnly = false;
   form.elements.base_url.title = "";
   $("button[type=submit]", form).textContent = "添加连接";
@@ -906,7 +910,7 @@ function renderConnectionManagement(status) {
   if (!connections.length) {
     const empty = document.createElement("p");
     empty.className = "empty-state compact";
-    empty.textContent = "暂无模型连接。填写上方三个字段即可自动发现模型。";
+    empty.textContent = "暂无模型连接。填写上方连接信息即可自动发现模型。";
     container.append(empty);
     return;
   }
@@ -924,19 +928,25 @@ function renderConnectionManagement(status) {
     const url = document.createElement("span");
     url.textContent = connection.base_url || "";
     url.title = url.textContent;
-    identity.append(name, url);
+    const protocol = document.createElement("span");
+    protocol.textContent = ({auto: "自动识别", anthropic: "Anthropic Messages", openai_responses: "OpenAI Responses", deepseek: "DeepSeek", openai_compatible: "OpenAI Chat Completions"})[connection.adapter] || connection.adapter;
+    identity.append(name, url, protocol);
     const ready = connection.enabled !== false && connection.credential?.detected && !connection.credential?.error;
     const badge = document.createElement("span");
     badge.className = `badge ${ready ? "good" : "warn"}`;
-    badge.textContent = ready ? "凭据可用" : (connection.credential?.error ? "凭据错误" : "缺少凭据");
+    const connectionState = connection.state || connection.connection_state || connection.status;
+    badge.textContent = ready ? ({needs_model: "待补充模型", needs_verification: "待验证", ready: "已就绪"}[connectionState] || "待验证") : (connection.credential?.error ? "凭据错误" : "缺少凭据");
     heading.append(identity, badge);
     const models = document.createElement("div");
     models.className = "ai-connection-models";
     for (const model of connectionModels(connection)) {
       const chip = document.createElement("span");
       chip.className = `chip${model.available === false ? " unavailable" : ""}`;
-      chip.textContent = model.id;
-      chip.title = model.id;
+      const modes = [model.wire_profile?.streaming === "buffered" ? "非流式" : "",
+        model.wire_profile?.structured_output === "prompt_json" ? "兼容输出" : "",
+        model.source === "manual" ? "手填" : ""].filter(Boolean);
+      chip.textContent = `${model.id}${modes.length ? `（${modes.join(" · ")}）` : ""}`;
+      chip.title = chip.textContent;
       models.append(chip);
     }
     if (!models.childElementCount) models.textContent = "尚未发现模型";
@@ -955,7 +965,10 @@ function renderConnectionManagement(status) {
       button.textContent = label;
       actions.append(button);
     }
-    card.append(heading, models, actions);
+    const warnings = document.createElement("p");
+    warnings.className = "credential-detail";
+    warnings.textContent = (Array.isArray(connection.warnings) ? connection.warnings : []).join("；");
+    card.append(heading, models, warnings, actions);
     container.append(card);
   }
 }
@@ -967,13 +980,27 @@ async function saveConnection(form) {
   try {
     const connectionId = form.elements.connection_id.value.trim();
     if (!connectionId && !keyInput.value.trim()) throw new Error("新建连接时 API Key 不能为空");
-    await api("/api/ai/connections", { body: {
+    let headers = {};
+    try { headers = JSON.parse(form.elements.headers.value.trim() || "{}"); }
+    catch { throw new Error("请求头必须是 JSON 对象"); }
+    if (!headers || Array.isArray(headers) || typeof headers !== "object"
+      || Object.values(headers).some(value => typeof value !== "string")) throw new Error("请求头必须是字符串值的 JSON 对象");
+    const authType = form.elements.auth_type.value;
+    const started = await api("/api/jobs/ai/connections/detect", { body: {
       ...(connectionId ? { connection_id: connectionId } : {}),
       display_name: form.elements.display_name.value.trim(),
+      ...(!form.elements.adapter.disabled ? { adapter: form.elements.adapter.value } : {}),
       base_url: form.elements.base_url.value.trim(),
       api_key: keyInput.value,
+      manual_models: form.elements.manual_models.value.split(/[,\n]/).map(value => value.trim()).filter(Boolean),
+      ...(authType === "auto" ? {} : {auth: authType === "bearer" ? {type: "bearer"} : {type: "header", header: form.elements.header_name.value.trim() || "x-api-key"}}),
+      headers,
     } });
-    toast(connectionId ? "连接已更新" : "连接已添加", "模型列表已从标准 /models 自动发现。");
+    const jobId = jobIdOf(started);
+    if (!jobId) throw new Error("服务未返回连接检测任务");
+    const result = await waitForJob(jobId, "正在发现模型并检测连接…");
+    const notes = Array.isArray(result?.warnings) ? result.warnings.join("；") : "";
+    toast(connectionId ? "连接已更新" : "连接已保存", notes || "请查看连接状态；需要时补填模型 ID，首次选择任务模型会自动验证。");
     resetConnectionForm();
     await loadAiStatus();
   } finally {
@@ -988,6 +1015,12 @@ function editConnection(connectionId) {
   const form = $("#ai-connection-form");
   form.elements.connection_id.value = connection.id;
   form.elements.display_name.value = connection.display_name || connection.id;
+  form.elements.adapter.value = connection.protocol_mode === "auto" ? "auto" : connection.adapter;
+  form.elements.manual_models.value = connectionModels(connection).filter(model => model.source === "manual").map(model => model.id).join("\n");
+  form.elements.auth_type.value = connection.auth_mode === "auto" ? "auto" : connection.auth?.type || "auto";
+  form.elements.header_name.value = connection.auth?.header || "";
+  form.elements.headers.value = Object.keys(asObject(connection.headers)).length ? JSON.stringify(connection.headers, null, 2) : "";
+  form.elements.adapter.disabled = Boolean(connection.builtin);
   form.elements.base_url.value = connection.base_url || "";
   form.elements.base_url.readOnly = Boolean(connection.builtin);
   form.elements.base_url.title = connection.builtin ? "内置 DeepSeek 固定使用官方 Base URL" : "";
@@ -1231,6 +1264,7 @@ function parseSseBlock(block) {
 }
 
 async function streamAiChat(message, mode, hintLevel) {
+  await ensureSelectionVerified("coaching", aiRequestSelection("coaching"));
   const conversationId = await ensureAiConversation();
   if (!conversationId) return false;
   const problemKey = state.aiProblemKey; const epoch = state.aiEpoch;

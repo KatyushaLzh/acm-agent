@@ -62,6 +62,7 @@ from .ai_context import (
 from .config import DEFAULT_CONFIG, load_config, save_config
 from .credentials import CredentialStoreError
 from .openai_compatible import discover_openai_compatible_models
+from .provider_detection import DetectionBudget, discover_models, normalize_endpoint, protocol_candidates, protocol_auth
 from .provider import (
     OUTPUT_TOKEN_LIMIT_MESSAGE,
     ProviderConfigurationError,
@@ -73,6 +74,8 @@ from .provider_config import (
     endpoint_origin,
     normalize_base_url,
     validate_auth,
+    validate_provider_headers,
+    validate_model_id,
     validate_identifier,
     validate_provider,
     validate_ai_policy,
@@ -1183,6 +1186,9 @@ class ServiceAIMixin:
                 {
                     "id": model,
                     "available": bool(definition.get("available", True)),
+                    "source": definition.get("source", "discovered"),
+                    "wire_profile": dict(definition.get("wire_profile") or {}),
+                    "effective_capabilities": dict(definition.get("effective_capabilities") or {}),
                     "capabilities": dict(definition["capabilities"]),
                     "evidence": definition.get("evidence", "declared"),
                     "evidence_hash": definition.get("evidence_hash"),
@@ -1202,6 +1208,10 @@ class ServiceAIMixin:
                 {
                     "id": provider_id,
                     "name": provider["name"],
+                    "state": provider.get("state", "ready"),
+                    "protocol_mode": provider.get("protocol_mode", "explicit"),
+                    "auth_mode": provider.get("auth_mode", "explicit"),
+                    "headers": dict(provider.get("headers") or {}),
                     "adapter": provider["adapter"],
                     "base_url": provider["base_url"],
                     "origin": endpoint_origin(provider["base_url"]),
@@ -1222,7 +1232,13 @@ class ServiceAIMixin:
             {
                 "id": provider["id"],
                 "display_name": provider["name"],
+                "state": provider.get("state", "ready"),
+                "protocol_mode": provider.get("protocol_mode", "explicit"),
+                "auth_mode": provider.get("auth_mode", "explicit"),
+                "auth": dict(provider.get("auth") or {}),
+                "headers": dict(provider.get("headers") or {}),
                 "base_url": provider["base_url"],
+                "adapter": provider["adapter"],
                 "builtin": provider["id"] == "deepseek",
                 "enabled": provider["enabled"],
                 "credential": {
@@ -1243,8 +1259,9 @@ class ServiceAIMixin:
         *,
         preserve_evidence: bool,
         adapter: str = "openai_compatible",
+        discovery_complete: bool = True,
     ) -> dict[str, Any]:
-        """Merge discovery without silently deleting models referenced by profiles."""
+        """Replace discovered entries only after a complete directory response."""
 
         selected = set(discovered)
         catalog: dict[str, Any] = {}
@@ -1272,10 +1289,31 @@ class ServiceAIMixin:
         for model, previous in existing.items():
             if model in selected or not isinstance(previous, Mapping):
                 continue
+            if discovery_complete and previous.get("source") != "manual":
+                continue
             definition = deepcopy(dict(previous))
-            definition["available"] = False
+            if not preserve_evidence:
+                definition.update(
+                    evidence="declared", evidence_hash=None, verified_at=None,
+                    verified_capabilities=[], verified_reasoning_strengths=[],
+                )
             catalog[str(model)] = definition
         return catalog
+
+    @staticmethod
+    def _discover_connection_models(
+        base_url: str, api_key: str, *, adapter: str
+    ) -> tuple[str, list[str]]:
+        resolved, hint = normalize_endpoint(base_url)
+        last_error = None
+        for protocol, address in protocol_candidates(resolved, adapter, hint):
+            try:
+                return address, discover_models(address, api_key, adapter=protocol)
+            except ProviderConfigurationError as exc:
+                last_error = exc
+                if exc.status in {401, 403, 429} or (exc.status and exc.status >= 500):
+                    raise
+        raise last_error or ProviderConfigurationError("no_models", "需要手填模型 ID")
 
     def ai_connection_upsert(
         self,
@@ -1284,6 +1322,11 @@ class ServiceAIMixin:
         base_url: str,
         api_key: str | None,
         connection_id: str | None = None,
+        adapter: str | None = None,
+        manual_models: Sequence[str] | None = None,
+        auth: Mapping[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
+        _budget: Any = None,
     ) -> dict[str, Any]:
         """Create/update a user-facing connection as one rollback-safe transaction."""
 
@@ -1307,16 +1350,31 @@ class ServiceAIMixin:
             raise ProviderConfigurationError("invalid_provider", "connection does not exist")
 
         name = str(display_name or "").strip()
-        normalized_base = normalize_base_url(base_url)
-        auth = {"type": "bearer"}
+        if not name:
+            raise ProviderConfigurationError("invalid_provider", "显示名称不能为空")
+        normalized_base, hint = normalize_endpoint(base_url)
+        selected_headers = validate_provider_headers(headers if headers is not None else (current or {}).get("headers"))
+        supplied_auth = auth
+        manual = [validate_model_id(item) for item in (manual_models or [])]
+        budget = _budget or DetectionBudget()
         if selected_id == "deepseek":
+            if adapter not in (None, "deepseek"):
+                raise ProviderConfigurationError(
+                    "invalid_provider", "the built-in DeepSeek protocol cannot be changed"
+                )
             if normalized_base != "https://api.deepseek.com":
                 raise ProviderConfigurationError(
                     "invalid_provider", "the built-in DeepSeek origin cannot be changed"
                 )
             adapter = "deepseek"
         else:
-            adapter = "openai_compatible"
+            adapter = adapter if adapter is not None else (
+                str(current.get("adapter", "auto"))
+                if isinstance(current, Mapping) else "auto"
+            )
+            if adapter not in {"auto", "openai_compatible", "openai_responses", "anthropic"}:
+                raise ProviderConfigurationError("invalid_provider", "unsupported connection protocol")
+        auth = protocol_auth(hint or adapter, supplied_auth)
         slot = selected_id
         supplied_secret = str(api_key or "").strip()
 
@@ -1349,18 +1407,91 @@ class ServiceAIMixin:
             auth=auth,
         )
         try:
-            discovered = discover_openai_compatible_models(
-                base_url=normalized_base, api_key=staged.credential.secret
-            )
+            discovered = []
+            discovery_error = None
+            detected_auth = None
+            discovery_attempts = set()
+            for protocol, address in protocol_candidates(normalized_base, adapter, hint):
+                discovery_identity = (address, tuple(sorted(protocol_auth(protocol, supplied_auth).items())))
+                if discovery_identity in discovery_attempts:
+                    continue
+                discovery_attempts.add(discovery_identity)
+                try:
+                    discovered = discover_models(address, staged.credential.secret, adapter=protocol,
+                        auth=supplied_auth, headers=selected_headers, budget=budget)
+                    normalized_base = address
+                    discovery_error = None
+                    break
+                except ProviderConfigurationError as exc:
+                    discovery_error = exc
+                    if exc.status == 401 and supplied_auth is None:
+                        attempted_auth = protocol_auth(protocol)
+                        alternate_auth = {"type": "bearer"} if attempted_auth["type"] == "header" else {"type": "header", "header": "x-api-key"}
+                        alternate_identity = (address, tuple(sorted(alternate_auth.items())))
+                        if alternate_identity not in discovery_attempts:
+                            discovery_attempts.add(alternate_identity)
+                            try:
+                                discovered = discover_models(address, staged.credential.secret, adapter=protocol,
+                                    auth=alternate_auth, headers=selected_headers, budget=budget)
+                            except ProviderConfigurationError:
+                                raise exc
+                            normalized_base = address
+                            # Discovery identifies a conventional auth dialect;
+                            # only a subsequent inference proves the protocol.
+                            hint = "anthropic" if adapter == "auto" and alternate_auth["type"] == "header" else protocol
+                            detected_auth = alternate_auth
+                            discovery_error = None
+                            break
+                    if exc.status == 401 or exc.status == 429 or (exc.status and exc.status >= 500) or exc.retryable:
+                        raise
+                    if exc.code not in {"model_discovery_failed", "invalid_models_response", "no_models"}:
+                        raise
+                    if exc.status == 403:
+                        break
+            if discovery_error is not None and not discovered and current is not None and not manual:
+                raise discovery_error
+
             old_models = (
                 dict(current.get("models") or {}) if isinstance(current, Mapping) else {}
             )
             preserve = bool(
                 isinstance(current, Mapping)
+                and (not supplied_secret or supplied_secret == existing_secret)
                 and str(current.get("adapter")) == adapter
                 and str(current.get("base_url")) == normalized_base
                 and dict(current.get("auth") or {}) == auth
+                and dict(current.get("headers") or {}) == selected_headers
+                and current.get("auth_mode", "explicit") == ("explicit" if supplied_auth else "auto")
             )
+            catalog = self._discovered_model_catalog(old_models, discovered, preserve_evidence=preserve, adapter=adapter, discovery_complete=discovery_error is None)
+            for model, metadata in getattr(discovered, "metadata", {}).items():
+                capabilities = metadata.get("capabilities") or {}
+                for source_key, destination_key in (("max_input_tokens", "max_context_tokens"), ("max_tokens", "max_output_tokens")):
+                    limit = metadata.get(source_key, capabilities.get(source_key))
+                    if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+                        catalog[model]["capabilities"][destination_key] = limit
+                thinking = capabilities.get("thinking") or {}
+                if isinstance(thinking, Mapping) and thinking.get("supported"):
+                    thinking_types = thinking.get("types") or {}
+                    adaptive = thinking_types.get("adaptive") if isinstance(thinking_types, Mapping) else None
+                    if adaptive is None:
+                        adaptive = thinking.get("adaptive")
+                    mode = "adaptive" if adaptive is True or isinstance(adaptive, Mapping) and adaptive.get("supported") else "manual"
+                    catalog[model]["wire_profile"] = {**dict(catalog[model].get("wire_profile") or {}), "reasoning_mode": mode}
+                    catalog[model]["capabilities"]["thinking"] = True
+                structured = capabilities.get("structured_outputs")
+                if structured is True or isinstance(structured, Mapping) and structured.get("supported"):
+                    catalog[model]["capabilities"]["json_schema"] = True
+            for model in manual:
+                entry = catalog.get(model) or self._discovered_model_catalog({}, [model], preserve_evidence=False, adapter=adapter)[model]
+                entry.update(source="manual", available=True)
+                catalog[model] = entry
+            if hint:
+                for definition in catalog.values():
+                    if not preserve:
+                        definition["wire_profile"] = {**dict(definition.get("wire_profile") or {}),
+                            "adapter": hint, "base_url": normalized_base,
+                            "auth": detected_auth or protocol_auth(hint, supplied_auth), "headers": selected_headers}
             provider = validate_provider(
                 selected_id,
                 {
@@ -1370,9 +1501,11 @@ class ServiceAIMixin:
                     "credential_slot": slot,
                     "auth": auth,
                     "enabled": True,
-                    "models": self._discovered_model_catalog(
-                        old_models, discovered, preserve_evidence=preserve, adapter=adapter
-                    ),
+                    "models": catalog,
+                    "protocol_mode": "auto" if adapter == "auto" else "explicit",
+                    "auth_mode": "explicit" if supplied_auth else "auto",
+                    "state": "needs_verification" if catalog else "needs_model",
+                    "headers": selected_headers,
                 },
             )
             providers[selected_id] = provider
@@ -1398,50 +1531,73 @@ class ServiceAIMixin:
             "ok": True,
             "connection_id": selected_id,
             "models_discovered": len(discovered),
+            "state": provider["state"],
+            "required_input": ["model"] if provider["state"] == "needs_model" else [],
+            "warnings": ["无法发现模型，请手填模型 ID。"] if not discovered else [],
             "connections": self.ai_connections()["connections"],
         }
 
     def ai_connection_refresh(self, *, connection_id: str) -> dict[str, Any]:
-        if self._credential_vault is None:
-            raise CredentialStoreError(
-                "模型连接需要可用的系统安全凭据库。",
-                code="credential_store_unavailable",
-            )
         config = load_config(self.paths, required=False)
         selected = validate_identifier(connection_id, label="connection_id")
         provider = config["ai"]["providers"].get(selected)
         if not isinstance(provider, Mapping):
             raise ProviderConfigurationError("invalid_provider", "connection does not exist")
-        slot = str(provider["credential_slot"])
-        binding = config["ai"]["credential_slots"][slot]
-        credential = self._credential_vault.load_bound(
-            slot,
-            provider_id=selected,
-            origin=str(binding["origin"]),
-            auth=dict(binding["auth"]),
-        )
-        secret = credential.secret if credential is not None else None
-        if not secret:
-            variable = str(binding.get("environment_variable") or "")
-            secret = str(os.environ.get(variable) or "").strip() or None
-        if not secret:
-            raise ProviderConfigurationError("missing_api_key", "connection credential is unavailable")
-        discovered = discover_openai_compatible_models(
-            base_url=str(provider["base_url"]), api_key=secret
-        )
-        updated = dict(provider)
-        updated["models"] = self._discovered_model_catalog(
-            dict(provider.get("models") or {}), discovered, preserve_evidence=True,
-            adapter=str(provider["adapter"]),
-        )
-        config["ai"]["providers"][selected] = validate_provider(selected, updated)
-        save_config(self.paths, config)
-        return {
-            "ok": True,
-            "connection_id": selected,
-            "models_discovered": len(discovered),
-            "connections": self.ai_connections()["connections"],
-        }
+        return self.ai_connection_upsert(connection_id=selected, display_name=provider["name"],
+            base_url=provider["base_url"], api_key=None, adapter=provider["adapter"],
+            auth=provider["auth"] if provider.get("auth_mode") == "explicit" else None, headers=provider.get("headers"))
+
+    def ai_connection_detect(self, **values: Any) -> dict[str, Any]:
+        budget = DetectionBudget()
+        original = load_config(self.paths, required=False)
+        requested_id = values.get("connection_id")
+        prior_provider = original["ai"]["providers"].get(requested_id)
+        # Preserve the destination credential, including the absence of a stored
+        # key when the old connection used its environment binding instead.
+        prior_credential = self._credential_vault.load(requested_id) if requested_id and isinstance(prior_provider, Mapping) and self._credential_vault is not None else None
+        saved = False
+
+        def rollback() -> None:
+            if not saved or not isinstance(prior_provider, Mapping):
+                return
+            if prior_credential is None:
+                self._credential_vault.clear(requested_id)
+            else:
+                self._credential_vault.save(requested_id, prior_credential.secret,
+                    provider_id=prior_credential.provider_id, origin=prior_credential.origin,
+                    auth=dict(prior_credential.auth))
+            restored = load_config(self.paths, required=False)
+            restored["ai"]["providers"][requested_id] = deepcopy(prior_provider)
+            prior_binding = original["ai"]["credential_slots"].get(requested_id)
+            if prior_binding is None:
+                restored["ai"]["credential_slots"].pop(requested_id, None)
+            else:
+                restored["ai"]["credential_slots"][requested_id] = deepcopy(prior_binding)
+            save_config(self.paths, restored)
+
+        try:
+            result = self.ai_connection_upsert(**values, _budget=budget)
+            saved = True
+            selected = result["connection_id"]
+            provider = load_config(self.paths, required=False)["ai"]["providers"][selected]
+            models = [name for name, definition in provider["models"].items() if definition.get("available", True)]
+            if len(models) == 1:
+                verification = self._verify_connection_model(selected, models[0], budget=budget, all_capabilities=True)
+                result["verification"] = verification
+                result["ok"] = bool(verification["ok"])
+                result["state"] = "ready" if verification["ok"] else "needs_verification"
+                if not verification["ok"] and isinstance(prior_provider, Mapping):
+                    rollback()
+                    saved = False
+                    result["rolled_back"] = True
+                    result["state"] = prior_provider.get("state", "needs_verification")
+            result["connections"] = self.ai_connections()["connections"]
+            result["requests"] = budget.requests
+            return result
+        except Exception as exc:
+            if not isinstance(exc, ProviderConfigurationError) or exc.code != "stale_configuration":
+                rollback()
+            raise
 
     def ai_connection_delete(self, *, connection_id: str) -> dict[str, Any]:
         if self._credential_vault is None:
@@ -2008,13 +2164,76 @@ class ServiceAIMixin:
     def ai_provider_test(
         self, *, provider_id: str, model: str | None = None
     ) -> dict[str, Any]:
+        return self._verify_connection_model(provider_id, model, all_capabilities=True)
+
+    def _verify_connection_model(self, provider_id: str, model: str | None, *,
+            profile_id: str = "recommendation", reasoning_strength: str = "auto", budget: Any = None, all_capabilities: bool = False) -> dict[str, Any]:
         registry = self._provider_registry()
-        route = registry.probe_route(provider_id, model)
-        client = registry.client_for_route(
-            route, timeout=float(route.budget["request_timeout_seconds"])
-        )
-        report = run_live_conformance(client, route)
-        return self._finish_model_verification(route, report)
+        provider = registry.providers.get(provider_id)
+        if not isinstance(provider, Mapping):
+            raise ProviderConfigurationError("invalid_provider", "connection does not exist")
+        selected_model = model or next(iter(provider.get("models") or {}), None)
+        if not selected_model:
+            raise ProviderConfigurationError("invalid_model", "请先填写模型 ID")
+        source_definition_hash = self._connection_model_source_hash(provider, selected_model)
+        if provider["adapter"] == "deepseek":
+            route = registry.probe_route(provider_id, selected_model, reasoning_strength=reasoning_strength, profile_id=profile_id)
+            client = registry.client_for_route(route, timeout=float(route.budget["request_timeout_seconds"]))
+            if budget is not None:
+                route = replace(route, budget={**route.budget, "max_requests": max(0, budget.limit - budget.requests),
+                    "request_timeout_seconds": max(0.001, budget.deadline - time.monotonic())})
+                client = budget.wrap(client)
+            report = run_live_conformance(client, route,
+                required_capabilities=None if all_capabilities else required_capabilities(profile_id))
+            report["source_definition_hash"] = source_definition_hash
+            return self._finish_model_verification(route, report)
+        detection_budget = budget or DetectionBudget(requests=int(registry.policy["budgets"][profile_id]["max_requests"]), seconds=float(registry.policy["budgets"][profile_id]["request_timeout_seconds"]))
+        base, hint = normalize_endpoint(provider["base_url"])
+        existing_wire = dict(provider["models"][selected_model].get("wire_profile") or {})
+        candidates = protocol_candidates(base, str(provider["adapter"]), hint)
+        if existing_wire.get("adapter"):
+            preferred = (existing_wire["adapter"], existing_wire.get("base_url", base))
+            candidates = [preferred] + [candidate for candidate in candidates if candidate != preferred]
+        last_report = None
+        last_route = None
+        candidate_usage: dict[str, Any] = {}
+        for adapter, address in candidates:
+            candidate = deepcopy(dict(provider))
+            wire = {**existing_wire, "adapter": adapter, "base_url": address,
+                "auth": existing_wire.get("auth") if existing_wire.get("adapter") == adapter and existing_wire.get("auth") else protocol_auth(adapter, provider["auth"] if provider.get("auth_mode", "explicit") == "explicit" else None),
+                "headers": dict(provider.get("headers") or {})}
+            if adapter == "anthropic":
+                wire["headers"].setdefault("anthropic-version", "2023-06-01")
+            candidate["models"][selected_model]["wire_profile"] = wire
+            registry.providers[provider_id] = candidate
+            route = registry.probe_route(provider_id, selected_model, reasoning_strength=reasoning_strength, profile_id=profile_id)
+            remaining_tokens = int(route.budget["max_total_tokens"]) - int(candidate_usage.get("total_tokens", 0))
+            if remaining_tokens <= 0:
+                raise ProviderConfigurationError("budget_exceeded", "模型验证 Token 预算已用尽。", usage=candidate_usage)
+            route = replace(route, budget={**route.budget, "max_total_tokens": remaining_tokens})
+            if budget is not None:
+                route = replace(route, budget={**route.budget,
+                    "max_requests": max(0, budget.limit - budget.requests),
+                    "request_timeout_seconds": max(0.001, budget.deadline - time.monotonic())})
+            client = detection_budget.wrap(registry.client_for_route(route, timeout=float(route.budget["request_timeout_seconds"])))
+            report = run_live_conformance(client, route, required_capabilities=None if all_capabilities else required_capabilities(profile_id))
+            merge_usage(candidate_usage, report.get("usage") or {})
+            report["usage"] = dict(candidate_usage)
+            report["source_definition_hash"] = source_definition_hash
+            last_route, last_report = route, report
+            if report["passed"]:
+                return self._finish_model_verification(route, report)
+            # Only protocol/field rejection or a nonmatching wire response permits
+            # another dialect. Authentication, quota, transient errors stop here.
+            codes = {str(case.get("error_code") or (case.get("error") or {}).get("code") or "")
+                for case in report.get("cases", []) if not case.get("ok")}
+            if any(case.get("error_http_status") in {401, 403, 402, 429} or int(case.get("error_http_status") or 0) >= 500 for case in report.get("cases", [])):
+                break
+            if any(case.get("name") == "text" and case.get("ok") for case in report.get("cases", [])):
+                break
+            if not codes or codes - {"invalid_request", "invalid_response", "unsupported_transport", "http_error", "unsupported_capability"}:
+                break
+        return self._finish_model_verification(last_route, last_report)
 
     def ai_model_verify(
         self,
@@ -2030,24 +2249,17 @@ class ServiceAIMixin:
             raise ProviderConfigurationError(
                 "invalid_model_ref", "model_ref must contain exactly provider_id and model"
             )
-        registry = self._provider_registry()
-        route = registry.probe_route(
-            str(model_ref["provider_id"]),
-            str(model_ref["model"]),
-            reasoning_strength=validate_reasoning_strength(reasoning_strength),
-            profile_id=selected_profile,
-        )
-        report = run_live_conformance(
-            registry.client_for_route(
-                route, timeout=float(route.budget["request_timeout_seconds"])
-            ),
-            route,
-            required_capabilities=required_capabilities(selected_profile),
-        )
-        result = self._finish_model_verification(route, report)
+        result = self._verify_connection_model(str(model_ref["provider_id"]), str(model_ref["model"]),
+            profile_id=selected_profile, reasoning_strength=validate_reasoning_strength(reasoning_strength))
         result["profile_id"] = selected_profile
-        result["reasoning_strength"] = route.reasoning_strength
+        result["reasoning_strength"] = reasoning_strength
         return result
+
+    @staticmethod
+    def _connection_model_source_hash(provider: Mapping[str, Any], model: str) -> str:
+        # Other models may be verified concurrently without invalidating this
+        # probe. Include the entire selected definition and connection binding.
+        return canonical_hash({**{key: value for key, value in provider.items() if key != "state"}, "models": {model: (provider.get("models") or {}).get(model)}})
 
     def _finish_model_verification(self, route: Any, report: Mapping[str, Any]) -> dict[str, Any]:
         safe_provider = validate_identifier(route.provider_id, label="provider_id")
@@ -2066,7 +2278,11 @@ class ServiceAIMixin:
         os.replace(temporary_report, report_path)
         if report["passed"]:
             config = load_config(self.paths, required=False)
-            provider = config["ai"]["providers"][route.provider_id]
+            provider = config["ai"]["providers"].get(route.provider_id)
+            expected_source = report.get("source_definition_hash")
+            if not isinstance(provider, Mapping) or route.model not in provider.get("models", {}) or (expected_source and self._connection_model_source_hash(provider, route.model) != expected_source):
+                raise ProviderConfigurationError("stale_configuration", "连接或模型在验证期间已改变，请重新验证。")
+            provider["models"][route.model] = deepcopy(route.provider["models"][route.model])
             definition = verified_definition_from_report(
                 route.provider_id,
                 provider,
@@ -2074,6 +2290,7 @@ class ServiceAIMixin:
                 report,
             )
             config["ai"]["providers"][route.provider_id]["models"][route.model] = definition
+            config["ai"]["providers"][route.provider_id]["state"] = "ready"
             save_config(self.paths, config)
         return {
             "ok": bool(report["passed"]),

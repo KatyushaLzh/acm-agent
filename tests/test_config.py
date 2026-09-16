@@ -224,7 +224,7 @@ class ConfigTests(unittest.TestCase):
 
                 config = load_config(paths)
 
-                self.assertEqual(CONFIG_VERSION, 17)
+                self.assertEqual(CONFIG_VERSION, 18)
                 self.assertEqual(config["version"], CONFIG_VERSION)
                 for retired_key in (
                     "validation_model",

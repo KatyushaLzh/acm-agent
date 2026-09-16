@@ -10,12 +10,12 @@ const PROFILE_LABELS = {
 };
 const STRENGTH_LABELS = { auto: "Provider 默认", off: "关闭", low: "低", medium: "中", high: "高" };
 const PROFILE_CAPABILITIES = {
-  recommendation: ["text_chat", "json_object", "usage"],
-  plan_organize: ["text_chat", "json_object", "usage"],
-  plan_generate: ["text_chat", "json_object", "usage"],
-  coaching: ["text_chat", "streaming", "usage", "stream_usage"],
-  patch: ["text_chat", "json_object", "usage"],
-  summary: ["text_chat", "json_object", "usage"],
+  recommendation: ["text_chat", "json_object"],
+  plan_organize: ["text_chat", "json_object"],
+  plan_generate: ["text_chat", "json_object"],
+  coaching: ["text_chat", "streaming"],
+  patch: ["text_chat", "json_object"],
+  summary: ["text_chat", "json_object"],
 };
 
 function connectionRows(status = state.aiStatus) {
@@ -71,7 +71,9 @@ function availableStrengths(model) {
 
 function selectableStrengths(model, connection) {
   const supported = new Set(["auto"]);
-  if (model?.capabilities?.thinking) {
+  if (Array.isArray(model?.supported_reasoning_strengths)) {
+    for (const value of model.supported_reasoning_strengths) supported.add(value);
+  } else if (model?.capabilities?.thinking) {
     for (const value of ["off", "low", "medium", "high"]) supported.add(value);
   }
   if (connection?.builtin) supported.delete("low");
@@ -79,8 +81,12 @@ function selectableStrengths(model, connection) {
 }
 
 function modelVerifiedForProfile(model, profileId, strength) {
-  const verified = new Set(Array.isArray(model?.verified_capabilities) ? model.verified_capabilities : []);
-  const capabilitiesReady = (PROFILE_CAPABILITIES[profileId] || []).every(value => verified.has(value));
+  const effective = model?.effective_capabilities;
+  const verified = new Set(Array.isArray(effective) ? effective
+    : effective && typeof effective === "object" ? Object.keys(effective).filter(key => effective[key] === true)
+      : Array.isArray(model?.verified_capabilities) ? model.verified_capabilities : []);
+  const evidence = new Set(Array.isArray(model?.verified_capabilities) ? model.verified_capabilities : []);
+  const capabilitiesReady = (PROFILE_CAPABILITIES[profileId] || []).every(value => verified.has(value) && evidence.has(value));
   const strengthReady = strength === "auto" || availableStrengths(model).has(strength);
   return capabilitiesReady && strengthReady;
 }
@@ -112,9 +118,10 @@ function renderAiAuditCards(root, audit, windowLabel = "当前窗口") {
   const costValue = cost.runs && cost.unknown_cost_runs === cost.runs
     ? "未知"
     : formatCny(cost.known_estimated_cny || 0);
-  const tokenValue = tokens.runs && tokens.unknown_runs === tokens.runs
+  const completeness = tokens.usage_completeness || data.governance?.usage_completeness;
+  const tokenValue = completeness === "unknown" || (tokens.runs && tokens.unknown_runs === tokens.runs)
     ? "未知"
-    : formatInteger(tokens.total_tokens_known);
+    : formatInteger(tokens.total_tokens_known) + (completeness === "partial" || tokens.unknown_runs ? "（部分未知）" : "");
   const cacheValue = cache.hit_rate_percent !== null && cache.hit_rate_percent !== undefined
     && Number.isFinite(Number(cache.hit_rate_percent))
     ? `${Number(cache.hit_rate_percent).toFixed(1)}%`
@@ -148,6 +155,12 @@ function createOption(value, label, { disabled = false, title = "" } = {}) {
   return option;
 }
 
+function modelCompatibilityLabel(model) {
+  const wire = asObject(model?.wire_profile);
+  return [wire.streaming === "buffered" ? "非流式" : "",
+    wire.structured_output === "prompt_json" ? "兼容输出" : ""].filter(Boolean).join(" · ");
+}
+
 function pickerStatus(profileId, selection) {
   const profile = asObject(asObject(state.aiStatus?.profiles)[profileId]);
   const connection = connectionFor(selection.model_ref.provider_id);
@@ -159,12 +172,12 @@ function pickerStatus(profileId, selection) {
   }
   if (!model || model.available === false) return { className: "error", text: "模型当前不可用，不会自动换模。" };
   if (sameSelection(profileSelection(profileId), selection) && profile.ready === true) {
-    return { className: "ready", text: "已验证，可用于此功能。" };
+    return { className: "ready", text: `已验证，可用于此功能。${modelCompatibilityLabel(model)}` };
   }
   if (modelVerifiedForProfile(model, profileId, selection.reasoning_strength)) {
-    return { className: "ready", text: "能力证据已验证。" };
+    return { className: "ready", text: `能力证据已验证。${modelCompatibilityLabel(model)}` };
   }
-  return { className: "pending", text: "首次使用前需验证；会产生一次小额模型调用。" };
+  return { className: "pending", text: "首次选择时自动验证，会产生少量 API 调用。" };
 }
 
 function readPicker(root) {
@@ -267,7 +280,7 @@ async function verifySelection(profileId, selection) {
   if (result?.ok !== true) {
     const failedCases = (Array.isArray(result?.report?.cases) ? result.report.cases : [])
       .filter(item => item?.ok !== true)
-      .map(item => `${item.name || "unknown"}${item.error_code ? ` (${item.error_code})` : ""}`);
+      .map(item => `${item.name || "unknown"}${item.error_code ? ` (${item.error_code}${item.error_http_status ? ` / HTTP ${item.error_http_status}` : ""})` : ""}${item.error_hint ? `：${item.error_hint}` : ""}`);
     const detail = failedCases.length ? failedCases.join("、") : "服务未返回通过证据";
     throw new Error(`模型能力验证未通过：${detail}`);
   }
@@ -278,9 +291,8 @@ async function ensureSelectionVerified(profileId, selection) {
   const currentProfile = asObject(asObject(state.aiStatus?.profiles)[profileId]);
   const alreadyReady = sameSelection(profileSelection(profileId), selection) && currentProfile.ready === true;
   if (alreadyReady || modelVerifiedForProfile(model, profileId, selection.reasoning_strength)) return true;
-  const accepted = window.confirm(`首次将此模型用于${PROFILE_LABELS[profileId] || profileId}需要验证，会产生一次小额 API 调用。继续吗？`);
-  if (!accepted) return false;
   await verifySelection(profileId, selection);
+  state.aiStatus = await api("/api/ai/status");
   return true;
 }
 

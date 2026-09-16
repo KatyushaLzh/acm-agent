@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping
 from .config import load_config, save_config
 from .ai_cache import EXACT_CACHE_PROFILES
 from .provider_registry import ProviderRegistry, ProviderRoute
+from .provider import ProviderConfigurationError
 from .provider_config import (
     TASK_PROFILE_IDS,
     validate_ai_policy,
@@ -107,12 +108,21 @@ class ServiceCoreMixin:
         model_ref: Mapping[str, Any] | None = None,
         reasoning_strength: str | None = None,
     ) -> ProviderRoute:
-        return self._provider_registry().route(
-            profile_id,
-            model_override=model_override,
-            model_ref=model_ref,
-            reasoning_strength=reasoning_strength,
-        )
+        registry = self._provider_registry()
+        options = {"model_override": model_override, "model_ref": model_ref,
+                   "reasoning_strength": reasoning_strength}
+        try:
+            return registry.route(profile_id, **options)
+        except ProviderConfigurationError as exc:
+            if exc.code not in {"unverified_capability", "unverified_reasoning_strength", "stale_capability_evidence"}:
+                raise
+            profile = registry.profiles[profile_id]
+            selected = model_ref or {"provider_id": profile["provider_id"], "model": model_override or profile["model"]}
+            result = self.ai_model_verify(profile_id=profile_id, model_ref=selected,
+                                          reasoning_strength=reasoning_strength or profile["reasoning_strength"])
+            if not result.get("ok"):
+                raise ProviderConfigurationError("unverified_capability", "模型能力自动验证未通过，请在设置中查看验证结果。") from None
+            return self._provider_registry().route(profile_id, **options)
 
     def _provider_client(
         self,

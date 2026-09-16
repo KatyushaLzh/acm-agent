@@ -28,7 +28,7 @@ class DynamicDeepSeekModelsTests(unittest.TestCase):
         self.service = AcmService(self.root, credential_vault=self.vault)
         self.service.setup("fixture", "42", skip_validate=True)
         with patch(
-            "tools.acm_agent.service_ai.discover_openai_compatible_models",
+            "tools.acm_agent.service_ai.discover_models",
             return_value=["legacy-" + uuid4().hex],
         ):
             self.service.ai_connection_upsert(
@@ -53,13 +53,13 @@ class DynamicDeepSeekModelsTests(unittest.TestCase):
         future_ids = ["future-family-" + uuid4().hex for _ in range(2)]
         profiles = load_config(self.service.paths)["ai"]["profiles"]
         with patch(
-            "tools.acm_agent.service_ai.discover_openai_compatible_models",
+            "tools.acm_agent.service_ai.discover_models",
             return_value=future_ids,
         ) as discover:
             refreshed = self.service.ai_connection_refresh(connection_id="deepseek")
-        discover.assert_called_once_with(
-            base_url="https://api.deepseek.com", api_key="fixture-secret",
-        )
+        discover.assert_called_once()
+        self.assertEqual(discover.call_args.args, ("https://api.deepseek.com", "fixture-secret"))
+        self.assertEqual(discover.call_args.kwargs["adapter"], "deepseek")
         self.assertEqual(refreshed["models_discovered"], 2)
         self.assertEqual(load_config(self.service.paths)["ai"]["profiles"], profiles)
         self.assertEqual(set(self.service.ai_status()["allowed_models"]), set(future_ids))
@@ -102,7 +102,7 @@ class DynamicDeepSeekModelsTests(unittest.TestCase):
 
         before = load_config(self.service.paths)["ai"]["providers"]["deepseek"]["models"]
         with patch(
-            "tools.acm_agent.service_ai.discover_openai_compatible_models", return_value=future_ids,
+            "tools.acm_agent.service_ai.discover_models", return_value=future_ids,
         ):
             self.service.ai_connection_refresh(connection_id="deepseek")
         after = load_config(self.service.paths)["ai"]["providers"]["deepseek"]["models"]
@@ -116,7 +116,7 @@ class DynamicDeepSeekModelsTests(unittest.TestCase):
             for path in (self.root / ".acm" / "credentials").iterdir() if path.is_file()
         }
         with patch(
-            "tools.acm_agent.service_ai.discover_openai_compatible_models",
+            "tools.acm_agent.service_ai.discover_models",
             side_effect=ProviderConfigurationError("model_discovery_failed", "fixture failure"),
         ):
             with self.assertRaises(ProviderConfigurationError):

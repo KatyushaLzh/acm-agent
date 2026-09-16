@@ -149,9 +149,11 @@ AI 预览不会创建题单文件或题单数据库记录，但会保留必要�
 
 ![ai-model](docs/screenshots/ai-model.png)
 
-AI 功能只在用户显式点击或执行 AI 命令时调用。Dashboard 可直接保存 DeepSeek 或 OpenAI-compatible 中转站 API Key：Windows 使用当前用户作用域的 DPAPI，macOS 使用系统 Keychain，Linux 使用 Freedesktop Secret Service。密钥只会在受认证的 loopback 凭据请求体中短暂传递；不会写入 JSON 配置、SQLite、日志、浏览器存储、后台 job 或 API 响应。系统安全存储缺失或锁定时拒绝持久化，仍可临时使用进程环境变量，绝不退化为明文落盘。
+添加连接时填写显示名称、Base URL 和 API Key，默认自动识别 `OpenAI Chat Completions`、`OpenAI Responses` 或 `Anthropic Messages`。支持公网 HTTPS 根地址、API 前缀或完整推理端点；协议、鉴权和手填模型 ID 位于高级设置。没有 `/models` 的服务可以先保存，再补填模型 ID。仅有一个模型时自动验证，多模型在选择后验证；验证会产生少量调用，接入检测最多 12 次请求、120 秒。编辑时 Key 留空复用原凭据，检测失败恢复旧连接。详见 [Provider 接入与兼容说明](docs/provider-compatibility.md)。
 
-内置 DeepSeek 连接支持 `deepseek-v4-flash` 与 `deepseek-v4-pro`；托管 OpenAI-compatible 连接只能使用已发现且通过能力验证的模型。推理强度中的“Provider 默认”不会下发 thinking/reasoning 控制字段，“关闭”才会显式关闭推理；推荐、对话、补丁、题单与 Markdown 总结按各自 profile 运行，provider reasoning 内容不展示也不保存。
+AI 功能只在用户显式点击或执行 AI 命令时调用。Dashboard 可直接保存 DeepSeek、OpenAI 兼容服务或 Anthropic 服务的 API Key：Windows 使用当前用户作用域的 DPAPI，macOS 使用系统 Keychain，Linux 使用 Freedesktop Secret Service。密钥通过受认证的 loopback 请求提交，检测期间仅在进程内存中传递；不会写入 JSON 配置、SQLite、日志、浏览器存储、后台任务记录或 API 响应。系统安全存储缺失或锁定时拒绝持久化，仍可临时使用进程环境变量，绝不退化为明文落盘。
+
+DeepSeek 连接以供应商最新模型目录为准，刷新会删除已下架的发现模型；托管连接可以使用自动发现或手填的模型 ID，通过对应任务能力验证后才能运行。推理强度中的“Provider 默认”不会下发 thinking/reasoning 控制字段，“关闭”才会显式关闭推理；推荐、对话、补丁、题单与 Markdown 总结按各自 profile 运行，provider reasoning 内容不展示也不保存。
 
 工作台对话按 active attempt 与题目隔离并持久化。清除对话会归档旧会话而非删除审计事实；补丁应用和回退都受源码哈希保护，外部修改发生后不会被覆盖。
 
@@ -169,7 +171,7 @@ Stage 4 将三层指标严格分开：DeepSeek KV cache 只按 provider 返回�
 
 Stage 4 live 报告使用脱敏 provider-leg ledger 汇总请求、tokens、费用和 phase 指标，同时记录 HEAD、dirty 状态、tracked diff、工作树及关键后端文件哈希；报告只保留哈希、匿名 run fingerprint 与数值遥测，不保存 prompt、源码、路径或凭据。顶层、phase、run、probe 与 provider-leg 计数不一致时，`all_report_counts_self_consistent` 会阻止阶段验收。
 
-每个 profile 默认最多执行一次 validation repair，并与 transport retry 共用原有请求、时间和 token 预算。官方 `deepseek-v4-flash` 的 JSON profile 使用 Responses JSON Schema，其他 DeepSeek/兼容路由保留 Chat JSON。Coaching 默认采用 `resilient` 缓冲交付，在内容完成安全检查后再回放；显式 `low_latency` 仍可选择直通流式交付。
+每个 profile 默认最多执行一次 validation repair，并与 transport retry 共用原有请求、时间和 token 预算。官方 `deepseek-v4-flash` 的 JSON profile 使用 Responses JSON Schema，其他路由按已验证的协议及结构化模式运行，必要时降级为提示词 JSON 并进行相同的业务校验。Coaching 默认采用 `resilient` 缓冲交付，在内容完成安全检查后再回放；显式 `low_latency` 仍可选择直通流式交付。
 
 ## Skip：已掌握但未实现
 

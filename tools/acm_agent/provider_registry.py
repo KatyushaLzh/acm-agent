@@ -11,30 +11,40 @@ from typing import Any, Callable, Mapping
 from .credentials import CredentialStoreError, CredentialVault
 from .deepseek import DeepSeekClient
 from .openai_compatible import OpenAICompatibleClient
+from .openai_responses import OpenAIResponsesClient
 from .provider import CapabilityProfile, ProviderConfigurationError, ProviderPort
 from .provider_config import (
     TASK_PROFILE_IDS,
     capability_profile,
     default_ai_policy,
+    effective_capabilities,
     endpoint_origin,
     validate_ai_catalog,
     validate_ai_policy,
-    validate_capabilities,
     validate_credential_slots,
     validate_identifier,
     validate_model_id,
+    validate_capabilities,
     validate_reasoning_strength,
 )
 
 
 _PROFILE_CAPABILITIES = {
-    "recommendation": ("text_chat", "json_object", "usage"),
-    "plan_organize": ("text_chat", "json_object", "usage"),
-    "plan_generate": ("text_chat", "json_object", "usage"),
-    "coaching": ("text_chat", "streaming", "usage", "stream_usage"),
-    "patch": ("text_chat", "json_object", "usage"),
-    "summary": ("text_chat", "json_object", "usage"),
+    "recommendation": ("text_chat", "json_object"),
+    "plan_organize": ("text_chat", "json_object"),
+    "plan_generate": ("text_chat", "json_object"),
+    "coaching": ("text_chat", "streaming"),
+    "patch": ("text_chat", "json_object"),
+    "summary": ("text_chat", "json_object"),
 }
+
+
+def model_wire(provider: Mapping[str, Any], model: str) -> dict[str, Any]:
+    return dict(((provider.get("models") or {}).get(model) or {}).get("wire_profile") or {})
+
+
+def model_adapter(provider: Mapping[str, Any], model: str) -> str:
+    return str(model_wire(provider, model).get("adapter") or provider.get("adapter") or "openai_compatible")
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,19 +61,22 @@ class ProviderRoute:
 
 
 def provider_definition_hash(provider_id: str, provider: Mapping[str, Any], model: str) -> str:
-    model_definition = ((provider.get("models") or {}).get(model) or {})
     document = {
         "provider_id": provider_id,
         "adapter": provider.get("adapter"),
         "base_url": provider.get("base_url"),
         "auth": provider.get("auth"),
+        "headers": provider.get("headers") or {},
+        "wire_profile": model_wire(provider, model),
+        "native_capabilities": validate_capabilities(((provider.get("models") or {}).get(model) or {}).get("capabilities")),
         "model": model,
-        "capabilities": validate_capabilities(model_definition.get("capabilities")),
+        "capabilities": effective_capabilities(provider, model),
         "reasoning_wire": (
             "deepseek_thinking" if provider.get("adapter") == "deepseek"
+            else "responses_reasoning_effort" if provider.get("adapter") == "openai_responses"
             else "openai_reasoning_effort"
         ),
-        "conformance_version": 3,
+        "conformance_version": 4,
     }
     encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -90,7 +103,7 @@ def resolve_reasoning_options(adapter: str, reasoning_strength: str) -> tuple[bo
             "medium": (True, "high"),
             "high": (True, "max"),
         }[strength]
-    if selected_adapter == "openai_compatible":
+    if selected_adapter in {"openai_compatible", "openai_responses", "anthropic", "auto"}:
         if strength == "auto":
             return False, "auto"
         if strength == "off":
@@ -105,6 +118,15 @@ def required_capabilities(profile_id: str) -> tuple[str, ...]:
         return tuple(_PROFILE_CAPABILITIES[selected])
     except KeyError:
         raise ProviderConfigurationError("invalid_profile", "unknown task profile") from None
+
+
+def _model_budget(budget: Mapping[str, Any], capabilities: CapabilityProfile) -> dict[str, Any]:
+    result = dict(budget)
+    if capabilities.max_output_tokens is not None:
+        result["max_output_tokens"] = min(
+            int(result["max_output_tokens"]), capabilities.max_output_tokens
+        )
+    return result
 
 
 class ProviderRegistry:
@@ -165,7 +187,7 @@ class ProviderRegistry:
         model_definition = (provider.get("models") or {}).get(model)
         if not isinstance(model_definition, Mapping):
             raise ProviderConfigurationError(
-                "invalid_model", "model is not declared by the selected provider"
+                "invalid_model", "所选模型已不在连接的模型列表中，请重新选择模型"
             )
         if not bool(model_definition.get("available", True)):
             raise ProviderConfigurationError(
@@ -175,7 +197,7 @@ class ProviderRegistry:
             reasoning_strength if reasoning_strength is not None
             else profile.get("reasoning_strength", "auto")
         )
-        thinking, effort = resolve_reasoning_options(str(provider["adapter"]), strength)
+        thinking, effort = resolve_reasoning_options(model_adapter(provider, model), strength)
         capabilities = capability_profile(provider, model)
         required = list(_PROFILE_CAPABILITIES[selected_profile])
         if thinking:
@@ -224,7 +246,7 @@ class ProviderRegistry:
             reasoning_effort=effort,
             provider=provider,
             capabilities=capabilities,
-            budget=dict(self.policy["budgets"][selected_profile]),
+            budget=_model_budget(self.policy["budgets"][selected_profile], capabilities),
         )
 
     def route_plan(
@@ -292,7 +314,10 @@ class ProviderRegistry:
             return self.injected_factory()
         provider = route.provider
         secret, _source = self._secret(route.provider_id, provider)
-        adapter = str(provider["adapter"])
+        wire = model_wire(provider, route.model)
+        adapter = model_adapter(provider, route.model)
+        if provider.get("protocol_mode") == "auto" or adapter == "anthropic":
+            wire.setdefault("structured_output", "native_schema")
         models = {
             model: capability_profile(provider, model)
             for model in (provider.get("models") or {})
@@ -303,11 +328,20 @@ class ProviderRegistry:
                     "invalid_endpoint", "the DeepSeek adapter is pinned to the official origin"
                 )
             return DeepSeekClient(api_key=secret, models=models, timeout=timeout, retries=0)
-        return OpenAICompatibleClient(
+        if adapter == "auto":
+            raise ProviderConfigurationError("unverified_protocol", "连接协议尚未验证。")
+        if adapter == "anthropic":
+            from .anthropic import AnthropicClient
+            client_type = AnthropicClient
+        else:
+            client_type = OpenAIResponsesClient if adapter == "openai_responses" else OpenAICompatibleClient
+        return client_type(
             api_key=secret,
             provider_id=route.provider_id,
-            base_url=str(provider["base_url"]),
-            auth=dict(provider["auth"]),
+            base_url=str(wire.get("base_url") or provider["base_url"]),
+            auth=dict(wire.get("auth") or provider["auth"]),
+            headers={**dict(provider.get("headers") or {}), **dict(wire.get("headers") or {})},
+            wire_profile=wire,
             models=models,
             credential_origin=str(self.credential_slots[provider["credential_slot"]]["origin"]),
             thinking_wire="none",
@@ -336,7 +370,7 @@ class ProviderRegistry:
         if not capabilities.text_chat:
             raise ProviderConfigurationError("unsupported_capability", "model does not declare text_chat")
         strength = validate_reasoning_strength(reasoning_strength)
-        thinking, effort = resolve_reasoning_options(str(provider["adapter"]), strength)
+        thinking, effort = resolve_reasoning_options(model_adapter(provider, selected_model), strength)
         if thinking and not capabilities.thinking:
             raise ProviderConfigurationError(
                 "unsupported_capability", "model does not declare reasoning support"
@@ -350,7 +384,7 @@ class ProviderRegistry:
             reasoning_effort=effort,
             provider=dict(provider),
             capabilities=capabilities,
-            budget=dict(self.policy["budgets"][selected_profile]),
+            budget=_model_budget(self.policy["budgets"][selected_profile], capabilities),
         )
 
     def credential_source(self, provider_id: str) -> str:

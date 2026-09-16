@@ -38,7 +38,7 @@ class ConfigBudgetUpgradeTests(unittest.TestCase):
         config["ai"]["policy"]["hard_limits"] = {"daily_cny": 1.0, "monthly_cny": 5.0}
         paths.config.write_text(json.dumps(config), encoding="utf-8")
         result = load_config(paths)
-        self.assertEqual(result["version"], 17)
+        self.assertEqual(result["version"], 18)
         self.assertEqual(result["ai"]["profiles"], config["ai"]["profiles"])
         self.assertEqual(result["ai"]["policy"]["hard_limits"], config["ai"]["policy"]["hard_limits"])
         for profile, previous in config["ai"]["policy"]["budgets"].items():

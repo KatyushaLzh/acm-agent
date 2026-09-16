@@ -577,6 +577,7 @@ class AcmRequestHandler(BaseHTTPRequestHandler):
         "/api/jobs/ai/test": "ai_test",
         "/api/jobs/ai/providers/test": "ai_provider_test",
         "/api/jobs/ai/models/verify": "ai_model_verify",
+        "/api/jobs/ai/connections/detect": "ai_connection_detect",
         "/api/jobs/ai/recommendations": "ai_recommendations",
         "/api/jobs/ai/plans/preview": "ai_plan_preview",
         "/api/jobs/problems/context/fetch": "problem_context_fetch",

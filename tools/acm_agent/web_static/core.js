@@ -101,7 +101,15 @@ async function api(path, options = {}) {
     headers["Content-Type"] = "application/json";
     request.body = JSON.stringify(options.body);
   }
-  const response = await fetch(path, request);
+  let response;
+  try {
+    response = await fetch(path, request);
+  } catch (cause) {
+    if (cause?.name === "AbortError") throw cause;
+    const error = new Error("无法连接 ACM Agent 本地服务。请重新运行启动器，并使用启动器新打开的页面地址后重试。", { cause });
+    error.code = "local_service_unreachable";
+    throw error;
+  }
   let payload;
   try { payload = await response.json(); } catch { payload = { error: `服务返回了非 JSON 响应（HTTP ${response.status}）` }; }
   if (!response.ok) {

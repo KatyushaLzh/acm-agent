@@ -3,7 +3,7 @@ import {
   navigate, pollJob, state, toast,
 } from "./core.js";
 import { importErrors, submitPlanImport } from "./view_plans.js";
-import { aiRequestSelection } from "./ai_model_controls.js";
+import { aiRequestSelection, ensureSelectionVerified } from "./ai_model_controls.js";
 
 function deepClone(value) { return JSON.parse(JSON.stringify(value)); }
 function draftStages() {
@@ -190,7 +190,10 @@ async function generateAiPlan(button) {
   showAiPlanProgress(mode === "generate" ? "AI 正在分析目标并筛选本地题库…" : "AI 正在识别并整理题目…");
   button.disabled = true;
   try {
-    const body = { mode, text, ...aiRequestSelection(profileId) };
+    const selection = aiRequestSelection(profileId);
+    await ensureSelectionVerified(profileId, selection);
+    if (state.aiPlanImportEpoch !== epoch || controller.signal.aborted) return;
+    const body = { mode, text, ...selection };
     if (mode === "generate") {
       body.task_count = count;
       body.include_completed = $("#ai-plan-include-completed").checked;

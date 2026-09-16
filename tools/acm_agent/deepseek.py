@@ -260,10 +260,72 @@ def _response_error_details(data: Any) -> dict[str, Any]:
     return details
 
 
-def _iter_sse_data(lines: Any) -> Iterator[str]:
+def _envelope_error(chunk: Mapping[str, Any], secret: str | None) -> DeepSeekError | None:
+    """Decode provider errors carried by an otherwise successful HTTP response."""
+    error = chunk.get("error")
+    if not isinstance(error, Mapping):
+        return None
+    aliases = {
+        "invalid_request": "invalid_request",
+        "invalid_request_error": "invalid_request",
+        "authentication_error": "authentication_failed",
+        "authentication_failed": "authentication_failed",
+        "invalid_api_key": "authentication_failed",
+        "permission_error": "permission_denied",
+        "permission_denied": "permission_denied",
+        "insufficient_quota": "insufficient_balance",
+        "insufficient_balance": "insufficient_balance",
+        "rate_limit_error": "rate_limited",
+        "rate_limit_exceeded": "rate_limited",
+        "rate_limited": "rate_limited",
+        "server_error": "server_error",
+        "internal_server_error": "server_error",
+        "api_error": "server_error",
+        "overloaded_error": "server_error",
+        "temporarily_unavailable": "server_error",
+        "timeout": "timeout",
+    }
+    status = None
+    for value in (error.get("status"), error.get("status_code"), error.get("code")):
+        if not isinstance(value, bool) and str(value).isdigit() and 400 <= int(value) <= 599:
+            status = int(value)
+            break
+    code = next((
+        aliases[str(value).casefold()]
+        for value in (error.get("code"), error.get("type"))
+        if str(value).casefold() in aliases
+    ), None)
+    if code is None:
+        code = _error_code_for_status(status) if status is not None else "provider_error"
+    details = {
+        "provider_" + name: _sanitize(error[name], secret)
+        for name in ("code", "type", "param")
+        if isinstance(error.get(name), (str, int)) and not isinstance(error.get(name), bool)
+    }
+    return DeepSeekError(
+        code,
+        _sanitize(error.get("message") or "Provider returned an error event", secret),
+        status=status,
+        retryable=code in {"server_error", "rate_limited", "timeout"},
+        usage=normalize_usage(chunk["usage"]) if isinstance(chunk.get("usage"), Mapping) else {},
+        protocol_details=details,
+    )
+
+
+def _iter_sse_data(lines: Any, *, deadline: float | None = None) -> Iterator[str]:
     """Parse data-only SSE while ignoring blank lines and keep-alive comments."""
+    def check_deadline() -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise DeepSeekError(
+                "timeout", "Provider stream exceeded its total request timeout", retryable=True
+            )
+
     data_lines: list[str] = []
+    check_deadline()
     for raw in lines:
+        # A socket's idle timeout restarts on keepalives. Bound total elapsed
+        # time as well, including comments and empty SSE frames.
+        check_deadline()
         try:
             if isinstance(raw, bytes):
                 line = raw.decode("utf-8-sig")
@@ -283,6 +345,7 @@ def _iter_sse_data(lines: Any) -> Iterator[str]:
             continue
         if line.startswith("data:"):
             data_lines.append(line[5:].lstrip(" "))
+    check_deadline()
     if data_lines:
         yield "\n".join(data_lines)
 
@@ -696,6 +759,11 @@ class DeepSeekClient:
                     raise DeepSeekProtocolError(
                         "invalid_response", "DeepSeek response must be a JSON object"
                     )
+                # Responses has its own terminal-status/error parser; preserve
+                # that protocol's semantics instead of applying Chat retries.
+                envelope_error = _envelope_error(data, self._api_key) if request_factory is None else None
+                if envelope_error is not None:
+                    raise envelope_error
                 return data
             except DeepSeekError as exc:
                 if not exc.retryable or attempt >= retry_limit:
@@ -1439,9 +1507,10 @@ class DeepSeekClient:
             response_model: str | None = None
             response_id: str | None = None
             try:
+                deadline = time.monotonic() + self.timeout
                 response = self._open(payload)
                 with _managed_response(response) as opened:
-                    for event_data in _iter_sse_data(opened):
+                    for event_data in _iter_sse_data(opened, deadline=deadline):
                         if event_data == "[DONE]":
                             final_usage = dict(accumulated_usage)
                             merge_usage(final_usage, usage or {})
@@ -1468,6 +1537,9 @@ class DeepSeekClient:
                             raise DeepSeekProtocolError(
                                 "invalid_stream", "DeepSeek SSE chunk must be a JSON object"
                             )
+                        stream_error = _envelope_error(chunk, self._api_key)
+                        if stream_error is not None:
+                            raise stream_error
                         if chunk.get("model") is not None:
                             response_model = str(chunk["model"])
                         if chunk.get("id") is not None:

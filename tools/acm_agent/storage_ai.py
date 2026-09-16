@@ -1220,6 +1220,8 @@ class _AiStorageMixin:
             total_tokens = usage.get("total_tokens")
             if isinstance(total_tokens, (int, float)) and not isinstance(total_tokens, bool):
                 all_model_tokens["total_tokens_known"] += int(total_tokens)
+                if governance.get("usage_completeness") in {"partial", "unknown"}:
+                    all_model_tokens["unknown_runs"] += 1
             else:
                 all_model_tokens["unknown_runs"] += 1
             cache_read = usage.get("cache_read_tokens")
@@ -1330,6 +1332,8 @@ class _AiStorageMixin:
                         "resolved_model": str(row["resolved_model"] or "") or None,
                         "provider_requests": requests,
                         "total_tokens": usage.get("total_tokens"),
+                        "usage_completeness": governance.get("usage_completeness", "complete" if usage.get("total_tokens") is not None else "unknown"),
+                        "total_token_budget_complete": governance.get("total_token_budget_complete", usage.get("total_tokens") is not None),
                         "cache_read_tokens": cache_read,
                         # Compatibility alias consumed by the existing UI.
                         "fallback_count": provider_fallback_count,

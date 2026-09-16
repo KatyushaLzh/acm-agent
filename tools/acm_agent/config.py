@@ -23,7 +23,7 @@ from .provider_config import (
 )
 
 
-CONFIG_VERSION = 17
+CONFIG_VERSION = 18
 # Compatibility-only conversion for explicitly configured v14 USD guardrails.
 # DeepSeek usage itself is always priced from the native CNY catalog.
 LEGACY_LIMIT_USD_TO_CNY_RATE = 7.2
@@ -321,6 +321,11 @@ def _upgrade_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     ai = upgraded.get("ai")
     if isinstance(ai, dict):
         source_ai = data.get("ai") if isinstance(data.get("ai"), dict) else {}
+        # A persisted model directory is authoritative, including an empty one.
+        # Recursive defaults must not resurrect models removed by discovery.
+        for provider_id, provider in (source_ai.get("providers") or {}).items():
+            if isinstance(provider, dict) and isinstance(provider.get("models"), dict):
+                ai["providers"][provider_id]["models"] = json.loads(json.dumps(provider["models"]))
         if version in (1, 2):
             # Phase-three summaries are coaching-like calls.  Existing users
             # therefore keep their explicit coaching model/thinking choices
@@ -406,6 +411,14 @@ def _upgrade_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             _upgrade_v15_default_token_budgets(ai, source_ai)
         if version <= 16:
             _upgrade_v16_reasoning_budgets(ai, source_ai, version)
+        if version <= 17:
+            for provider in (ai.get("providers") or {}).values():
+                provider.setdefault("protocol_mode", "explicit")
+                provider.setdefault("state", "needs_verification")
+                for definition in (provider.get("models") or {}).values():
+                    if definition.get("evidence") == "verified_live":
+                        definition.update(evidence="declared", evidence_hash=None, verified_at=None,
+                                          verified_capabilities=[], verified_reasoning_strengths=[])
         providers, profiles = validate_ai_catalog(ai.get("providers"), ai.get("profiles"))
         _upgrade_profiles_reasoning(profiles)
         ai["providers"] = providers

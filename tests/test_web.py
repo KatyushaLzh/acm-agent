@@ -103,6 +103,10 @@ class FakeService:
         values = {key: value for key, value in values.items() if key != "api_key"}
         return self._return("ai_connection_upsert", values)
 
+    def ai_connection_detect(self, **values: object) -> dict[str, object]:
+        values = {key: value for key, value in values.items() if key != "api_key"}
+        return self._return("ai_connection_detect", values)
+
     def ai_connection_refresh(self, **values: object) -> dict[str, object]:
         return self._return("ai_connection_refresh", values)
 
@@ -518,6 +522,16 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["data"]["operation"], "ai_connection_upsert")
         self.assertNotIn(secret, json.dumps(payload))
+
+        status, payload, _ = self.request("POST", "/api/jobs/ai/connections/detect", payload={
+            "display_name": "Relay", "base_url": "https://relay.example/v1", "api_key": secret,
+            "adapter": "auto", "manual_models": ["same-name"],
+        })
+        self.assertEqual(status, 202)
+        job = self.wait_for_job(payload["data"]["job_id"])
+        self.assertEqual(job["result"]["operation"], "ai_connection_detect")
+        self.assertEqual(job["result"]["manual_models"], ["same-name"])
+        self.assertNotIn(secret, json.dumps(job))
 
         status, payload, _ = self.request("POST", "/api/ai/profiles", payload={
             "profile_id": "recommendation", **selection,
@@ -1768,7 +1782,7 @@ class JobManagerTest(unittest.TestCase):
         self.assertIn('autocomplete="new-password"', self.html)
         self.assertNotIn('id="ai-credential-form"', self.html)
         self.assertNotIn('id="ai-key-clear"', self.html)
-        self.assertIn('api("/api/ai/connections"', self.script)
+        self.assertIn('api("/api/jobs/ai/connections/detect"', self.script)
         self.assertIn('finally {\n    keyInput.value = "";', self.script)
         self.assertNotIn('localStorage.setItem("deepseek', self.script)
         self.assertNotIn('sessionStorage.setItem("deepseek', self.script)

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from tools.acm_agent.provider import (
-    AIJsonResult, AIResult, AIStreamEvent, ProviderConfigurationError,
+    AIJsonResult, AIResult, AIStreamEvent, ProviderConfigurationError, ProviderError,
 )
 from tools.acm_agent.provider_config import (
     TASK_PROFILE_IDS, default_ai_policy, default_credential_slots,
@@ -54,7 +54,8 @@ class ConformanceBudgetTests(unittest.TestCase):
             with self.subTest(case=name):
                 self.assertEqual(kwargs["max_tokens"], budget["max_output_tokens"])
                 if name != "stream":
-                    self.assertEqual(kwargs["request_timeout"], budget["request_timeout_seconds"])
+                    self.assertGreater(kwargs["request_timeout"], 0)
+                    self.assertLessEqual(kwargs["request_timeout"], budget["request_timeout_seconds"])
                 if name == "json_object":
                     self.assertEqual(kwargs["json_retries"], 0)
 
@@ -91,6 +92,20 @@ class ConformanceBudgetTests(unittest.TestCase):
         route.budget["max_output_tokens"] = 1
         self.assertEqual(registry.policy["budgets"]["patch"]["max_output_tokens"], 12345)
 
+    def test_output_parameter_error_has_safe_hint_without_reflected_content(self):
+        route = self.registry().probe_route("deepseek")
+        error = ProviderError("invalid_request", "max_tokens invalid reflected-secret", status=400)
+        client = SimpleNamespace(
+            chat=Mock(side_effect=error), chat_json=Mock(side_effect=error),
+            stream_chat=Mock(side_effect=error),
+        )
+        report = run_live_conformance(client, route)
+        self.assertFalse(report["passed"])
+        for case in report["cases"]:
+            if case["name"] in {"text", "json_object", "stream"}:
+                self.assertIn("最大输出 Token", case["error_hint"])
+        self.assertNotIn("reflected-secret", str(report))
+
     def test_probe_default_is_recommendation_and_invalid_profile_is_rejected(self):
         registry = self.registry()
         self.assertEqual(registry.probe_route("deepseek").budget,
@@ -123,6 +138,8 @@ class ConformanceBudgetTests(unittest.TestCase):
                     _provider_registry=lambda: registry,
                     _finish_model_verification=lambda route, report: {"ok": report["passed"]},
                 )
+                service._connection_model_source_hash = ServiceAIMixin._connection_model_source_hash
+                service._verify_connection_model = lambda *args, **kwargs: ServiceAIMixin._verify_connection_model(service, *args, **kwargs)
                 model = registry.profiles[profile_id]["model"]
                 result = ServiceAIMixin.ai_model_verify(
                     service, profile_id=profile_id,
@@ -143,6 +160,8 @@ class ConformanceBudgetTests(unittest.TestCase):
             _provider_registry=lambda: registry,
             _finish_model_verification=lambda route, report: {"ok": report["passed"]},
         )
+        service._connection_model_source_hash = ServiceAIMixin._connection_model_source_hash
+        service._verify_connection_model = lambda *args, **kwargs: ServiceAIMixin._verify_connection_model(service, *args, **kwargs)
         self.assertTrue(ServiceAIMixin.ai_provider_test(service, provider_id="deepseek")["ok"])
         self.assert_call_budget(client, registry.policy["budgets"]["recommendation"])
         self.assertEqual(registry.client_for_route.call_args.kwargs["timeout"],

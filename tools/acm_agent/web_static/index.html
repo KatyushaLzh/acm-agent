@@ -369,7 +369,14 @@
               <label>显示名称<input name="display_name" required maxlength="80" placeholder="例如：主力中转站"></label>
               <label>HTTPS Base URL<input name="base_url" type="url" required inputmode="url" placeholder="https://relay.example.com/v1"></label>
               <label>API Key<input name="api_key" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" maxlength="2048" placeholder="新建时必填；编辑时留空表示保留"></label>
-              <p class="credential-detail">保存会访问该地址的标准 <code>/models</code>。仅允许 HTTPS，内网地址、跨源重定向和异常响应会被拒绝。</p>
+              <details class="connection-advanced"><summary>高级设置与手填模型</summary>
+                <label>接口协议<select name="adapter"><option value="auto">自动识别</option><option value="openai_compatible">OpenAI Chat Completions</option><option value="openai_responses">OpenAI Responses</option><option value="anthropic">Anthropic Messages</option></select></label>
+                <label>模型 ID（可选，每行一个）<textarea name="manual_models" rows="3" placeholder="无法自动发现时填写模型 ID"></textarea></label>
+                <label>鉴权方式<select name="auth_type"><option value="auto">协议默认</option><option value="bearer">Bearer</option><option value="header">API Key Header</option></select></label>
+                <label>API Key Header 名称<input name="header_name" placeholder="x-api-key"></label>
+                <label>其他非敏感请求头（JSON 对象）<textarea name="headers" rows="2" placeholder='{"anthropic-version":"2023-06-01"}'></textarea></label>
+              </details>
+              <p class="credential-detail">自动发现模型并检测协议；首次选择任务模型会自动验证，可能产生少量 API 调用。仅支持公网 HTTPS。没有模型列表时可在高级设置中补填模型 ID。</p>
               <div class="card-actions"><button class="button primary" type="submit">添加连接</button><button id="ai-connection-cancel" class="button secondary hidden" type="button">取消编辑</button></div>
             </form>
             <div id="ai-connection-list" class="ai-connection-list" aria-live="polite"><p class="subtle">正在读取模型连接…</p></div>

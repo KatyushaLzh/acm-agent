@@ -136,6 +136,7 @@ class GovernedProviderClient:
         self._started = monotonic()
         self._deadline = self._started + float(self.budget["request_timeout_seconds"])
         self._requests = 0
+        self._unknown_usage_requests = 0
         self._usage: dict[str, Any] = {}
         self._legs: list[dict[str, Any]] = []
         self._fallbacks: list[dict[str, Any]] = []
@@ -253,6 +254,8 @@ class GovernedProviderClient:
         if "provider_requests" not in normalized:
             normalized["provider_requests"] = attempts
         self._requests += attempts
+        if "total_tokens" not in normalized:
+            self._unknown_usage_requests += attempts
         merge_usage(self._usage, normalized)
         # The request counter is authoritative when available; do not add a
         # provider-reported counter to the run total a second time.
@@ -294,6 +297,10 @@ class GovernedProviderClient:
     ) -> dict[str, Any]:
         return {
             "version": 1,
+            "usage_completeness": ("unknown" if self._unknown_usage_requests == self._requests and self._requests
+                                   else "partial" if self._unknown_usage_requests else "complete"),
+            "unknown_usage_requests": self._unknown_usage_requests,
+            "total_token_budget_complete": self._unknown_usage_requests == 0,
             "profile_id": self.routes[0].profile_id,
             "primary": _safe_route(self.routes[0]),
             "actual": _safe_route(actual_route) if actual_route is not None else None,
@@ -352,6 +359,12 @@ class GovernedProviderClient:
                 selected[name] = value
             else:
                 selected.pop(name, None)
+        cap = int(route.budget["max_output_tokens"])
+        if route.capabilities.max_output_tokens is not None:
+            cap = min(cap, int(route.capabilities.max_output_tokens))
+        requested = selected.get("max_tokens")
+        if requested is None or int(requested) > cap:
+            selected["max_tokens"] = cap
         return selected
 
     def _invoke(

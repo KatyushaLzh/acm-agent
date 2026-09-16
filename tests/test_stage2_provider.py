@@ -892,7 +892,7 @@ class Stage2ServiceManagementTests(unittest.TestCase):
             service = AcmService(root, credential_vault=vault)
             service.setup("fixture", "42", skip_validate=True)
             with patch(
-                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                "tools.acm_agent.service_ai.discover_models",
                 return_value=["shared-name", "long-model-v1"],
             ):
                 created = service.ai_connection_upsert(
@@ -906,7 +906,7 @@ class Stage2ServiceManagementTests(unittest.TestCase):
                 service.paths.config.read_text(encoding="utf-8"),
             )
             with patch(
-                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                "tools.acm_agent.service_ai.discover_models",
                 return_value=["shared-name"],
             ):
                 service.ai_connection_upsert(
@@ -921,7 +921,7 @@ class Stage2ServiceManagementTests(unittest.TestCase):
             )
             models = {item["id"]: item for item in connection["models"]}
             self.assertTrue(models["shared-name"]["available"])
-            self.assertFalse(models["long-model-v1"]["available"])
+            self.assertNotIn("long-model-v1", models)
             self.assertEqual(vault.load(connection_id).secret, "connection-secret")
             config = load_config(service.paths)
             config["ai"]["profiles"]["recommendation"].update(
@@ -944,7 +944,7 @@ class Stage2ServiceManagementTests(unittest.TestCase):
             service = AcmService(root, credential_vault=vault)
             service.setup("fixture", "42", skip_validate=True)
             with patch(
-                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                "tools.acm_agent.service_ai.discover_models",
                 return_value=[
                     "deepseek-v4-flash",
                     "deepseek-v4-pro",
@@ -979,7 +979,7 @@ class Stage2ServiceManagementTests(unittest.TestCase):
             service = AcmService(root, credential_vault=vault)
             service.setup("fixture", "42", skip_validate=True)
             with patch(
-                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                "tools.acm_agent.service_ai.discover_models",
                 return_value=["deepseek-v4-flash", "deepseek-v4-pro"],
             ):
                 service.ai_connection_upsert(
@@ -989,7 +989,7 @@ class Stage2ServiceManagementTests(unittest.TestCase):
                     api_key="existing-secret",
                 )
             with patch(
-                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                "tools.acm_agent.service_ai.discover_models",
                 return_value=[
                     "deepseek-v4-flash",
                     "deepseek-v4-pro",
@@ -1005,7 +1005,7 @@ class Stage2ServiceManagementTests(unittest.TestCase):
             self.assertEqual(result["models_discovered"], 3)
             self.assertEqual(vault.load("deepseek").secret, "existing-secret")
 
-    def test_builtin_deepseek_refresh_preserves_new_models_and_marks_missing(self):
+    def test_builtin_deepseek_refresh_preserves_new_models_and_removes_missing(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             vault = ProviderCredentialVault(
@@ -1016,7 +1016,7 @@ class Stage2ServiceManagementTests(unittest.TestCase):
             service = AcmService(root, credential_vault=vault)
             service.setup("fixture", "42", skip_validate=True)
             with patch(
-                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                "tools.acm_agent.service_ai.discover_models",
                 return_value=["deepseek-v4-flash", "deepseek-v4-pro"],
             ):
                 service.ai_connection_upsert(
@@ -1026,7 +1026,7 @@ class Stage2ServiceManagementTests(unittest.TestCase):
                     api_key="existing-secret",
                 )
             with patch(
-                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                "tools.acm_agent.service_ai.discover_models",
                 return_value=[
                     "deepseek-v4-flash",
                     "future-family-2032-beta",
@@ -1039,14 +1039,14 @@ class Stage2ServiceManagementTests(unittest.TestCase):
                 if item["id"] == "deepseek"
             )
             models = {item["id"]: item for item in connection["models"]}
-            self.assertEqual(set(models), {"deepseek-v4-flash", "deepseek-v4-pro", "future-family-2032-beta"})
+            self.assertEqual(set(models), {"deepseek-v4-flash", "future-family-2032-beta"})
             self.assertEqual(models["future-family-2032-beta"]["evidence"], "declared")
             self.assertEqual(models["future-family-2032-beta"]["verified_capabilities"], [])
             self.assertTrue(models["deepseek-v4-flash"]["available"])
-            self.assertFalse(models["deepseek-v4-pro"]["available"])
+            self.assertNotIn("deepseek-v4-pro", models)
             self.assertEqual(vault.load("deepseek").secret, "existing-secret")
 
-    def test_builtin_deepseek_replacement_catalog_retains_unavailable_profile_models(self):
+    def test_builtin_deepseek_replacement_catalog_removes_missing_profile_models(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             vault = ProviderCredentialVault(
@@ -1057,7 +1057,7 @@ class Stage2ServiceManagementTests(unittest.TestCase):
             service = AcmService(root, credential_vault=vault)
             service.setup("fixture", "42", skip_validate=True)
             with patch(
-                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                "tools.acm_agent.service_ai.discover_models",
                 return_value=["deepseek-v4-flash", "deepseek-v4-pro"],
             ):
                 service.ai_connection_upsert(
@@ -1068,7 +1068,7 @@ class Stage2ServiceManagementTests(unittest.TestCase):
                 )
             original_profiles = load_config(service.paths)["ai"]["profiles"]
             with patch(
-                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                "tools.acm_agent.service_ai.discover_models",
                 return_value=["future-family-2032-beta"],
             ):
                 result = service.ai_connection_refresh(connection_id="deepseek")
@@ -1078,8 +1078,8 @@ class Stage2ServiceManagementTests(unittest.TestCase):
             models = config["ai"]["providers"]["deepseek"]["models"]
             self.assertTrue(models["future-family-2032-beta"]["available"])
             self.assertEqual(models["future-family-2032-beta"]["evidence"], "declared")
-            self.assertFalse(models["deepseek-v4-flash"]["available"])
-            self.assertFalse(models["deepseek-v4-pro"]["available"])
+            self.assertNotIn("deepseek-v4-flash", models)
+            self.assertNotIn("deepseek-v4-pro", models)
             self.assertEqual(vault.load("deepseek").secret, "existing-secret")
 
     def test_simplified_connection_discovery_failure_rolls_back_config_and_credential(self):
@@ -1094,9 +1094,9 @@ class Stage2ServiceManagementTests(unittest.TestCase):
             service.setup("fixture", "42", skip_validate=True)
             before = service.paths.config.read_bytes()
             with patch(
-                "tools.acm_agent.service_ai.discover_openai_compatible_models",
+                "tools.acm_agent.service_ai.discover_models",
                 side_effect=ProviderConfigurationError(
-                    "model_discovery_failed", "no standard /models"
+                    "model_discovery_failed", "unauthorized /models", status=401
                 ),
             ):
                 with self.assertRaisesRegex(ProviderConfigurationError, "/models"):

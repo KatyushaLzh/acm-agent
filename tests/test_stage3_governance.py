@@ -483,6 +483,23 @@ class Stage3GovernorTests(unittest.TestCase):
             fallback.calls[0]["reasoning_effort"], routes[1].reasoning_effort
         )
 
+    def test_fallback_clamps_output_to_its_own_model_limit(self):
+        config = _ai_config(max_requests=2, max_retries=0, max_total_tokens=5000)
+        routes = list(ProviderRegistry(config).route_plan("recommendation"))
+        routes[1] = replace(
+            routes[1], capabilities=replace(routes[1].capabilities, max_output_tokens=512)
+        )
+        primary = _OptionsCapturingClient([_retryable()])
+        fallback = _OptionsCapturingClient([
+            AIResult(content="OK", finish_reason="stop", usage={}, model=routes[1].model)
+        ])
+        clients = {routes[0].model: primary, routes[1].model: fallback}
+        GovernedProviderClient(
+            routes, lambda route, timeout: clients[route.model], sleep=lambda _: None
+        ).chat([], max_tokens=2000)
+        self.assertEqual(primary.calls[0]["max_tokens"], 2000)
+        self.assertEqual(fallback.calls[0]["max_tokens"], 512)
+
     def test_request_budget_never_allows_n_plus_one(self):
         config = _ai_config(max_requests=2, max_retries=1)
         config["policy"]["fallbacks"]["recommendation"] = []

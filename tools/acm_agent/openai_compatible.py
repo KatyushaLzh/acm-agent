@@ -28,13 +28,14 @@ from .deepseek import (
     DeepSeekError,
     Transport,
 )
-from .provider import CapabilityProfile, ProviderConfigurationError
+from .provider import CapabilityProfile, ProviderConfigurationError, AIStreamEvent, AIJsonResult, ProviderProtocolError
 from .provider_config import (
     chat_completions_url,
     endpoint_origin,
     models_url,
     validate_auth,
     validate_model_id,
+    validate_provider_headers,
 )
 
 
@@ -53,30 +54,8 @@ _JSON_FENCE = re.compile(
 
 
 def _safe_https_open(request: urllib.request.Request, timeout: float) -> Any:
-    parsed = urlsplit(request.full_url)
-    try:
-        addresses = {
-            item[4][0]
-            for item in socket.getaddrinfo(
-                parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM
-            )
-        }
-    except OSError as exc:
-        raise ProviderConfigurationError(
-            "endpoint_resolution_failed", "provider endpoint DNS resolution failed"
-        ) from exc
-    try:
-        unsafe = not addresses or any(
-            not ipaddress.ip_address(address.split("%", 1)[0]).is_global
-            for address in addresses
-        )
-    except ValueError:
-        unsafe = True
-    if unsafe:
-        raise ProviderConfigurationError(
-            "unsafe_endpoint", "provider endpoint resolved to a non-public address"
-        )
-    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+    from .provider_http import safe_https_open
+    return safe_https_open(request, timeout)
 
 
 def discover_openai_compatible_models(
@@ -118,9 +97,19 @@ def discover_openai_compatible_models(
         raise
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
         status = int(exc.code) if isinstance(exc, urllib.error.HTTPError) else None
+        message = {
+            401: "模型列表请求失败（HTTP 401）：请检查 API Key 是否正确或已过期。",
+            403: "模型列表请求失败（HTTP 403）：请检查 API Key 权限或平台访问限制。",
+            404: "模型列表请求失败（HTTP 404）：请检查 Base URL 的 API 前缀（例如 /v1），并确认平台支持 GET /models。",
+            429: "模型列表请求失败（HTTP 429）：平台限流，请稍后重试。",
+        }.get(status, (
+            f"模型列表请求失败（HTTP {status}）：请检查平台服务状态。"
+            if status is not None else
+            "模型列表请求失败：连接超时或网络/TLS 错误，请检查网络与代理设置。"
+        ))
         raise ProviderConfigurationError(
             "model_discovery_failed",
-            "provider /models request failed",
+            message,
             status=status,
             retryable=status is None or status == 429 or bool(status and status >= 500),
         ) from None
@@ -178,6 +167,8 @@ class OpenAICompatibleClient(DeepSeekClient):
         models: Mapping[str, CapabilityProfile],
         credential_origin: str | None = None,
         thinking_wire: str = "none",
+        wire_profile: Mapping[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
         transport: Transport | None = None,
         **options: Any,
     ) -> None:
@@ -187,6 +178,8 @@ class OpenAICompatibleClient(DeepSeekClient):
         self.origin = endpoint_origin(base_url)
         self.credential_origin = endpoint_origin(credential_origin or base_url)
         self.auth = validate_auth(auth)
+        self.wire_profile = dict(wire_profile or {})
+        self.headers = validate_provider_headers(headers)
         self.thinking_wire = str(thinking_wire or "none").strip().lower()
         if self.thinking_wire not in {"none", "deepseek"}:
             raise ProviderConfigurationError(
@@ -266,10 +259,11 @@ class OpenAICompatibleClient(DeepSeekClient):
                 "credential origin does not match the configured provider endpoint",
             )
         headers = {
-            "Accept": "application/json",
+            "Accept": "text/event-stream" if payload.get("stream") else "application/json",
             "Content-Type": "application/json; charset=utf-8",
             "User-Agent": "acm-agent/2.0 (+local learning tool)",
         }
+        headers.update(self.headers)
         if self.auth["type"] == "bearer":
             headers["Authorization"] = f"Bearer {key}"
         else:
@@ -354,26 +348,43 @@ class OpenAICompatibleClient(DeepSeekClient):
             payload["reasoning_effort"] = effort
         elif self.thinking_wire == "deepseek" and effort != "auto":
             payload["thinking"] = {"type": "disabled"}
-        if stream:
+        if stream and capabilities.stream_usage and self.wire_profile.get("stream_usage", True):
             payload["stream_options"] = {"include_usage": True}
         if json_object:
             if not any("json" in item["content"].casefold() for item in normalized_messages):
                 raise ProviderConfigurationError(
                     "missing_json_instruction", "JSON Output requires an explicit JSON instruction"
                 )
-            payload["response_format"] = {"type": "json_object"}
+            if self.wire_profile.get("structured_output") != "prompt_json":
+                payload["response_format"] = {"type": "json_object"}
         if max_tokens is not None:
             if isinstance(max_tokens, bool) or int(max_tokens) <= 0:
                 raise ProviderConfigurationError("invalid_max_tokens", "max_tokens must be positive")
             if capabilities.max_output_tokens is not None and int(max_tokens) > capabilities.max_output_tokens:
                 raise ProviderConfigurationError("invalid_max_tokens", "max_tokens exceeds declared model limit")
-            payload["max_tokens"] = int(max_tokens)
-        if temperature is not None and (not thinking or effort == "none"):
+            payload[self.wire_profile.get("token_parameter", "max_tokens")] = int(max_tokens)
+        if temperature is not None and not self.wire_profile.get("omit_temperature") and (not thinking or effort == "none"):
             value = float(temperature)
             if not 0 <= value <= 2:
                 raise ProviderConfigurationError("invalid_temperature", "temperature must be between 0 and 2")
             payload["temperature"] = value
         return payload
+
+    def stream_chat(self, messages: Sequence[Mapping[str, Any]], *, model: str,
+                    thinking: bool = False, reasoning_effort: str = "auto",
+                    max_tokens: int | None = None, temperature: float | None = None) -> Any:
+        options = {"model": model, "thinking": thinking, "reasoning_effort": reasoning_effort,
+                   "max_tokens": max_tokens, "temperature": temperature}
+        if self.wire_profile.get("streaming") != "buffered":
+            yield from super().stream_chat(messages, **options)
+            return
+        result = self.chat(messages, **options)
+        metadata = {**result.provider_metadata, "streaming_mode": "buffered"}
+        if result.content:
+            yield AIStreamEvent("delta", content=result.content, provider_metadata=metadata)
+        yield AIStreamEvent("done", finish_reason=result.finish_reason, usage=result.usage,
+                            model=result.model, requested_model=result.requested_model,
+                            response_id=result.response_id, provider_metadata=metadata)
 
     @staticmethod
     def _decode_json_output(content: str) -> tuple[Any, bool]:
@@ -408,11 +419,41 @@ class OpenAICompatibleClient(DeepSeekClient):
             raise ProviderConfigurationError(
                 "invalid_json_schema", "json_schema and schema_name are required"
             )
-        result = self.chat_json(messages, json_retries=0, **options)
+        options.pop("json_retries", None)
+        if self.wire_profile.get("structured_output") == "native_schema":
+            selected = dict(options)
+            selected.pop("json_retries", None)
+            transport_options = {key: selected.pop(key) for key in
+                                 ("request_timeout", "request_retries", "retry_callback") if key in selected}
+            selected.setdefault("thinking", False)
+            selected.setdefault("reasoning_effort", "auto")
+            payload = self._payload(messages, stream=False, **selected)
+            schema_format = {"type": "json_schema", "json_schema": {
+                "name": schema_name, "strict": True, "schema": dict(json_schema)}}
+            if self.endpoint.endswith("/responses"):
+                payload["text"] = {"format": {"type": "json_schema", "name": schema_name,
+                                               "strict": True, "schema": dict(json_schema)}}
+            else:
+                payload["response_format"] = schema_format
+            raw = self._nonstream(payload, **transport_options)
+            try:
+                data, _ = self._decode_json_output(raw.content)
+            except (ValueError, TypeError):
+                data = None
+            if not isinstance(data, dict):
+                raise ProviderProtocolError("invalid_json_output", "Expected a JSON object", usage=raw.usage,
+                                            finish_reason=raw.finish_reason)
+            result = AIJsonResult(raw.content, raw.finish_reason, raw.usage, raw.model, data,
+                                  raw.response_id, raw.requested_model, raw.provider_metadata)
+        else:
+            if self.wire_profile.get("structured_output") == "prompt_json":
+                messages = [*messages, {"role": "user", "content":
+                    "Return only one JSON object matching this schema: " + json.dumps(dict(json_schema), ensure_ascii=False)}]
+            result = self.chat_json(messages, json_retries=0, **options)
         metadata = dict(result.provider_metadata)
         metadata.update(
-            transport_api="chat_completions",
-            structured_format="json_object",
+            transport_api="responses" if self.endpoint.endswith("/responses") else "chat_completions",
+            structured_format=self.wire_profile.get("structured_output", "json_object"),
         )
         return replace(result, provider_metadata=metadata)
 

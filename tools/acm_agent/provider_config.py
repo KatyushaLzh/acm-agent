@@ -48,6 +48,57 @@ _CAPABILITY_KEYS = {
     "stream_usage",
 }
 
+ADAPTERS = ("deepseek", "openai_compatible", "openai_responses", "anthropic", "auto")
+
+
+def validate_provider_headers(value: Any) -> dict[str, str]:
+    """Only non-secret protocol metadata may be persisted alongside a connection."""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ProviderConfigurationError("invalid_headers", "headers must be an object")
+    allowed = {"anthropic-version", "anthropic-beta", "anthropic-workspace-id",
+               "openai-organization", "openai-project", "http-referer", "x-title"}
+    result = {}
+    for key, raw in value.items():
+        name = str(key).lower()
+        if name not in allowed or not isinstance(raw, str) or len(raw) > 512 or any(ord(c) < 32 or ord(c) == 127 for c in raw):
+            raise ProviderConfigurationError("invalid_headers", "unsupported or unsafe provider metadata header")
+        result[name] = raw
+    return result
+
+
+def validate_wire_profile(value: Any, *, base_url: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ProviderConfigurationError("invalid_wire_profile", "wire_profile must be an object")
+    enums = {
+        "adapter": ADAPTERS[1:-1],
+        "structured_output": ("native_schema", "json_object", "prompt_json"),
+        "token_parameter": ("max_tokens", "max_completion_tokens"),
+        "streaming": ("native", "buffered"),
+        "reasoning_mode": ("adaptive", "manual", "auto"),
+    }
+    result = {}
+    for key, raw in value.items():
+        if key in enums and raw in enums[key]:
+            result[key] = raw
+        elif key in {"omit_temperature", "stream_usage"}:
+            result[key] = _strict_bool(raw, label=key)
+        elif key == "base_url":
+            normalized = normalize_base_url(raw)
+            if endpoint_origin(normalized) != endpoint_origin(base_url):
+                raise ProviderConfigurationError("invalid_wire_profile", "model endpoint must share the connection origin")
+            result[key] = normalized
+        elif key == "auth":
+            result[key] = validate_auth(raw)
+        elif key == "headers":
+            result[key] = validate_provider_headers(raw)
+        else:
+            raise ProviderConfigurationError("invalid_wire_profile", "unknown or invalid wire profile field")
+    return result
+
 _DEFAULT_TASK_BUDGETS: dict[str, dict[str, int | float]] = {
     "recommendation": {
         "max_output_tokens": 16_384,
@@ -573,9 +624,9 @@ def validate_provider(provider_id: Any, value: Any) -> dict[str, Any]:
         raise ProviderConfigurationError("invalid_provider", "provider must be an object")
     source = dict(value)
     adapter = str(source.get("adapter") or "openai_compatible").strip().lower()
-    if adapter not in {"deepseek", "openai_compatible"}:
+    if adapter not in ADAPTERS:
         raise ProviderConfigurationError(
-            "invalid_provider", "adapter must be deepseek or openai_compatible"
+            "invalid_provider", "unsupported provider adapter"
         )
     base_url = normalize_base_url(source.get("base_url"))
     auth = validate_auth(source.get("auth"))
@@ -589,7 +640,10 @@ def validate_provider(provider_id: Any, value: Any) -> dict[str, Any]:
             "the DeepSeek adapter is reserved for the official HTTPS root with bearer auth",
         )
     models = source.get("models")
-    if not isinstance(models, Mapping) or not models:
+    state = str(source.get("state") or ("needs_model" if not models else "needs_verification"))
+    if state not in {"needs_model", "needs_verification", "ready"}:
+        raise ProviderConfigurationError("invalid_provider", "invalid connection state")
+    if not isinstance(models, Mapping) or (not models and state != "needs_model"):
         raise ProviderConfigurationError("invalid_provider", "provider must declare at least one model")
     normalized_models: dict[str, Any] = {}
     for raw_model, raw_definition in models.items():
@@ -634,7 +688,13 @@ def validate_provider(provider_id: Any, value: Any) -> dict[str, Any]:
                 set(verified_reasoning), key=REASONING_STRENGTHS.index
             ),
             "available": _strict_bool(definition.get("available", True), label="available"),
+            "source": str(definition.get("source") or "discovered"),
+            "wire_profile": validate_wire_profile(definition.get("wire_profile"), base_url=base_url),
         }
+        if normalized_models[model]["source"] not in {"manual", "discovered"}:
+            raise ProviderConfigurationError("invalid_model", "invalid model source")
+        if definition.get("effective_capabilities") is not None:
+            normalized_models[model]["effective_capabilities"] = validate_capabilities(definition["effective_capabilities"])
     slot = validate_identifier(
         source.get("credential_slot") or selected_id, label="credential_slot"
     )
@@ -649,6 +709,10 @@ def validate_provider(provider_id: Any, value: Any) -> dict[str, Any]:
         "auth": auth,
         "enabled": _strict_bool(source.get("enabled", True), label="enabled"),
         "models": normalized_models,
+        "state": state,
+        "protocol_mode": "auto" if source.get("protocol_mode") == "auto" or adapter == "auto" else "explicit",
+        "auth_mode": "auto" if source.get("auth_mode") == "auto" else "explicit",
+        "headers": validate_provider_headers(source.get("headers")),
     }
 
 
@@ -665,12 +729,15 @@ def validate_profile(profile_id: Any, value: Any, providers: Mapping[str, Any]) 
         raise ProviderConfigurationError("invalid_profile", "task profile provider is missing or disabled")
     model = validate_model_id(source.get("model"))
     model_definition = (provider.get("models") or {}).get(model)
-    if not isinstance(model_definition, Mapping):
-        raise ProviderConfigurationError("invalid_profile", "task profile model is not declared by provider")
-    capabilities = validate_capabilities(model_definition.get("capabilities"))
+    # Discovery may remove a selected model. Keep the user's selection readable;
+    # ProviderRegistry.route rejects the missing model before any request.
+    capabilities = (
+        validate_capabilities(model_definition.get("capabilities"))
+        if isinstance(model_definition, Mapping) else None
+    )
     strength = reasoning_strength_from_profile(source)
     thinking, effort = _legacy_reasoning_fields(strength)
-    if not capabilities["text_chat"] or (thinking and not capabilities["thinking"]):
+    if capabilities is not None and (not capabilities["text_chat"] or (thinking and not capabilities["thinking"])):
         raise ProviderConfigurationError(
             "unsupported_capability", "task profile requests a capability not declared by its model"
         )
@@ -714,11 +781,16 @@ def _strict_bool(value: Any, *, label: str) -> bool:
     return value
 
 
-def capability_profile(provider: Mapping[str, Any], model: str) -> CapabilityProfile:
+def effective_capabilities(provider: Mapping[str, Any], model: str) -> dict[str, Any]:
     definition = (provider.get("models") or {}).get(model)
     if not isinstance(definition, Mapping):
         raise ProviderConfigurationError("invalid_model", "model is not declared by provider")
-    value = validate_capabilities(definition.get("capabilities"))
+    return validate_capabilities(definition.get("effective_capabilities", definition.get("capabilities")))
+
+
+def capability_profile(provider: Mapping[str, Any], model: str) -> CapabilityProfile:
+    value = effective_capabilities(provider, model)
+    definition = provider["models"][model]
     return CapabilityProfile(
         **value,
         evidence=str(definition.get("evidence") or "declared"),
@@ -778,7 +850,7 @@ def validate_credential_slots(providers: Mapping[str, Any], value: Any) -> dict[
 __all__ = [
     "COACHING_DELIVERY_MODES", "DEEPSEEK_CAPABILITIES", "REASONING_STRENGTHS", "TASK_PROFILE_IDS", "capability_profile",
     "chat_completions_url", "models_url", "default_ai_policy", "default_cache_policy", "default_credential_slots", "default_provider_config", "default_task_profiles",
-    "endpoint_origin", "normalize_base_url", "validate_ai_catalog", "validate_auth",
+    "endpoint_origin", "effective_capabilities", "normalize_base_url", "validate_ai_catalog", "validate_auth",
     "reasoning_strength_from_profile", "validate_capabilities", "validate_identifier", "validate_model_id",
     "validate_reasoning_strength", "validate_coaching_delivery_mode", "validate_ai_policy", "validate_cache_policy",
     "validate_credential_slots", "validate_profile", "validate_provider",
