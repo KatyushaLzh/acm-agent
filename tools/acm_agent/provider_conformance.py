@@ -65,6 +65,10 @@ def run_live_conformance(
 
     cases: list[dict[str, Any]] = []
     observed_usage: dict[str, Any] = {}
+    # Reasoning tokens share the completion budget. Reuse the task's normal
+    # limits, including for auto where the provider may enable thinking.
+    max_tokens = int(route.budget["max_output_tokens"])
+    request_timeout = float(route.budget["request_timeout_seconds"])
 
     def record(name: str, ok: bool, *, usage: dict[str, Any] | None = None, code: str | None = None) -> None:
         nonlocal observed_usage
@@ -86,14 +90,19 @@ def run_live_conformance(
             model=route.model,
             thinking=route.thinking,
             reasoning_effort=route.reasoning_effort,
-            max_tokens=8,
+            max_tokens=max_tokens,
+            request_timeout=request_timeout,
             temperature=0,
         )
         # This case proves the declared text-chat wire contract: the provider
         # returned a parseable, non-empty assistant message.  Exact phrasing is
         # a model-quality property, not a protocol capability; reasoning-first
         # models may include an explanation even when asked for a terse marker.
-        record("text", bool(text.content.strip()), usage=text.usage)
+        incomplete = text.finish_reason == "length"
+        record(
+            "text", bool(text.content.strip()) and not incomplete, usage=text.usage,
+            code="response_incomplete" if incomplete else None,
+        )
         record("usage", bool(text.usage.get("total_tokens") is not None))
     except ProviderError as exc:
         record("text", False, usage=dict(exc.usage), code=exc.code)
@@ -108,11 +117,16 @@ def run_live_conformance(
                 model=route.model,
                 thinking=route.thinking,
                 reasoning_effort=route.reasoning_effort,
-                max_tokens=32,
+                max_tokens=max_tokens,
+                request_timeout=request_timeout,
                 temperature=0,
                 json_retries=0,
             )
-            record("json_object", structured.data.get("ok") is True, usage=structured.usage)
+            incomplete = structured.finish_reason == "length"
+            record(
+                "json_object", structured.data.get("ok") is True and not incomplete,
+                usage=structured.usage, code="response_incomplete" if incomplete else None,
+            )
         except ProviderError as exc:
             record("json_object", False, usage=dict(exc.usage), code=exc.code)
 
@@ -122,6 +136,7 @@ def run_live_conformance(
         stream_usage: dict[str, Any] = {}
         saw_content = False
         saw_done = False
+        incomplete = False
         try:
             for event in client.stream_chat(
                 [
@@ -131,14 +146,18 @@ def run_live_conformance(
                 model=route.model,
                 thinking=route.thinking,
                 reasoning_effort=route.reasoning_effort,
-                max_tokens=8,
+                max_tokens=max_tokens,
                 temperature=0,
             ):
                 saw_content = saw_content or (event.kind == "delta" and bool(event.content))
                 if event.usage:
                     stream_usage = dict(event.usage)
                 saw_done = saw_done or event.kind == "done"
-            record("stream", saw_content and saw_done, usage=stream_usage)
+                incomplete = incomplete or event.finish_reason == "length"
+            record(
+                "stream", saw_content and saw_done and not incomplete, usage=stream_usage,
+                code="response_incomplete" if incomplete else None,
+            )
             if route.capabilities.stream_usage and (
                 requested is None or "stream_usage" in requested
             ):
@@ -188,6 +207,11 @@ def run_live_conformance(
         "origin": route.provider["base_url"],
         "model": route.model,
         "reasoning_strength": route.reasoning_strength,
+        "profile_id": route.profile_id,
+        "budget": {
+            "max_output_tokens": max_tokens,
+            "request_timeout_seconds": request_timeout,
+        },
         "adapter": route.provider["adapter"],
         "definition_hash": provider_definition_hash(route.provider_id, route.provider, route.model),
         "verified_at": stamp,

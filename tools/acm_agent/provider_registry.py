@@ -321,7 +321,11 @@ class ProviderRegistry:
         model: str | None = None,
         *,
         reasoning_strength: str = "auto",
+        profile_id: str = "recommendation",
     ) -> ProviderRoute:
+        selected_profile = str(profile_id).strip().lower()
+        if selected_profile not in TASK_PROFILE_IDS:
+            raise ProviderConfigurationError("invalid_profile", "unknown task profile")
         selected_provider = validate_identifier(provider_id, label="provider_id")
         provider = self.providers.get(selected_provider)
         if not isinstance(provider, Mapping) or not provider.get("enabled"):
@@ -338,7 +342,7 @@ class ProviderRegistry:
                 "unsupported_capability", "model does not declare reasoning support"
             )
         return ProviderRoute(
-            profile_id="conformance",
+            profile_id=selected_profile,
             provider_id=selected_provider,
             model=selected_model,
             reasoning_strength=strength,
@@ -346,13 +350,7 @@ class ProviderRegistry:
             reasoning_effort=effort,
             provider=dict(provider),
             capabilities=capabilities,
-            budget={
-                "max_output_tokens": 8,
-                "request_timeout_seconds": 30.0,
-                "max_retries": 0,
-                "max_requests": 1,
-                "max_total_tokens": 4_096,
-            },
+            budget=dict(self.policy["budgets"][selected_profile]),
         )
 
     def credential_source(self, provider_id: str) -> str:

@@ -1972,7 +1972,7 @@ class ServiceAIMixin:
                 ],
                 model=selected,
                 thinking=False,
-                max_tokens=8,
+                max_tokens=int(route.budget["max_output_tokens"]),
                 temperature=0,
             )
         except ProviderError as exc:
@@ -2010,7 +2010,9 @@ class ServiceAIMixin:
     ) -> dict[str, Any]:
         registry = self._provider_registry()
         route = registry.probe_route(provider_id, model)
-        client = registry.client_for_route(route)
+        client = registry.client_for_route(
+            route, timeout=float(route.budget["request_timeout_seconds"])
+        )
         report = run_live_conformance(client, route)
         return self._finish_model_verification(route, report)
 
@@ -2033,9 +2035,12 @@ class ServiceAIMixin:
             str(model_ref["provider_id"]),
             str(model_ref["model"]),
             reasoning_strength=validate_reasoning_strength(reasoning_strength),
+            profile_id=selected_profile,
         )
         report = run_live_conformance(
-            registry.client_for_route(route),
+            registry.client_for_route(
+                route, timeout=float(route.budget["request_timeout_seconds"])
+            ),
             route,
             required_capabilities=required_capabilities(selected_profile),
         )
