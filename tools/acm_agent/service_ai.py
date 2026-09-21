@@ -1722,12 +1722,12 @@ class ServiceAIMixin:
     def ai_policy_update(self, *, policy: Mapping[str, Any]) -> dict[str, Any]:
         normalized = validate_ai_policy(policy)
         config = load_config(self.paths, required=False)
+        previous_policy = config["ai"]["policy"]
         config["ai"]["policy"] = normalized
         registry = ProviderRegistry(config["ai"])
-        for profile_id in TASK_PROFILE_IDS:
-            registry.route_plan(profile_id)
+        route_warnings = registry.validate_policy_update(previous_policy)
         save_config(self.paths, config)
-        return {"ok": True, "governance": self.ai_governance()}
+        return {"ok": True, "governance": self.ai_governance(), "route_warnings": route_warnings}
 
     def ai_costs(self, *, days: int = 30) -> dict[str, Any]:
         with Database(self.paths.database) as db:

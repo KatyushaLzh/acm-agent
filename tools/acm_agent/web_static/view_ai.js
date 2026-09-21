@@ -604,6 +604,27 @@ function clonePolicy(policy) {
   return JSON.parse(JSON.stringify(policy));
 }
 
+function samePolicyRoute(left, right) {
+  return left?.provider_id === right?.provider_id && left?.model === right?.model
+    && (left?.reasoning_strength || "auto") === (right?.reasoning_strength || "auto");
+}
+
+function savedFallbackRoute(profileId, route) {
+  const saved = asObject(savedAiPolicy?.fallbacks)[profileId];
+  return Array.isArray(saved) && saved.some(item => samePolicyRoute(item, route));
+}
+
+function policyRouteProblem(profileId, route) {
+  const connection = connectionRows().find(item => String(item.id) === route.provider_id);
+  const model = modelFor({ model_ref: route });
+  if (!connection) return "连接已不存在";
+  if (connection.enabled === false) return "连接已停用";
+  if (!connection.credential?.detected || connection.credential?.error) return "连接凭据不可用";
+  if (!model || model.available === false) return "模型已不在当前可用列表中";
+  if (!modelVerifiedForProfile(model, profileId, route.reasoning_strength || "auto")) return "所需能力或推理强度尚未验证";
+  return "";
+}
+
 function fallbackModelOptions(profileId, selected) {
   const options = ['<option value="">不启用</option>'];
   let selectedFound = false;
@@ -643,18 +664,14 @@ function budgetInput(profileId, name, label, explanation, value, { integer = tru
 function fallbackEditor(profileId, index, route = {}) {
   const item = asObject(route);
   const modelValue = item.provider_id && item.model ? modelOptionValue(item.provider_id, item.model) : "";
-  const ref = parseModelOption(modelValue);
-  const connection = connectionRows().find(candidate => String(candidate.id) === ref.provider_id);
-  const model = modelFor({ model_ref: ref });
-  const valid = !modelValue || (connection && connection.enabled !== false && connection.credential?.detected
-    && !connection.credential?.error && model?.available !== false
-    && modelVerifiedForProfile(model, profileId, item.reasoning_strength || "auto"));
+  const problem = modelValue ? policyRouteProblem(profileId, item) : "";
+  const valid = !problem;
   return `<div class="fallback-route-editor${valid ? "" : " fallback-invalid"}" data-fallback-slot="${index}">
     <span>备用 ${index + 1}</span>
     <select data-fallback-model aria-label="${escapeHtml(PROFILE_LABELS[profileId])}备用模型 ${index + 1}">${fallbackModelOptions(profileId, modelValue)}</select>
     <select data-fallback-strength aria-label="${escapeHtml(PROFILE_LABELS[profileId])}备用推理强度 ${index + 1}"${modelValue ? "" : " disabled"}>${fallbackStrengthOptions(profileId, modelValue, item.reasoning_strength || "auto")}</select>
     <button class="button secondary fallback-remove" type="button" data-fallback-remove>删除</button>
-    ${valid ? "" : "<small class=\"fallback-invalid-note\">历史路由已失效，请删除或替换后再保存。</small>"}
+    ${valid ? "" : `<small class="fallback-invalid-note">${escapeHtml(problem)}。${savedFallbackRoute(profileId, item) ? "已保存的路由可保留，仍可修改预算；使用前请替换或删除。" : "请删除或替换后再保存。"}</small>`}
   </div>`;
 }
 
@@ -668,7 +685,10 @@ function fallbackEditors(profileId, routes) {
 }
 
 function renderAiPolicyEditor(policy, { force = false } = {}) {
-  if (aiPolicyDirty && !force) return;
+  if (aiPolicyDirty && !force) {
+    refreshAiPolicyRouteStatus();
+    return;
+  }
   const normalized = clonePolicy(policy);
   savedAiPolicy = normalized;
   aiPolicyDirty = false;
@@ -684,11 +704,12 @@ function renderAiPolicyEditor(policy, { force = false } = {}) {
     const provider = profile.provider_id || "?";
     const model = profile.model || "?";
     const strength = profile.reasoning_strength || "auto";
+    const routeProblem = policyRouteProblem(profileId, { provider_id: provider, model, reasoning_strength: strength });
     return `<section class="governance-row policy-profile-row" data-policy-profile="${profileId}">
       <div class="policy-profile-summary">
         <div data-label="任务" class="policy-task"><span class="policy-field-label">任务</span><strong>${escapeHtml(PROFILE_LABELS[profileId] || profileId)}</strong><small>TaskProfile · ${escapeHtml(profileId)}</small></div>
         <div data-label="主路由" class="policy-primary-route"><span class="policy-field-label">主路由</span><strong>${escapeHtml(model)}</strong><small>${escapeHtml(provider)}</small><span class="badge neutral">推理强度 · ${escapeHtml(strength)}</span></div>
-        <div data-label="能力" class="policy-capability"><span class="policy-field-label">能力</span><span class="badge ${profile.ready ? "good" : "warn"}">${profile.ready ? "已验证" : "不可用"}</span><small>${profile.ready ? "所需能力与推理证据完整" : escapeHtml(profile.error || "路由能力尚未满足")}</small></div>
+        <div data-label="能力" class="policy-capability"><span class="policy-field-label">能力</span><span class="badge ${profile.ready && !routeProblem ? "good" : "warn"}">${profile.ready && !routeProblem ? "已验证" : "不可用"}</span><small>${escapeHtml(routeProblem ? `${routeProblem}；仍可保存预算，请重新选择主路由。` : profile.ready ? "所需能力与推理证据完整" : profile.error || "路由能力尚未满足")}</small></div>
         <div data-label="模型路由回退" class="policy-fallback-grid"><span class="policy-field-label">模型路由回退</span>${fallbackEditors(profileId, fallbacks)}</div>
       </div>
       <div data-label="预算" class="policy-budget-section">
@@ -707,6 +728,29 @@ function renderAiPolicyEditor(policy, { force = false } = {}) {
   table.className = "governance-table";
   table.innerHTML = rows.join("");
   updateAiPolicyDirtyState();
+}
+
+function refreshAiPolicyRouteStatus() {
+  const form = $("#ai-policy-form");
+  for (const profileId of POLICY_PROFILES) {
+    const row = $(`[data-policy-profile="${profileId}"]`, form);
+    if (!row) continue;
+    const selection = profileSelection(profileId);
+    const route = { ...selection.model_ref, reasoning_strength: selection.reasoning_strength };
+    const problem = policyRouteProblem(profileId, route);
+    const profile = asObject(asObject(state.aiStatus?.profiles)[profileId]);
+    const ready = profile.ready && !problem;
+    const capability = $(".policy-capability", row);
+    capability.innerHTML = `<span class="policy-field-label">能力</span><span class="badge ${ready ? "good" : "warn"}">${ready ? "已验证" : "不可用"}</span><small>${escapeHtml(problem ? `${problem}；仍可保存预算，请重新选择主路由。` : ready ? "所需能力与推理证据完整" : profile.error || "路由能力尚未满足")}</small>`;
+    const primary = $(".policy-primary-route", row);
+    primary.innerHTML = `<span class="policy-field-label">主路由</span><strong>${escapeHtml(route.model || "?")}</strong><small>${escapeHtml(route.provider_id || "?")}</small><span class="badge neutral">推理强度 · ${escapeHtml(route.reasoning_strength)}</span>`;
+    const grid = $(".policy-fallback-grid", row);
+    const routes = $$("[data-fallback-slot]", grid).map(editor => ({
+      ...parseModelOption($("[data-fallback-model]", editor).value),
+      reasoning_strength: $("[data-fallback-strength]", editor).value || "auto",
+    }));
+    grid.innerHTML = `<span class="policy-field-label">模型路由回退</span>${fallbackEditors(profileId, routes)}`;
+  }
 }
 
 function updateAiPolicyDirtyState() {
@@ -824,12 +868,9 @@ function readAiPolicyDraft() {
       const modelRef = parseModelOption(modelSelect.value);
       const strengthSelect = $("[data-fallback-strength]", editor);
       const route = { ...modelRef, reasoning_strength: strengthSelect.value || "auto" };
-      const connection = connectionRows().find(item => String(item.id) === modelRef.provider_id);
-      const model = modelFor({ model_ref: modelRef });
-      const usable = connection && connection.enabled !== false && connection.credential?.detected
-        && !connection.credential?.error && model?.available !== false;
-      if (!usable || !model || !modelVerifiedForProfile(model, profileId, route.reasoning_strength)) {
-        invalidPolicyField(modelSelect, `${PROFILE_LABELS[profileId]}备用模型尚未通过所需能力与推理强度验证`);
+      const problem = policyRouteProblem(profileId, route);
+      if (problem && !savedFallbackRoute(profileId, route)) {
+        invalidPolicyField(modelSelect, `${PROFILE_LABELS[profileId]}备用模型不可用：${problem}；请删除或替换后再保存`);
       }
       routes.push(route);
     }
@@ -864,7 +905,10 @@ async function saveAiPolicy(button) {
     aiPolicyDirty = false;
     if (result.governance) renderAiGovernance(result.governance, { forcePolicy: true });
     await loadAiStatus();
-    toast("策略已保存", "六类预算、能力门禁与模型路由回退均已重新校验。");
+    const warnings = Array.isArray(result.route_warnings) ? result.route_warnings : [];
+    toast("策略已保存", warnings.length
+      ? `预算与策略已保存；仍有 ${warnings.length} 条不可用路由，请在使用前替换或删除。`
+      : "预算与模型路由回退已保存。新增或修改的备用路由已通过校验。");
   } finally {
     setBusy(button, false);
     updateAiPolicyDirtyState();

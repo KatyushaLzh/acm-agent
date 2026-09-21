@@ -13,7 +13,6 @@ from .ai_cache import EXACT_CACHE_PROFILES
 from .provider_registry import ProviderRegistry, ProviderRoute
 from .provider import ProviderConfigurationError
 from .provider_config import (
-    TASK_PROFILE_IDS,
     validate_ai_policy,
     validate_coaching_delivery_mode,
 )
@@ -53,15 +52,16 @@ class ServiceCoreMixin:
             if coaching_delivery_mode is not None
             else config["ai"].get("coaching_delivery_mode")
         )
+        previous_policy = config["ai"]["policy"]
         config["ai"]["policy"] = normalized
         config["ai"]["coaching_delivery_mode"] = selected_delivery
         registry = ProviderRegistry(config["ai"])
-        for profile_id in TASK_PROFILE_IDS:
-            registry.route_plan(profile_id)
+        route_warnings = registry.validate_policy_update(previous_policy)
         save_config(self.paths, config)
         return {
             "ok": True,
             "coaching_delivery_mode": selected_delivery,
+            "route_warnings": route_warnings,
             "governance": self.ai_governance(),
         }
 

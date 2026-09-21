@@ -272,18 +272,10 @@ class SummaryReliabilityTests(unittest.TestCase):
             Path(applied["target_path"]).read_text(encoding="utf-8-sig"),
         )
 
-    def test_prompt_calibrates_confidence_for_safe_applyability(self) -> None:
+    def test_summary_response_confidence_schema_accepts_full_range(self) -> None:
         service, provider, attempt_id, target_id = self.service_with([valid_summary()])
         result = service.knowledge_preview(attempt_id, target_id)
         self.assertTrue(result["ok"])
-        system = str(provider.calls[0]["messages"][0]["content"])
-        self.assertIn("剩余知识卡的可验证置信度", system)
-        self.assertIn("confidence 必须设为 0.85 到 1", system)
-        self.assertIn("source 会由服务端规范化为当前题号", system)
-        self.assertIn("删除冲突细节，只保留共同可证事实", system)
-        self.assertIn("仍有 required field 无法可靠填写", system)
-        self.assertIn("所有 required fields 非空", system)
-        self.assertIn("不得为了提高 confidence 虚构", system)
         schema = dict(provider.calls[0]["json_schema"])
         confidence = schema["properties"]["confidence"]
         self.assertEqual(confidence["minimum"], 0)

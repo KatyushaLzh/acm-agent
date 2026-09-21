@@ -249,6 +249,49 @@ class ProviderRegistry:
             budget=_model_budget(self.policy["budgets"][selected_profile], capabilities),
         )
 
+    def validate_policy_update(self, previous_policy: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Validate new fallback choices without locking edits behind stale routes.
+
+        Primaries are edited separately. Existing fallback identities may be kept
+        or removed even after discovery/capability changes; execution still uses
+        the strict route_plan gate. Never silently migrate a saved model.
+        """
+        previous = validate_ai_policy(previous_policy)
+        warnings: list[dict[str, Any]] = []
+        for profile_id in TASK_PROFILE_IDS:
+            profile = self.profiles[profile_id]
+            try:
+                self.route(profile_id)
+            except ProviderConfigurationError as exc:
+                warnings.append({
+                    "profile_id": profile_id, "route_kind": "primary",
+                    "provider_id": profile["provider_id"], "model": profile["model"],
+                    "code": exc.code, "message": str(exc),
+                })
+            seen = {(profile["provider_id"], profile["model"], profile["reasoning_strength"])}
+            for index, definition in enumerate(self.policy["fallbacks"][profile_id]):
+                identity = (definition["provider_id"], definition["model"], definition["reasoning_strength"])
+                if identity in seen:
+                    raise ProviderConfigurationError(
+                        "invalid_fallback", "fallback route duplicates the primary or an earlier route"
+                    )
+                seen.add(identity)
+                try:
+                    self.route(
+                        profile_id,
+                        model_ref={"provider_id": definition["provider_id"], "model": definition["model"]},
+                        reasoning_strength=definition["reasoning_strength"],
+                    )
+                except ProviderConfigurationError as exc:
+                    if definition not in previous["fallbacks"][profile_id]:
+                        raise
+                    warnings.append({
+                        "profile_id": profile_id, "route_kind": "fallback", "index": index,
+                        "provider_id": definition["provider_id"], "model": definition["model"],
+                        "code": exc.code, "message": str(exc),
+                    })
+        return warnings
+
     def route_plan(
         self,
         profile_id: str,
