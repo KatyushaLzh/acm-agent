@@ -48,7 +48,7 @@ class WireTransport:
             usage = {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
             document = {"id": "c1", "model": "new-model", "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "length" if self.truncated else "stop"}], "usage": usage}
             events = [{"id": "c1", "model": "new-model", "choices": [{"delta": {"content": text}, "finish_reason": None}]},
-                      {"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": usage}, "[DONE]"]
+                      {"choices": [{"delta": {}, "finish_reason": document["choices"][0]["finish_reason"]}], "usage": usage}, "[DONE]"]
         if payload.get("stream"):
             return io.BytesIO("".join("data: " + (e if isinstance(e, str) else json.dumps(e)) + "\n\n" for e in events).encode())
         return io.BytesIO(json.dumps(document).encode())

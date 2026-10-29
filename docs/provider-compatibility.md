@@ -28,6 +28,10 @@
 
 六类任务：推荐、计划整理、计划生成、辅导、补丁和总结。所有结构化结果仍经过业务校验；截断或无效数据不能应用或进入结果缓存。只对明确不支持的字段执行有限协商，认证、余额或服务故障不通过删参数掩盖。显式思考强度不会偷偷退回自动模式。
 
+Chat Completions 模型声明支持原生流式时，同步聊天、辅导的 `resilient` 模式和结构化任务也使用上游 SSE：收齐正文后才返回并执行原有业务校验，不向界面提前泄露未校验内容。这样可兼容 `stream=false` 只返回 HTTP 200 保活注释的中转站。JSON Schema、输出预算、请求数、超时和用量统计保持生效；思考内容不进入结果。流缺少结束标记或完成原因时拒绝作为完整结果，`finish_reason=length` 继续按截断处理。
+
+明确不支持流式或已协商为 `streaming=buffered` 的连接仍使用非流式；DeepSeek 专用适配器、Responses 与 Anthropic 的协议选择不变。SSE 的 `data: [DONE]` 终止语义参见 [Chat Completions 官方协议](https://api-docs.deepseek.com/api/create-chat-completion)。
+
 Anthropic 思考默认 `auto`，省略控制参数；支持的模型使用 adaptive effort 或手动预算。手动 low/medium/high 分别为 1024/4096/8192 tokens，输出预算须额外留出至少 1024 tokens。字段被接受只代表请求兼容，不代表能证明服务内部推理深度。
 
 缺用量的请求不记为零消费；一次运行同时含有已知与未知用量时显示“部分未知”。总 Token 限制只能覆盖已知用量，请求数、截止时间和单次输出上限仍生效。不提供无法证实的费用或缓存命中率。

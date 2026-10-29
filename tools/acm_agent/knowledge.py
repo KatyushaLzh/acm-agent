@@ -1018,6 +1018,76 @@ def _normalize_title(value: str) -> str:
     value = re.sub(r"[`*_~]", "", value.casefold())
     value = re.sub(r"[\s\-—_:：/\\|（）()\[\]{}]+", " ", value)
     return value.strip()
+def markdown_category_titles(
+    text_or_document: str | MarkdownDocument,
+    schema: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return distinct category-level headings in document order.
+
+    ``TOC`` is a renderer directive rather than a knowledge category.  The
+    remaining headings are user-owned, so manually added categories are
+    automatically available to the summary model.
+    """
+
+    text = text_or_document.text if isinstance(text_or_document, MarkdownDocument) else str(text_or_document)
+    category_level = validate_summary_schema(schema)["category_heading_level"]
+    titles: list[str] = []
+    seen: set[str] = set()
+    for heading in _scan_headings(text):
+        if heading.level != category_level or _normalize_title(heading.title) == "toc":
+            continue
+        key = _normalize_title(heading.title)
+        if key and key not in seen:
+            seen.add(key)
+            titles.append(heading.title)
+    return tuple(titles)
+
+
+def resolve_markdown_category(
+    text_or_document: str | MarkdownDocument,
+    schema: Mapping[str, Any],
+    requested: Any,
+    *,
+    fallback: str = "杂项",
+) -> str:
+    """Resolve a model category to an existing heading or the fixed fallback."""
+
+    titles = markdown_category_titles(text_or_document, schema)
+    requested_key = _normalize_title(str(requested or ""))
+    for title in titles:
+        if _normalize_title(title) == requested_key:
+            return title
+    fallback_key = _normalize_title(fallback)
+    for title in titles:
+        if _normalize_title(title) == fallback_key:
+            return title
+    return fallback
+
+
+def markdown_category_for_position(
+    text_or_document: str | MarkdownDocument,
+    schema: Mapping[str, Any],
+    position: int,
+) -> str | None:
+    """Return the nearest category heading owning a Markdown position."""
+
+    text = text_or_document.text if isinstance(text_or_document, MarkdownDocument) else str(text_or_document)
+    category_level = validate_summary_schema(schema)["category_heading_level"]
+    owned: str | None = None
+    for heading in _scan_headings(text):
+        if heading.start > position:
+            break
+        if heading.level == category_level and _normalize_title(heading.title) != "toc":
+            owned = heading.title
+    return owned
+
+
+def _extract_source(body: str) -> str:
+    for line in body.splitlines():
+        match = _BULLET_FIELD_RE.match(line) or _PLAIN_FIELD_RE.match(line)
+        if match and match.group(1).strip().casefold() in {"source", "来源"}:
+            return _normalize_source(match.group(2))
+    return ""
 
 
 def _normalize_source(value: str) -> str:
@@ -1103,7 +1173,9 @@ __all__ = [
     "get_builtin_template",
     "infer_summary_schema",
     "inspect_markdown_path",
-    "list_builtin_templates",
+    "markdown_category_for_position",
+    "markdown_category_titles",
+    "resolve_markdown_category",
     "markdown_bytes_sha256",
     "parse_rendered_entry",
     "readback_markdown",

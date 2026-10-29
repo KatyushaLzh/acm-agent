@@ -7,7 +7,11 @@ import tempfile
 import unittest
 
 from tools.acm_agent.provider import AIJsonResult, ProviderError
-from tools.acm_agent.knowledge import EntryValidationError, get_builtin_schema
+from tools.acm_agent.knowledge import (
+    EntryValidationError,
+    get_builtin_schema,
+    get_builtin_template,
+)
 from tools.acm_agent.service import AcmService
 from tools.acm_agent.storage import Database
 
@@ -15,9 +19,11 @@ from tools.acm_agent.storage import Database
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def valid_summary(*, confidence: float = 0.92) -> dict[str, object]:
+def valid_summary(
+    *, confidence: float = 0.92, topic: str = "基础实现"
+) -> dict[str, object]:
     return {
-        "topic": "基础实现",
+        "topic": topic,
         "title": "输入输出边界",
         "aliases": [],
         "confidence": confidence,
@@ -85,6 +91,42 @@ class SummaryReliabilityTests(unittest.TestCase):
             allow_create=True,
         )
         return service, provider, attempt_id, str(target["target_id"])
+    def test_algorithm_categories_include_manual_h1_and_insert_there(self) -> None:
+        service, provider, attempt_id, target_id = self.service_with(
+            [valid_summary(topic="手动分类")]
+        )
+        target_path = self.root / "algorithms.md"
+        target_path.write_text(
+            get_builtin_template("algorithms-v1") + "\n# 手动分类\n",
+            encoding="utf-8",
+        )
+        result = service.knowledge_preview(attempt_id, target_id)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["proposal"]["topic"], "手动分类")
+        request = json.loads(provider.calls[0]["messages"][-1]["content"].split("\n", 1)[1])
+        self.assertEqual(request["algorithm_category_options"][-1], "手动分类")
+        applied = service.knowledge_apply(
+            result["proposal"]["proposal_id"],
+            expected_revision=result["proposal"]["revision"],
+        )
+        text = Path(applied["proposal"]["target_path"]).read_text(encoding="utf-8")
+        self.assertIn("# 手动分类\n\n## 输入输出边界", text)
+
+    def test_algorithm_unknown_category_falls_back_to_misc(self) -> None:
+        service, _, attempt_id, target_id = self.service_with(
+            [valid_summary(topic="模型虚构分类")]
+        )
+        result = service.knowledge_preview(attempt_id, target_id)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["proposal"]["topic"], "杂项")
+        self.assertNotIn("模型虚构分类", result["proposal"]["entry_markdown"])
+        applied = service.knowledge_apply(
+            result["proposal"]["proposal_id"],
+            expected_revision=result["proposal"]["revision"],
+        )
+        text = Path(applied["proposal"]["target_path"]).read_text(encoding="utf-8")
+        self.assertIn("# 杂项\n\n## 输入输出边界", text)
+        self.assertNotIn("# 模型虚构分类", text)
 
     def cache_entries(self) -> int:
         with Database(self.root / ".acm" / "state.db") as db:

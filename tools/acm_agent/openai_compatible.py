@@ -28,7 +28,7 @@ from .deepseek import (
     DeepSeekError,
     Transport,
 )
-from .provider import CapabilityProfile, ProviderConfigurationError, AIStreamEvent, AIJsonResult, ProviderProtocolError
+from .provider import CapabilityProfile, ProviderConfigurationError, AIResult, AIStreamEvent, AIJsonResult, ProviderProtocolError, RetryCallback
 from .provider_config import (
     chat_completions_url,
     endpoint_origin,
@@ -369,6 +369,54 @@ class OpenAICompatibleClient(DeepSeekClient):
                 raise ProviderConfigurationError("invalid_temperature", "temperature must be between 0 and 2")
             payload["temperature"] = value
         return payload
+
+    def _nonstream(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        retry_callback: RetryCallback | None = None,
+        request_timeout: float | None = None,
+        request_retries: int | None = None,
+    ) -> AIResult:
+        # Delivery stays synchronous; stream-capable Chat relays need not
+        # implement the non-streaming HTTP response envelope correctly.
+        if (
+            not self.endpoint.endswith("/chat/completions")
+            or not self._capabilities(str(payload["model"])).streaming
+            or self.wire_profile.get("streaming") == "buffered"
+        ):
+            return super()._nonstream(
+                payload, retry_callback=retry_callback,
+                request_timeout=request_timeout, request_retries=request_retries,
+            )
+        streamed = dict(payload)
+        streamed["stream"] = True
+        if (
+            self._capabilities(str(payload["model"])).stream_usage
+            and self.wire_profile.get("stream_usage", True)
+        ):
+            streamed["stream_options"] = {"include_usage": True}
+        parts: list[str] = []
+        for event in self._stream(
+            streamed, retry_callback=retry_callback,
+            request_timeout=request_timeout, request_retries=request_retries,
+        ):
+            if event.kind == "delta":
+                parts.append(event.content)
+            elif event.kind == "done":
+                if event.finish_reason is None:
+                    raise ProviderProtocolError(
+                        "incomplete_stream", "Provider stream has no completion finish reason",
+                        usage=event.usage, model=event.model,
+                        requested_model=event.requested_model, response_id=event.response_id,
+                    )
+                return AIResult(
+                    content="".join(parts), finish_reason=event.finish_reason,
+                    usage=dict(event.usage or {}), model=event.model or "",
+                    response_id=event.response_id, requested_model=event.requested_model,
+                    provider_metadata={**event.provider_metadata, "streaming_mode": "collected"},
+                )
+        raise ProviderProtocolError("incomplete_stream", "Provider stream did not complete")
 
     def stream_chat(self, messages: Sequence[Mapping[str, Any]], *, model: str,
                     thinking: bool = False, reasoning_effort: str = "auto",

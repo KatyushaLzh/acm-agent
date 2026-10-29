@@ -1483,7 +1483,20 @@ class DeepSeekClient:
         )
         return self._stream(payload)
 
-    def _stream(self, payload: Mapping[str, Any]) -> Iterator[StreamEvent]:
+    def _stream(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        retry_callback: RetryCallback | None = None,
+        request_timeout: float | None = None,
+        request_retries: int | None = None,
+    ) -> Iterator[StreamEvent]:
+        retry_limit = self.retries if request_retries is None else int(request_retries)
+        if retry_limit < 0:
+            raise DeepSeekConfigurationError(
+                "invalid_retries", "request_retries must not be negative"
+            )
+        timeout = self._provider_timeout(request_timeout)
         emitted_content = False
         accumulated_usage: dict[str, Any] = {}
         requested_model = str(payload.get("model") or "") or None
@@ -1501,14 +1514,14 @@ class DeepSeekClient:
                 ),
             }
 
-        for attempt in range(self.retries + 1):
+        for attempt in range(retry_limit + 1):
             finish_reason: str | None = None
             usage: dict[str, Any] | None = None
             response_model: str | None = None
             response_id: str | None = None
             try:
-                deadline = time.monotonic() + self.timeout
-                response = self._open(payload)
+                deadline = time.monotonic() + timeout
+                response = self._open(payload, request_timeout=timeout)
                 with _managed_response(response) as opened:
                     for event_data in _iter_sse_data(opened, deadline=deadline):
                         if event_data == "[DONE]":
@@ -1594,7 +1607,7 @@ class DeepSeekClient:
                     response_id=response_id,
                 )
             except DeepSeekError as exc:
-                if emitted_content or not exc.retryable or attempt >= self.retries:
+                if emitted_content or not exc.retryable or attempt >= retry_limit:
                     prior_usage = dict(accumulated_usage)
                     merge_usage(prior_usage, usage or {})
                     merge_usage(prior_usage, exc.usage)
@@ -1607,6 +1620,8 @@ class DeepSeekClient:
                 merge_usage(accumulated_usage, exc.usage)
                 self._sleep_before_retry(
                     attempt,
+                    retry_callback=retry_callback,
+                    retry_limit=retry_limit,
                     code=exc.code,
                     retry_after_seconds=exc.protocol_details.get(
                         "retry_after_seconds"
@@ -1623,11 +1638,14 @@ class DeepSeekClient:
                     _sanitize(f"DeepSeek stream failed: {exc}", self._api_key),
                     retryable=True,
                 )
-                if emitted_content or attempt >= self.retries:
+                if emitted_content or attempt >= retry_limit:
                     merge_usage(mapped.usage, accumulated_usage)
                     merge_usage(mapped.usage, usage or {})
                     merge_usage(mapped.usage, stream_telemetry())
                     raise mapped from None
                 merge_usage(accumulated_usage, usage or {})
-                self._sleep_before_retry(attempt, code=mapped.code)
+                self._sleep_before_retry(
+                    attempt, code=mapped.code,
+                    retry_callback=retry_callback, retry_limit=retry_limit,
+                )
         raise AssertionError("unreachable")

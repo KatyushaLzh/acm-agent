@@ -28,6 +28,6 @@ def compatibility_adjustment(error: ProviderError, wire: Mapping[str, Any], *, a
             return {"structured_output": "json_object"}
         if mode != "prompt_json":
             return {"structured_output": "prompt_json"}
-    if case == "stream" and any(word in message for word in ("stream", "sse")) and wire.get("streaming") != "buffered":
+    if case in {"text", "json_object", "stream"} and any(word in message for word in ("stream", "sse")) and wire.get("streaming") != "buffered":
         return {"streaming": "buffered"}
     return None

@@ -62,6 +62,22 @@ class QueueTransport:
         item = self.items.pop(0)
         if isinstance(item, BaseException):
             raise item
+        if isinstance(item, Response) and request.full_url.endswith("/chat/completions") and json.loads(request.data).get("stream"):
+            body = item.getvalue()
+            if body.lstrip().startswith(b"{"):
+                document = json.loads(body)
+                if document.get("choices") and "message" in document["choices"][0]:
+                    choice = document["choices"][0]
+                    chunk = {
+                        "id": document.get("id"), "model": document.get("model"),
+                        "choices": [{"delta": choice["message"], "finish_reason": choice.get("finish_reason")}],
+                        "usage": document.get("usage"),
+                    }
+                    item.close()
+                    item = Response(
+                        ("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode(),
+                        status=item.status, url=item._url,
+                    )
         return item
 
 
